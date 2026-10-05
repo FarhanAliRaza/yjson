@@ -27,6 +27,78 @@ comptime LANES = SIMD[DType.uint8, 32](0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
 def rdi(addr: Int, off: Int) -> Int:
     return Pointer[Int, MutUntrackedOrigin](unsafe_from_address=addr)[unsafe_offset=off]
 
+# ---------------- CPython object layout ----------------
+# Byte offsets of the fields read directly. build.sh probes them from the target
+# interpreter's headers (src/layout_probe.c) and passes them with -D; the C shim
+# re-checks the same values with _Static_assert and against live objects at
+# import. The defaults are the CPython 3.12 layout (3.14 moved tuple items).
+comptime PY_MINOR = get_defined_int["MOJSON_PY_MINOR", 12]()
+comptime OB_TYPE = get_defined_int["MOJSON_OB_TYPE", 8]()
+comptime OB_SIZE = get_defined_int["MOJSON_OB_SIZE", 16]()
+comptime TP_NAME = get_defined_int["MOJSON_TP_NAME", 24]()
+comptime FLOAT_VALUE = get_defined_int["MOJSON_FLOAT_VALUE", 16]()
+comptime LONG_TAG = get_defined_int["MOJSON_LONG_TAG", 16]()
+comptime LONG_DIGITS = get_defined_int["MOJSON_LONG_DIGITS", 24]()
+comptime LIST_ITEMS = get_defined_int["MOJSON_LIST_ITEMS", 24]()
+comptime TUPLE_ITEMS = get_defined_int["MOJSON_TUPLE_ITEMS", 24]()
+comptime BYTES_DATA = get_defined_int["MOJSON_BYTES_DATA", 32]()
+comptime DICT_USED = get_defined_int["MOJSON_DICT_USED", 16]()
+comptime DICT_KEYS = get_defined_int["MOJSON_DICT_KEYS", 32]()
+comptime STR_LENGTH = get_defined_int["MOJSON_STR_LENGTH", 16]()
+comptime STR_STATE = get_defined_int["MOJSON_STR_STATE", 32]()
+comptime STR_ASCII_DATA = get_defined_int["MOJSON_STR_ASCII_DATA", 40]()
+comptime STR_UTF8_LENGTH = get_defined_int["MOJSON_STR_UTF8_LENGTH", 40]()
+comptime STR_UTF8 = get_defined_int["MOJSON_STR_UTF8", 48]()
+# str.state bits (identical on 3.12-3.15; verified at import against live objects)
+comptime STR_COMPACT: UInt32 = 0x20
+comptime STR_ASCII: UInt32 = 0x40
+
+@always_inline
+def rdb(addr: Int, off: Int) -> Int:
+    return Pointer[Int, MutUntrackedOrigin](unsafe_from_address=addr + off)[]
+
+@always_inline
+def ob_type(o: Int) -> Int:
+    return rdb(o, OB_TYPE)
+
+# ob_size for list/tuple/bytes, ma_used for dict (same word on every supported version)
+@always_inline
+def ob_size(o: Int) -> Int:
+    comptime assert DICT_USED == OB_SIZE, "dict ma_used must share the ob_size word"
+    return rdb(o, OB_SIZE)
+
+@always_inline
+def list_items(o: Int) -> Int:
+    return rdb(o, LIST_ITEMS)
+
+@always_inline
+def tuple_items(o: Int) -> Int:
+    return o + TUPLE_ITEMS
+
+@always_inline
+def long_tag(o: Int) -> Int:
+    return rdb(o, LONG_TAG)
+
+@always_inline
+def long_digits(o: Int) -> Pointer[UInt32, MutUntrackedOrigin]:
+    return Pointer[UInt32, MutUntrackedOrigin](unsafe_from_address=o + LONG_DIGITS)
+
+@always_inline
+def float_bits(o: Int) -> UInt64:
+    return Pointer[UInt64, MutUntrackedOrigin](unsafe_from_address=o + FLOAT_VALUE)[]
+
+@always_inline
+def dict_keys(o: Int) -> Int:
+    return rdb(o, DICT_KEYS)
+
+@always_inline
+def bytes_data(o: Int) -> Int:
+    return o + BYTES_DATA
+
+@always_inline
+def tp_name(tp: Int) -> Int:
+    return rdb(tp, TP_NAME)
+
 # ---------------- output buffer: writes straight into a PyBytes object (no final copy) ----------------
 struct Buf:
     var obj: Int
@@ -37,7 +109,7 @@ struct Buf:
 
     def __init__(out self, cap: Int):
         self.obj = external_call["PyBytes_FromStringAndSize", Int](0, cap)
-        self.p = P8(unsafe_from_address=self.obj + 32)
+        self.p = P8(unsafe_from_address=bytes_data(self.obj))
         self.len = 0
         self.cap = cap
         self.err = 0
@@ -58,7 +130,7 @@ struct Buf:
         if external_call["_PyBytes_Resize", Int32](Int(Pointer(to=o)), nc) != 0:
             abort("out of memory")
         self.obj = o
-        self.p = P8(unsafe_from_address=o + 32)
+        self.p = P8(unsafe_from_address=bytes_data(o))
         self.cap = nc
 
 struct Ctx(ImplicitlyCopyable):
@@ -155,15 +227,15 @@ def needs_esc(v: SIMD[DType.uint8, 32]) -> SIMD[DType.bool, 32]:
 # directly, compact non-ASCII via its cached utf8 pointer (as orjson does).
 @always_inline
 def str_src(o: Int, mut sz: Int) -> Int:
-    var state = Pointer[UInt32, MutUntrackedOrigin](unsafe_from_address=o + 32)[]
-    if likely((state & 0x60) == 0x60):
-        sz = rdi(o, 2)
-        return o + 40
-    if (state & 0x20) != 0:
-        var ul = rdi(o, 5)
+    var state = Pointer[UInt32, MutUntrackedOrigin](unsafe_from_address=o + STR_STATE)[]
+    if likely((state & (STR_COMPACT | STR_ASCII)) == (STR_COMPACT | STR_ASCII)):
+        sz = rdb(o, STR_LENGTH)
+        return o + STR_ASCII_DATA
+    if (state & STR_COMPACT) != 0:
+        var ul = rdb(o, STR_UTF8_LENGTH)
         if ul != 0:
             sz = ul
-            return rdi(o, 6)
+            return rdb(o, STR_UTF8)
     var t = 0
     var src = external_call["PyUnicode_AsUTF8AndSize", Int](o, Int(Pointer(to=t)))
     sz = t
@@ -456,10 +528,10 @@ def put_u64(dst: P8, n: Int, v: UInt64) -> Int:
 @always_inline
 def int_fast(dst: P8, n: Int, o: Int) -> Int:
     # returns new length, or -1 if the int is not a compact (<2**30) int
-    var tag = rdi(o, 2)
+    var tag = long_tag(o)
     if unlikely(tag >= 16):
         return -1
-    var mag = UInt64(Pointer[UInt32, MutUntrackedOrigin](unsafe_from_address=o + 24)[])
+    var mag = UInt64(long_digits(o)[])
     var m = n
     if unlikely((tag & 3) == 2):
         (dst + n)[] = 45
@@ -473,9 +545,9 @@ def write_surrogate_string[o_: Origin[mut=True]](bp: Pointer[Buf, o_], o: Int) -
     var encoded = external_call["mojson_surrogate_string", Int](o)
     if encoded == 0:
         return False
-    var size = rdi(encoded, 2)
+    var size = ob_size(encoded)
     bp[].ensure(size)
-    _ = external_call["memcpy", Int](Int(bp[].p.unsafe_offset(bp[].len)), encoded + 32, size)
+    _ = external_call["memcpy", Int](Int(bp[].p.unsafe_offset(bp[].len)), bytes_data(encoded), size)
     bp[].len += size
     external_call["Py_DecRef", NoneType](encoded)
     return True
@@ -497,7 +569,7 @@ def write_big_integer[o_: Origin[mut=True]](bp: Pointer[Buf, o_], o: Int) -> Boo
 def write_socket_integer[o_: Origin[mut=True], c_: Origin](bp: Pointer[Buf, o_], cp: Pointer[Ctx, c_], o: Int, depth: Int) -> Bool:
     # CPython can import _pylong for enormous integers when its digit limit is
     # disabled. Such imports can run arbitrary callbacks and release parents.
-    if unlikely((rdi(o, 2) >> 3) > 6000):
+    if unlikely((long_tag(o) >> 3) > 6000):
         if external_call["mojson_pin_ancestors", Int32](cp[].request, cp[].ancestors, depth) == 0:
             return False
     return write_int[True](bp, o)
@@ -505,10 +577,10 @@ def write_socket_integer[o_: Origin[mut=True], c_: Origin](bp: Pointer[Buf, o_],
 @always_inline
 def write_int[SOCKET: Bool, o_: Origin[mut=True]](bp: Pointer[Buf, o_], o: Int) -> Bool:
     ref b = bp[]
-    var tag = rdi(o, 2)
+    var tag = long_tag(o)
     var val: Int
     if tag < 16:
-        val = (1 - (tag & 3)) * Int(Pointer[UInt32, MutUntrackedOrigin](unsafe_from_address=o + 24)[])
+        val = (1 - (tag & 3)) * Int(long_digits(o)[])
     else:
         return write_long_int[SOCKET](bp, o, tag)
     b.ensure(40)
@@ -523,7 +595,7 @@ def write_int[SOCKET: Bool, o_: Origin[mut=True]](bp: Pointer[Buf, o_], o: Int) 
 
 @inline(.never)
 def write_long_int[SOCKET: Bool, o_: Origin[mut=True]](bp: Pointer[Buf, o_], o: Int, tag: Int) -> Bool:
-    # CPython 3.12 stores magnitude in little-endian base-2^30 digits.
+    # CPython 3.12+ stores the magnitude in little-endian base-2^30 digits.
     var count = tag >> 3
     if unlikely(count > 3):
         comptime if SOCKET:
@@ -531,7 +603,7 @@ def write_long_int[SOCKET: Bool, o_: Origin[mut=True]](bp: Pointer[Buf, o_], o: 
         else:
             bp[].err = 2
             return False
-    var digits = Pointer[UInt32, MutUntrackedOrigin](unsafe_from_address=o + 24)
+    var digits = long_digits(o)
     var magnitude = UInt64(digits[]) | (UInt64(digits[unsafe_offset=1]) << 30)
     if count == 3:
         var high = digits[unsafe_offset=2]
@@ -867,7 +939,7 @@ def nonfinite_at(dst: P8, bits: UInt64) -> Int:
 
 @always_inline
 def float_at(dst: P8, o: Int) -> Int:
-    return float_bits_at(dst, Pointer[UInt64, MutUntrackedOrigin](unsafe_from_address=o + 16)[])
+    return float_bits_at(dst, float_bits(o))
 
 @always_inline
 def float_bits_at(dst: P8, bits: UInt64) -> Int:
@@ -975,13 +1047,13 @@ def put_byte[o_: Origin[mut=True]](bp: Pointer[Buf, o_], c: UInt8):
 
 @always_inline
 def dict_has_general_keys(o: Int) -> Bool:
-    # CPython 3.12 unicode/split tables contain only exact str keys.
-    return P8(unsafe_from_address=rdi(o, 4))[unsafe_offset=10] == 0
+    # dk_kind == DICT_KEYS_GENERAL (0): unicode/split tables hold only exact str keys.
+    return P8(unsafe_from_address=dict_keys(o))[unsafe_offset=10] == 0
 
 @always_inline
 def ser_value[NONSTR: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=True], c_: Origin](bp: Pointer[Buf, o_], cp: Pointer[Ctx, c_], o: Int, depth: Int) -> Bool:
     ref ctx = cp[]
-    var t = rdi(o, 1)
+    var t = ob_type(o)
     if t == ctx.t_str:
         return write_str[SOCKET](bp, o)
     if t == ctx.t_int:
@@ -1019,7 +1091,7 @@ def ser_value[NONSTR: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=True], c_: 
 
 @always_inline
 def is_numpy_type(tp: Int) -> Bool:
-    var nm = P8(unsafe_from_address=rdi(tp, 3))   # tp_name
+    var nm = P8(unsafe_from_address=tp_name(tp))
     return (nm + 0)[] == 110 and (nm + 1)[] == 117 and (nm + 2)[] == 109 and (nm + 3)[] == 112 and (nm + 4)[] == 121 and (nm + 5)[] == 46
 
 # kind: 0 f64, 1 f32, 2 i64, 3 i32, 4 bool, 5 u8, -1 unsupported
@@ -1187,7 +1259,7 @@ def nd_rec[o_: Origin[mut=True]](bp: Pointer[Buf, o_], data: Int, kind: Int, shp
 @no_inline
 def ser_numpy[NONSTR: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=True], c_: Origin](bp: Pointer[Buf, o_], cp: Pointer[Ctx, c_], o: Int, depth: Int) -> Bool:
     ref ctx = cp[]
-    var tp = rdi(o, 1)
+    var tp = ob_type(o)
     # np.float64 is a float subclass: same memory layout as float
     if external_call["PyType_IsSubtype", Int32](tp, ctx.t_float) != 0:
         bp[].ensure(40)
@@ -1236,17 +1308,17 @@ def int_batch(p: P8, len0: Int, items: Int, i: Int, cnt: Int, t_int: Int) -> Int
     comptime for j in range(NL):
         var oj = rdi(items, i + j)
         objs[j] = oj
-        ok = ok and rdi(oj, 1) == t_int
+        ok = ok and ob_type(oj) == t_int
     if ok:
         comptime for j in range(NL):
-            tags |= rdi(Int(objs[j]), 2)
+            tags |= long_tag(Int(objs[j]))
         if (tags & ~9) == 0:
             if i + 2 * NL <= cnt:
                 comptime for j in range(NL):
                     prefetch[PrefetchOptions().for_read().high_locality()](Pointer[Int, MutUntrackedOrigin](unsafe_from_address=rdi(items, i + NL + j)))
             var m = U4(0)
             comptime for j in range(NL):
-                m[j] = UInt64(Pointer[UInt32, MutUntrackedOrigin](unsafe_from_address=Int(objs[j]) + 24)[])
+                m[j] = UInt64(long_digits(Int(objs[j]))[])
             if m.lt(U4(100000000)).reduce_and():
                 var nd = ndigits_v(m)
                 var w = eight_digits_x4(m) >> ((U4(8) - nd) * 8)
@@ -1267,12 +1339,12 @@ def float_batch(p: P8, len0: Int, items: Int, i: Int, t_float: Int) -> Int:
     comptime for j in range(4):
         var oj = rdi(items, i + j)
         fo[j] = oj
-        fok = fok and rdi(oj, 1) == t_float
+        fok = fok and ob_type(oj) == t_float
     if fok:
         var bitsv = SIMD[DType.uint64, 4](0)
         var good = True
         comptime for j in range(4):
-            var bj = Pointer[UInt64, MutUntrackedOrigin](unsafe_from_address=Int(fo[j]) + 16)[]
+            var bj = float_bits(Int(fo[j]))
             bitsv[j] = bj
             good = good and ((bj >> 52) & 0x7FF) != 0x7FF and (bj << 1) != 0
         if good:
@@ -1354,8 +1426,8 @@ def ser_list_num[NONSTR: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=True], c
     var t_float = ctx.t_float
     var t_str = ctx.t_str
     var none_addr = ctx.none_addr
-    var cnt = rdi(o, 2)
-    var items = rdi(o, 3) if is_list else o + 24
+    var cnt = ob_size(o)
+    var items = list_items(o) if is_list else tuple_items(o)
     put_byte(bp, 91)
     var p = bp[].p
     var len = bp[].len
@@ -1369,7 +1441,7 @@ def ser_list_num[NONSTR: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=True], c
             p = bp[].p
             cap = bp[].cap
         var v = rdi(items, i)
-        var t = rdi(v, 1)
+        var t = ob_type(v)
         # SIMD batches live out of line so this loop stays small (no spills);
         # after a failed attempt, skip batching for a while (mixed lists).
         if i >= skip_until:
@@ -1436,10 +1508,10 @@ def ser_list_num[NONSTR: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=True], c
         if not ser_value[NONSTR, SORT, SOCKET](bp, cp, v, depth):
             return False
         if is_list:
-            if rdi(o, 2) != cnt:
+            if ob_size(o) != cnt:
                 bp[].err = 8
                 return False
-            items = rdi(o, 3)
+            items = list_items(o)
         p = bp[].p
         len = bp[].len
         cap = bp[].cap
@@ -1461,10 +1533,10 @@ def ser_list[NONSTR: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=True], c_: O
     var none_addr = ctx.none_addr
     var t_dict = ctx.t_dict
     var t_list = ctx.t_list
-    var cnt = rdi(o, 2)
-    var items = rdi(o, 3) if is_list else o + 24
+    var cnt = ob_size(o)
+    var items = list_items(o) if is_list else tuple_items(o)
     if cnt >= 8:
-        var t0 = rdi(rdi(items, 0), 1)
+        var t0 = ob_type(rdi(items, 0))
         if t0 == ctx.t_int or t0 == ctx.t_float:
             return ser_list_num[NONSTR, SORT, SOCKET](bp, cp, o, depth, is_list)
     put_byte(bp, 91)
@@ -1480,7 +1552,7 @@ def ser_list[NONSTR: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=True], c_: O
             p = bp[].p
             cap = bp[].cap
         var v = rdi(items, i)
-        var t = rdi(v, 1)
+        var t = ob_type(v)
         if i > 0:
             (p + len)[] = 44
             len += 1
@@ -1530,10 +1602,10 @@ def ser_list[NONSTR: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=True], c_: O
         if not ser_value[NONSTR, SORT, SOCKET](bp, cp, v, depth):
             return False
         if is_list:
-            if rdi(o, 2) != cnt:
+            if ob_size(o) != cnt:
                 bp[].err = 8
                 return False
-            items = rdi(o, 3)
+            items = list_items(o)
         p = bp[].p
         len = bp[].len
         cap = bp[].cap
@@ -1552,7 +1624,7 @@ def ser_dict[NONSTR: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=True], c_: O
         var items = external_call["mojson_sort_unicode", Int](o, Int(storage), 32)
         if items == 0:
             return False
-        var count = rdi(o, 2)
+        var count = ob_size(o)
         var ok = ser_dict_items[NONSTR, True, SOCKET](bp, cp, o, depth, items)
         external_call["mojson_release_sorted", NoneType](items, count, Int(storage))
         return ok
@@ -1582,7 +1654,7 @@ def ser_dict_items[NONSTR: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=True],
     var first = True
     var kc = ctx.kc
     var gen = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=kc)[]
-    var remaining = rdi(o, 2)  # ma_used: stop after len items, like orjson (no final PyDict_Next call)
+    var remaining = ob_size(o)  # ma_used: stop after len items, like orjson (no final PyDict_Next call)
     while remaining > 0:
         remaining -= 1
         comptime if SORT:
@@ -1594,8 +1666,8 @@ def ser_dict_items[NONSTR: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=True],
                 bp[].len = len
                 bp[].err = 8
                 return False
-        if unlikely(rdi(k, 1) != t_str):
-            if external_call["PyType_IsSubtype", Int32](rdi(k, 1), t_str) == 0:
+        if unlikely(ob_type(k) != t_str):
+            if external_call["PyType_IsSubtype", Int32](ob_type(k), t_str) == 0:
                 bp[].len = len
                 bp[].err = 8 if NONSTR else 4
                 return False
@@ -1669,7 +1741,7 @@ def ser_dict_items[NONSTR: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=True],
                     sk[unsafe_offset=2] = (gen << 16) | kl
         (p + len)[] = 58
         len += 1
-        var t = rdi(v, 1)
+        var t = ob_type(v)
         if t == t_str:
             var vsz = 0
             var vsrc = str_src(v, vsz)
@@ -1708,7 +1780,7 @@ def ser_dict_items[NONSTR: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=True],
             (p + len + 3)[] = 108
             len += 4
             continue
-        elif (t == t_dict or t == t_list) and rdi(v, 2) == 0:
+        elif (t == t_dict or t == t_list) and ob_size(v) == 0:
             (p + len)[] = 123 if t == t_dict else 91
             (p + len + 1)[] = 125 if t == t_dict else 93
             len += 2
@@ -1739,9 +1811,9 @@ def ser_fallback[INDENT: Bool, SORT: Bool, CONFIG: Bool, NONSTR: Bool, SOCKET: B
         return False
     var ok: Bool
     if fragment == 1:
-        var size = rdi(converted, 2)
+        var size = ob_size(converted)
         bp[].ensure(size)
-        _ = external_call["memcpy", Int](Int(bp[].p.unsafe_offset(bp[].len)), converted + 32, size)
+        _ = external_call["memcpy", Int](Int(bp[].p.unsafe_offset(bp[].len)), bytes_data(converted), size)
         bp[].len += size
         ok = True
     else:
@@ -1786,7 +1858,7 @@ def ser_configured_child[INDENT: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=
         if depth > 255:
             bp[].err = 3
             return False
-        var tp = rdi(o, 1)
+        var tp = ob_type(o)
         if tp == cp[].t_str:
             return write_str[SOCKET](bp, o)
         if tp == cp[].t_float:
@@ -1816,7 +1888,7 @@ def ser_configured[INDENT: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=True],
             if (option & 4) != 0:
                 return ser_value[True, SORT, SOCKET](bp, cp, o, depth)
             return ser_value[False, SORT, SOCKET](bp, cp, o, depth)
-    var tp = rdi(o, 1)
+    var tp = ob_type(o)
     if tp == ctx.t_str:
         return write_str[SOCKET](bp, o)
     if tp == ctx.t_int:
@@ -1834,8 +1906,8 @@ def ser_configured[INDENT: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=True],
         return ser_value[False, False, SOCKET](bp, cp, o, depth)
     if tp == ctx.t_list or tp == ctx.t_tuple:
         Pointer[Int, MutUntrackedOrigin](unsafe_from_address=cp[].ancestors)[unsafe_offset=depth + 1] = o
-        var count = rdi(o, 2)
-        var items = rdi(o, 3) if tp == ctx.t_list else o + 24
+        var count = ob_size(o)
+        var items = list_items(o) if tp == ctx.t_list else tuple_items(o)
         put_byte(bp, 91)
         for index in range(count):
             if index > 0:
@@ -1845,10 +1917,10 @@ def ser_configured[INDENT: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=True],
             if not ser_configured_child[INDENT, SORT, SOCKET](bp, cp, rdi(items, index), depth + 1):
                 return False
             if tp == ctx.t_list:
-                if rdi(o, 2) != count:
+                if ob_size(o) != count:
                     bp[].err = 8
                     return False
-                items = rdi(o, 3)
+                items = list_items(o)
         comptime if INDENT:
             if count > 0:
                 indent_line(bp, depth)
@@ -1866,8 +1938,8 @@ def ser_configured_dict[INDENT: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=T
     var pairs = external_call["mojson_prepare_items", Int](cp[].request, o, Int32(skip_sort), cp[].ancestors, depth + 1)
     if pairs == 0:
         return False
-    var count = rdi(pairs, 2)
-    var items = rdi(pairs, 3)
+    var count = ob_size(pairs)
+    var items = list_items(pairs)
     var ok = True
     put_byte(bp, 123)
     for index in range(count):
@@ -1876,13 +1948,13 @@ def ser_configured_dict[INDENT: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=T
             put_byte(bp, 44)
         comptime if INDENT:
             indent_line(bp, depth + 1)
-        if not write_str[SOCKET](bp, rdi(pair, 3)):
+        if not write_str[SOCKET](bp, rdi(tuple_items(pair), 0)):
             ok = False
             break
         put_byte(bp, 58)
         comptime if INDENT:
             put_byte(bp, 32)
-        if not ser_configured_child[INDENT, SORT, SOCKET](bp, cp, rdi(pair, 4), depth + 1):
+        if not ser_configured_child[INDENT, SORT, SOCKET](bp, cp, rdi(tuple_items(pair), 1), depth + 1):
             ok = False
             break
     external_call["Py_DecRef", NoneType](pairs)
@@ -1896,7 +1968,7 @@ def ser_configured_dict[INDENT: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=T
 
 @inline(.never)
 def ser_configured_dict_direct[INDENT: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=True], c_: Origin](bp: Pointer[Buf, o_], cp: Pointer[Ctx, c_], o: Int, depth: Int) -> Bool:
-    var count = rdi(o, 2)
+    var count = ob_size(o)
     var position = 0
     var key = 0
     var value = 0
@@ -1905,7 +1977,7 @@ def ser_configured_dict_direct[INDENT: Bool, SORT: Bool, SOCKET: Bool, o_: Origi
         if external_call["PyDict_Next", Int32](o, Int(Pointer(to=position)), Int(Pointer(to=key)), Int(Pointer(to=value))) == 0:
             bp[].err = 8
             return False
-        if rdi(key, 1) != cp[].t_str and external_call["PyType_IsSubtype", Int32](rdi(key, 1), cp[].t_str) == 0:
+        if ob_type(key) != cp[].t_str and external_call["PyType_IsSubtype", Int32](ob_type(key), cp[].t_str) == 0:
             bp[].err = 4
             return False
         if index > 0:
@@ -1955,21 +2027,7 @@ def write_cached_key[o_: Origin[mut=True], c_: Origin](bp: Pointer[Buf, o_], cp:
         slot[unsafe_offset=2] = (generation << 16) | size
     return True
 
-# ---------------- Python entry point: an Encoder object caches the type pointers ----------------
-struct SocketEncoder(Writable, Movable, Defaultable):
-    var ctx: Ctx
-    var ready: Bool
-
-    def __init__(out self):
-        self.ctx = Ctx(False)
-        self.ready = False
-
-    def write_to(self, mut writer: Some[Writer]):
-        writer.write("Encoder")
-
-    def write_repr_to(self, mut writer: Some[Writer]):
-        writer.write("Encoder")
-
+# ---------------- Python entry point: the module's Ctx caches the type pointers ----------------
 @export
 def mojson_encode(context: Int, obj: Int, request: Int) abi("C") -> Int:
     var ctx = Pointer[Ctx, MutUntrackedOrigin](unsafe_from_address=context)[]
@@ -2023,21 +2081,20 @@ def PyInit_mojson() abi("C") -> PythonObject:
     try:
         if external_call["mojson_check_runtime", Int32]() == 0:
             return PythonObject(from_owned=external_call["mojson_null", PyObjectPtr]())
-        var m = PythonModuleBuilder("mojson")
-        _ = m.add_type[SocketEncoder]("_Encoder").def_init_defaultable[SocketEncoder]()
-        var mod = m.finalize()
-        var e = SocketEncoder()
-        e.ctx.load()
+        var builder = PythonModuleBuilder("mojson")
+        var mod = builder.finalize()
+        # The context and key cache live for the whole process: the module is
+        # never unloaded, and no Python type is registered (Mojo allows one
+        # bound type per process, which would stop two builds loading together).
+        var ctx = alloc[Ctx](1)
+        ctx[] = Ctx(False)
+        ctx[].load()
         # key cache: word 0 = generation, then 512 slots x (key addr, out offset, gen<<16|len)
         var kc = alloc[Int](1 + 512 * 3)
         for z in range(1 + 512 * 3):
             (kc + z)[] = 0
-        e.ctx.kc = Int(kc)
-        e.ready = True
-        var enc = PythonObject(alloc=e^)
-        mod._encoder = enc
-        var encoder = enc.unchecked_downcast_value_ptr[SocketEncoder]()
-        if external_call["mojson_install", Int32](Int(mod._obj_ptr), Int(enc._obj_ptr), Int(Pointer(to=encoder[].ctx))) != 0:
+        ctx[].kc = Int(kc)
+        if external_call["mojson_install", Int32](Int(mod._obj_ptr), Int(ctx)) != 0:
             return PythonObject(from_owned=external_call["mojson_null", PyObjectPtr]())
         return mod
     except e:

@@ -6,14 +6,25 @@ NaN / Infinity are written the way Python's `json` writes them
 
 ## Build
 
-Requirements: CPython 3.12 and its headers, a C compiler, x86-64 with AVX2,
-and Mojo 1.1 (`pip install mojo`). The default build uses `.venv-bench/bin/python`
-for headers if available, otherwise `python3.12`; override with `PYTHON=...`.
+Requirements: CPython 3.12, 3.13, 3.14 or 3.15 (default GIL builds) with headers,
+a C compiler, x86-64 with AVX2, and Mojo 1.1 (`pip install mojo`). The build
+targets one interpreter at a time: it uses `.venv-bench/bin/python` if present,
+otherwise `python3`; override with `PYTHON=...`.
 
 ```bash
-./build.sh            # -> build/mojson.so
+./build.sh                               # -> build/mojson.cpython-312-x86_64-linux-gnu.so
+PYTHON=python3.14 ./build.sh             # -> build/mojson.cpython-314-x86_64-linux-gnu.so
 export PYTHONPATH="$PWD/build${PYTHONPATH:+:$PYTHONPATH}"
 ```
+
+The output carries the interpreter's extension suffix, so builds for several
+versions coexist in `build/` and each interpreter imports its own. The Mojo
+loops read CPython object fields directly; `build.sh` probes those offsets from
+the target headers (`src/layout_probe.c`) and passes them to both compilers.
+The C shim re-checks them with `_Static_assert`, and the module verifies them
+against live objects at import, so an unsupported interpreter fails with an
+`ImportError` instead of reading memory wrongly. The only layout difference in
+this range is the tuple item offset (3.14 added a cached tuple hash).
 
 ## Use
 
@@ -87,7 +98,7 @@ python tests/check_correctness.py path/to/jsonexamples     # corpus optional
 python tests/check_features.py                            # options, types, callbacks, decoding
 python bench/bench_paired.py path/to/jsonexamples          # mojson vs orjson, robust
 python bench/bench_features.py                            # enabled feature paths vs orjson
-python bench/bench_regression.py                          # requires build/baseline/mojson.so
+python bench/bench_regression.py                          # requires a baseline build in build/baseline/
 python bench/bench_all_libraries.py path/to/jsonexamples   # + msgspec, ujson, rapidjson, json, simplejson
 python bench/bench_numpy.py
 ```
@@ -107,7 +118,7 @@ and `build/indent-reflex-benchmark.json`.
 ### Local comparison with uv
 
 If Mojo is already installed in `.venv`, keep that compiler environment and use
-a separate CPython 3.12 environment for the extension:
+a separate CPython environment for the extension (3.12 shown; any of 3.12 - 3.15 works):
 
 ```bash
 uv venv --python 3.12 .venv-bench
@@ -117,6 +128,17 @@ PATH="$PWD/.venv/bin:$PATH" ./build.sh
 .venv-bench/bin/python tests/check_correctness.py build/jsonexamples
 .venv-bench/bin/python tests/check_features.py
 .venv-bench/bin/python bench/bench_paired.py build/jsonexamples --cpu 2 --micro --output build/paired-local.json
+```
+
+To build and test every supported version side by side:
+
+```bash
+for v in 3.13 3.14 3.15; do
+  uv venv --python $v .venv-py$v && uv pip install --python .venv-py$v/bin/python orjson numpy
+  PATH="$PWD/.venv/bin:$PATH" PYTHON=.venv-py$v/bin/python ./build.sh
+  .venv-py$v/bin/python tests/check_correctness.py build/jsonexamples
+  .venv-py$v/bin/python tests/check_features.py
+done
 ```
 
 Choose an available logical CPU for `--cpu`, or omit it. The paired benchmark
@@ -129,7 +151,8 @@ revision and SHA-256 hashes in `build/jsonexamples/manifest.json.txt`.
 
 ## What's inside (src/mojson.mojo)
 
-- Direct reads of CPython 3.12 object layouts (type pointer, list items, compact ints, float bits, str data)
+- Direct reads of CPython object layouts (type pointer, list/tuple items, compact ints, float bits, str data)
+  for 3.12 - 3.15, with the offsets supplied by the build and verified at import,
   and `external_call` into the CPython C API; output written straight into a `bytes` object.
 - Floats: Żmij shortest round-trip core (one 64x128 multiply), SSE BCD digit conversion and `pshufb`
   decimal-point insertion (ported from zmij), exponent table, 4-float batches.
@@ -151,8 +174,10 @@ revision and SHA-256 hashes in `build/jsonexamples/manifest.json.txt`.
   decoder rejects these tokens, so nonfinite output does not round-trip through `loads`.
 - NumPy float32 values are formatted after promotion to float64, which can
   produce more decimal digits than orjson. Non-contiguous arrays use `.tolist()`.
-- CPython 3.12 internal layouts only; x86-64 AVX2 only (no runtime AVX-512 dispatch yet).
-- Keep `build/_mojson_support.py` alongside `build/mojson.so`; the build copies
+- CPython 3.12 - 3.15 default (GIL) builds only: free-threaded (`t`) builds lay
+  objects out differently and are rejected at build time. One build serves one
+  minor version. x86-64 AVX2 only (no runtime AVX-512 dispatch yet).
+- Keep `build/_mojson_support.py` alongside the built `mojson.*.so`; the build copies
   this stdlib-only helper automatically. The extension has no orjson runtime dependency.
 - The string tail reads up to 31 bytes past a string's end within the same memory page (safe, but
   AddressSanitizer/valgrind will flag it).

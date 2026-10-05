@@ -1,27 +1,133 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 #include <datetime.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <math.h>
 #include <stdlib.h>
 
+#if PY_VERSION_HEX < 0x030C0000 || PY_VERSION_HEX >= 0x03100000
+#error "mojson supports CPython 3.12 through 3.15"
+#endif
+#ifdef Py_GIL_DISABLED
+#error "mojson reads the default (GIL) object layouts; free-threaded builds are not supported"
+#endif
+#ifndef MOJSON_TUPLE_ITEMS
+#error "build with ./build.sh, which passes the probed object layout to both compilers"
+#endif
+
+/* The Mojo loops read these object fields directly. build.sh probes them from
+   the target headers (src/layout_probe.c) and passes the same values to both
+   compilers; this re-check catches a mismatch between the two. */
+#define MOJSON_LAYOUT(name, expr) _Static_assert((expr) == (name), #name " does not match the Python headers")
+MOJSON_LAYOUT(MOJSON_PY_MINOR, PY_MINOR_VERSION);
+MOJSON_LAYOUT(MOJSON_OB_TYPE, offsetof(PyObject, ob_type));
+MOJSON_LAYOUT(MOJSON_OB_SIZE, offsetof(PyVarObject, ob_size));
+MOJSON_LAYOUT(MOJSON_TP_NAME, offsetof(PyTypeObject, tp_name));
+MOJSON_LAYOUT(MOJSON_FLOAT_VALUE, offsetof(PyFloatObject, ob_fval));
+MOJSON_LAYOUT(MOJSON_LONG_TAG, offsetof(PyLongObject, long_value.lv_tag));
+MOJSON_LAYOUT(MOJSON_LONG_DIGITS, offsetof(PyLongObject, long_value.ob_digit));
+MOJSON_LAYOUT(MOJSON_LIST_ITEMS, offsetof(PyListObject, ob_item));
+MOJSON_LAYOUT(MOJSON_TUPLE_ITEMS, offsetof(PyTupleObject, ob_item));
+MOJSON_LAYOUT(MOJSON_BYTES_DATA, offsetof(PyBytesObject, ob_sval));
+MOJSON_LAYOUT(MOJSON_DICT_USED, offsetof(PyDictObject, ma_used));
+MOJSON_LAYOUT(MOJSON_DICT_KEYS, offsetof(PyDictObject, ma_keys));
+MOJSON_LAYOUT(MOJSON_STR_LENGTH, offsetof(PyASCIIObject, length));
+MOJSON_LAYOUT(MOJSON_STR_STATE, offsetof(PyASCIIObject, state));
+MOJSON_LAYOUT(MOJSON_STR_ASCII_DATA, sizeof(PyASCIIObject));
+MOJSON_LAYOUT(MOJSON_STR_UTF8_LENGTH, offsetof(PyCompactUnicodeObject, utf8_length));
+MOJSON_LAYOUT(MOJSON_STR_UTF8, offsetof(PyCompactUnicodeObject, utf8));
+/* Compact integers: lv_tag = ndigits << 3 | sign (0 positive, 1 zero, 2 negative). */
 _Static_assert(PyLong_SHIFT == 30, "mojson requires 30-bit CPython integer digits");
+_Static_assert(_PyLong_NON_SIZE_BITS == 3 && _PyLong_SIGN_MASK == 3, "mojson requires the 3.12 lv_tag encoding");
+_Static_assert(sizeof(digit) == 4, "mojson requires 32-bit integer digits");
+/* Py_buffer fields read by the NumPy fast path. */
+_Static_assert(offsetof(Py_buffer, len) == 16 && offsetof(Py_buffer, itemsize) == 24 && offsetof(Py_buffer, ndim) == 36
+    && offsetof(Py_buffer, format) == 40 && offsetof(Py_buffer, shape) == 48 && offsetof(Py_buffer, strides) == 56
+    && sizeof(Py_buffer) <= 128, "Py_buffer layout");
 
 /* All Python ownership and keyword parsing lives here, outside the Mojo loops. */
 extern uintptr_t mojson_encode(uintptr_t context, uintptr_t object, uintptr_t request);
+
+static int runtime_failure(const char *what) {
+    PyErr_Format(PyExc_ImportError, "mojson was built for CPython %d.%d; this interpreter's %s layout differs",
+                 PY_MAJOR_VERSION, PY_MINOR_VERSION, what);
+    return 0;
+}
+
+#define WORD(obj, offset) (*(uintptr_t *)((char *)(obj) + (offset)))
+
+/* The field positions above are compile-time facts about the headers. This
+   confirms them against live objects of the running interpreter, including
+   the str state bits and the dict key-table kind byte, which the headers do
+   not expose as offsets. Runs once at import. */
 int mojson_check_runtime(void) {
-    if (strncmp(Py_GetVersion(), "3.12.", 5) != 0) {
-        PyErr_SetString(PyExc_ImportError, "mojson requires CPython 3.12");
+    if ((Py_Version >> 16) != (PY_VERSION_HEX >> 16)) {
+        PyErr_Format(PyExc_ImportError, "mojson was built for CPython %d.%d, not %lu.%lu",
+                     PY_MAJOR_VERSION, PY_MINOR_VERSION, Py_Version >> 24, (Py_Version >> 16) & 0xFF);
         return 0;
     }
-    return 1;
+    int ok = 0;
+    PyObject *ascii = PyUnicode_FromString("mojson"), *wide = PyUnicode_FromString("mojs\xc3\xb6n");
+    PyObject *negative = PyLong_FromLong(-5), *zero = PyLong_FromLong(0), *wide_int = PyLong_FromLongLong(1LL << 40);
+    PyObject *real = PyFloat_FromDouble(1.5), *list = NULL, *tuple = NULL, *bytes = PyBytes_FromString("xyz");
+    PyObject *text_keys = PyDict_New(), *general_keys = PyDict_New();
+    if (!ascii || !wide || !negative || !zero || !wide_int || !real || !bytes || !text_keys || !general_keys) goto done;
+    list = PyList_New(1);
+    tuple = PyTuple_New(1);
+    if (!list || !tuple) goto done;
+    PyList_SET_ITEM(list, 0, Py_NewRef(real));
+    PyTuple_SET_ITEM(tuple, 0, Py_NewRef(real));
+    if (PyDict_SetItem(text_keys, ascii, zero) < 0 || PyDict_SetItem(general_keys, zero, zero) < 0) goto done;
+    if (WORD(ascii, MOJSON_OB_TYPE) != (uintptr_t)&PyUnicode_Type || *(const char **)((char *)&PyUnicode_Type + MOJSON_TP_NAME) != PyUnicode_Type.tp_name) {
+        runtime_failure("object header"); goto done;
+    }
+    uint32_t state = *(uint32_t *)((char *)ascii + MOJSON_STR_STATE);
+    if ((state & 0x60) != 0x60 || (Py_ssize_t)WORD(ascii, MOJSON_STR_LENGTH) != 6
+        || (char *)ascii + MOJSON_STR_ASCII_DATA != (char *)PyUnicode_DATA(ascii) || memcmp((char *)ascii + MOJSON_STR_ASCII_DATA, "mojson", 7) != 0) {
+        runtime_failure("str"); goto done;
+    }
+    Py_ssize_t utf8_length = 0;
+    const char *utf8 = PyUnicode_AsUTF8AndSize(wide, &utf8_length);
+    state = *(uint32_t *)((char *)wide + MOJSON_STR_STATE);
+    if (!utf8 || (state & 0x60) != 0x20 || (Py_ssize_t)WORD(wide, MOJSON_STR_UTF8_LENGTH) != utf8_length || (const char *)WORD(wide, MOJSON_STR_UTF8) != utf8) {
+        runtime_failure("compact str utf8 cache"); goto done;
+    }
+    uintptr_t tag = WORD(negative, MOJSON_LONG_TAG);
+    if ((tag & 3) != 2 || (tag >> 3) != 1 || *(uint32_t *)((char *)negative + MOJSON_LONG_DIGITS) != 5
+        || (WORD(zero, MOJSON_LONG_TAG) & 3) != 1 || (WORD(wide_int, MOJSON_LONG_TAG) >> 3) != 2
+        || ((uint64_t)((uint32_t *)((char *)wide_int + MOJSON_LONG_DIGITS))[1] << 30) != (1ULL << 40)) {
+        runtime_failure("int"); goto done;
+    }
+    double value;
+    memcpy(&value, (char *)real + MOJSON_FLOAT_VALUE, sizeof value);
+    if (value != 1.5) { runtime_failure("float"); goto done; }
+    if ((Py_ssize_t)WORD(list, MOJSON_OB_SIZE) != 1 || ((PyObject **)WORD(list, MOJSON_LIST_ITEMS))[0] != real) {
+        runtime_failure("list"); goto done;
+    }
+    if ((Py_ssize_t)WORD(tuple, MOJSON_OB_SIZE) != 1 || (PyObject *)WORD(tuple, MOJSON_TUPLE_ITEMS) != real) {
+        runtime_failure("tuple"); goto done;
+    }
+    if ((Py_ssize_t)WORD(bytes, MOJSON_OB_SIZE) != 3 || memcmp((char *)bytes + MOJSON_BYTES_DATA, "xyz", 4) != 0) {
+        runtime_failure("bytes"); goto done;
+    }
+    /* dk_kind: DICT_KEYS_GENERAL (0) only when a key is not str. */
+    if ((Py_ssize_t)WORD(text_keys, MOJSON_DICT_USED) != 1 || ((unsigned char *)WORD(text_keys, MOJSON_DICT_KEYS))[10] == 0
+        || ((unsigned char *)WORD(general_keys, MOJSON_DICT_KEYS))[10] != 0) {
+        runtime_failure("dict"); goto done;
+    }
+    ok = 1;
+done:
+    Py_XDECREF(ascii); Py_XDECREF(wide); Py_XDECREF(negative); Py_XDECREF(zero); Py_XDECREF(wide_int);
+    Py_XDECREF(real); Py_XDECREF(list); Py_XDECREF(tuple); Py_XDECREF(bytes); Py_XDECREF(text_keys); Py_XDECREF(general_keys);
+    return ok;
 }
 
 PyObject *mojson_null(void) { return NULL; }
 
 typedef struct {
     uintptr_t context;
-    PyObject *encoder, *convert, *key_string, *fragment_type, *dataclass_fields_type, *uuid_type;
+    PyObject *convert, *key_string, *fragment_type, *dataclass_fields_type, *uuid_type;
     PyObject *dataclass_name, *field_kind_name, *field_sentinel;
     PyObject *enum_type;
 } ModuleState;
@@ -50,7 +156,6 @@ static PyMethodDef socket_method = {
 static void destroy_state(PyObject *capsule) {
     ModuleState *state = PyCapsule_GetPointer(capsule, "mojson.state");
     if (!state) { PyErr_Clear(); return; }
-    Py_XDECREF(state->encoder);
     Py_XDECREF(state->convert);
     Py_XDECREF(state->key_string);
     Py_XDECREF(state->fragment_type);
@@ -70,22 +175,17 @@ static void wrap_error(int callback) {
     }
     if ((!callback && (PyErr_ExceptionMatches(PyExc_TypeError) || PyErr_ExceptionMatches(PyExc_MemoryError)))
         || PyErr_ExceptionMatches(PyExc_KeyboardInterrupt) || PyErr_ExceptionMatches(PyExc_SystemExit)) return;
-    PyObject *type, *value, *traceback;
-    PyErr_Fetch(&type, &value, &traceback);
-    PyErr_NormalizeException(&type, &value, &traceback);
-    PyObject *message = value ? PyObject_Str(value) : PyUnicode_FromString("Unable to serialize object");
+    PyObject *value = PyErr_GetRaisedException();
+    PyObject *message = PyObject_Str(value);
     PyObject *error = message ? PyObject_CallOneArg(PyExc_TypeError, message) : NULL;
     Py_XDECREF(message);
     if (error) {
-        if (value) {
-            if (traceback) PyException_SetTraceback(value, traceback);
-            PyException_SetCause(error, value);
-            value = NULL;
-        }
+        PyException_SetCause(error, value);  /* steals value */
         PyErr_SetObject(PyExc_TypeError, error);
         Py_DECREF(error);
+    } else {
+        Py_DECREF(value);
     }
-    Py_XDECREF(type); Py_XDECREF(value); Py_XDECREF(traceback);
 }
 
 static inline __attribute__((always_inline)) PyObject *dumps_impl(PyObject *capsule, PyObject *const *args, Py_ssize_t nargs, PyObject *kwnames, int socket) {
@@ -383,9 +483,19 @@ static PyObject *uuid_string(PyObject *obj) {
         PyErr_SetString(PyExc_TypeError, "UUID.int must be an integer");
         return NULL;
     }
+#if PY_VERSION_HEX >= 0x030D0000
+    Py_ssize_t needed = PyLong_AsNativeBytes(integer, bytes, 16, Py_ASNATIVEBYTES_BIG_ENDIAN | Py_ASNATIVEBYTES_UNSIGNED_BUFFER);
+    Py_DECREF(integer);
+    if (needed < 0) return NULL;
+    if (needed > 16) {
+        PyErr_SetString(PyExc_TypeError, "UUID.int exceeds 128 bits");
+        return NULL;
+    }
+#else
     int status = _PyLong_AsByteArray((PyLongObject *)integer, bytes, 16, 0, 0);
     Py_DECREF(integer);
     if (status < 0) return NULL;
+#endif
     static const char hex[] = "0123456789abcdef";
     char text[36];
     int size = 0;
@@ -656,7 +766,7 @@ void mojson_error(int code) {
     PyErr_SetString(PyExc_TypeError, message);
 }
 
-int mojson_install(uintptr_t module_ptr, uintptr_t encoder_ptr, uintptr_t context) {
+int mojson_install(uintptr_t module_ptr, uintptr_t context) {
     PyObject *module = (PyObject *)module_ptr;
     PyDateTime_IMPORT;
     if (!PyDateTimeAPI) return -1;
@@ -665,7 +775,6 @@ int mojson_install(uintptr_t module_ptr, uintptr_t encoder_ptr, uintptr_t contex
     ModuleState *state = PyMem_Calloc(1, sizeof(ModuleState));
     if (!state) { Py_DECREF(support); PyErr_NoMemory(); return -1; }
     state->context = context;
-    state->encoder = Py_NewRef((PyObject *)encoder_ptr);
     state->convert = PyObject_GetAttrString(support, "convert");
     state->key_string = PyObject_GetAttrString(support, "_key_string");
     state->fragment_type = PyObject_GetAttrString(support, "Fragment");
@@ -689,8 +798,7 @@ int mojson_install(uintptr_t module_ptr, uintptr_t encoder_ptr, uintptr_t contex
     }
     PyObject *capsule = PyCapsule_New(state, "mojson.state", destroy_state);
     if (!capsule) {
-        Py_XDECREF(state->encoder); Py_XDECREF(state->convert);
-        Py_XDECREF(state->key_string); Py_XDECREF(state->fragment_type);
+        Py_XDECREF(state->convert); Py_XDECREF(state->key_string); Py_XDECREF(state->fragment_type);
         Py_XDECREF(state->dataclass_fields_type);
         Py_XDECREF(state->uuid_type);
         Py_XDECREF(state->dataclass_name); Py_XDECREF(state->field_kind_name); Py_XDECREF(state->field_sentinel);
