@@ -1,0 +1,9 @@
+{
+  "packets": 3000,
+  "same_semantics": true,
+  "stdlib_json_dumps_disabled": true,
+  "stdlib_retry_disabled": true,
+  "python_marker_walk_disabled": true,
+  "upload_writer_uses_native_socket": true,
+  "mojson_sha256": "ba830ec5d9e54a29a12a0298a7acf95204620a23905c33d7432e1117fa880555"
+}

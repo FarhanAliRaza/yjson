@@ -1,0 +1,35 @@
+{
+  "checked_at": "2026-10-05T22:13:38.199301+00:00",
+  "reflex_pr": "https://github.com/reflex-dev/reflex/pull/6116",
+  "reflex_commit": "f2b00b407b892778e259eb0c671a89c03524ea7d",
+  "python": "3.12.13",
+  "orjson": "3.12.0",
+  "mojson_sha256": "ba830ec5d9e54a29a12a0298a7acf95204620a23905c33d7432e1117fa880555",
+  "feature_test_groups": 24,
+  "selected_reflex_tests_passed": 156,
+  "native_wire_fuzz_packets": 3000,
+  "stdlib_encoder_retry_and_marker_walk_disabled": true,
+  "upload_writer_native": true,
+  "correctness_mismatches": 0,
+  "default_corpus_geomean_to_previous": 1.0010316364456493,
+  "profiling": "socket-profile-summary.json",
+  "benchmarks": "socket-reflex-benchmark.json",
+  "regression": "socket-regression.json",
+  "production_export_exit_code": 0,
+  "browser": {
+    "evidence": "socket-reflex-browser.json",
+    "mojson_all_passed": true,
+    "orjson_all_passed": true,
+    "console_errors_or_warnings": 0,
+    "mojson_url": "http://localhost:3036/",
+    "orjson_url": "http://localhost:3037/"
+  },
+  "scope": "Native mojson socket path replaces PR stdlib retry; orjson baseline remains the original PR codec; CPython 3.12, x86-64 AVX2",
+  "limitations": [
+    "Socket speedups include removing framework retry overhead; full event processing excludes network and rendering.",
+    "Default corpus is unchanged overall; small dict is 104 to 107 ns and empty dict is 72 to 73 ns.",
+    "Sorted artifact is about 2% slower in this run; indentation is around parity.",
+    "Small finite floats can differ in decimal spelling from the PR stdlib fallback.",
+    "Benchmark quartiles describe spread, not confidence intervals."
+  ]
+}

@@ -1,0 +1,255 @@
+{
+  "rate_hz": 400,
+  "seconds": 10,
+  "filter": "Only profile_native.py:44 call stacks; startup/import/timer samples excluded",
+  "current_sha256": "ba830ec5d9e54a29a12a0298a7acf95204620a23905c33d7432e1117fa880555",
+  "before_sha256": "4964ed89728cc0e088656fd3b868dc9ad65aed08609734ab81c213cd9e9ad1bc",
+  "before": {
+    "path": "build/profile-special-before.txt",
+    "total_samples": 5855,
+    "steady_call_samples": 3963,
+    "inclusive": {
+      "stdlib_retry": {
+        "samples": 3301,
+        "fraction": 0.83295483219783
+      },
+      "stdlib_json_encoder": {
+        "samples": 2285,
+        "fraction": 0.576583396416856
+      },
+      "python_marker_walk": {
+        "samples": 664,
+        "fraction": 0.1675498359828413
+      },
+      "native_socket": {
+        "samples": 0,
+        "fraction": 0.0
+      },
+      "custom_conversion": {
+        "samples": 250,
+        "fraction": 0.06308352258390108
+      },
+      "integer_rejection": {
+        "samples": 30,
+        "fraction": 0.00757002271006813
+      }
+    },
+    "top_leaf_frames": [
+      {
+        "frame": "mojson::ser_dict_items[LITMutOrigin,::Bool,LITOrigin[$1._mlir_value],::Bool,::Bool,::Origin[True, $0],::Origin[$1, $2]](::Pointer[True, $0, mojson::Buf, $5, AddressSpace.GENERIC],::Pointer[$1, $2, mojson::Ctx, $6, AddressSpace.GENERIC],::SIMD[DType.int, 1],::SIMD[DType.int, 1],::SIMD[DType.int, 1]),c_.mut`1=true,NONSTR=true,SORT=false (mojson.so)",
+        "fraction": 0.0174110522331567
+      },
+      {
+        "frame": "0x1a780c9 (python3.12)",
+        "fraction": 0.012869038607115822
+      },
+      {
+        "frame": "0x1813bc7 (python3.12)",
+        "fraction": 0.012869038607115822
+      },
+      {
+        "frame": "0x1813bbc (python3.12)",
+        "fraction": 0.011102699974766591
+      },
+      {
+        "frame": "0x1999684 (python3.12)",
+        "fraction": 0.009084027252081756
+      },
+      {
+        "frame": "0x1802293 (python3.12)",
+        "fraction": 0.008327024981074944
+      },
+      {
+        "frame": "0x180c019 (python3.12)",
+        "fraction": 0.008074690890739339
+      },
+      {
+        "frame": "0x1801b78 (python3.12)",
+        "fraction": 0.007317688619732526
+      },
+      {
+        "frame": "0x18022a1 (python3.12)",
+        "fraction": 0.007317688619732526
+      },
+      {
+        "frame": "0x18139da (python3.12)",
+        "fraction": 0.0063083522583901085
+      },
+      {
+        "frame": "BIO_listen (python3.12)",
+        "fraction": 0.0063083522583901085
+      },
+      {
+        "frame": "0x18137f7 (python3.12)",
+        "fraction": 0.005299015897047691
+      }
+    ]
+  },
+  "orjson_pr": {
+    "path": "build/profile-special-orjson.txt",
+    "total_samples": 5487,
+    "steady_call_samples": 3969,
+    "inclusive": {
+      "stdlib_retry": {
+        "samples": 3330,
+        "fraction": 0.8390022675736961
+      },
+      "stdlib_json_encoder": {
+        "samples": 2290,
+        "fraction": 0.5769715293524817
+      },
+      "python_marker_walk": {
+        "samples": 676,
+        "fraction": 0.17031997984378935
+      },
+      "native_socket": {
+        "samples": 0,
+        "fraction": 0.0
+      },
+      "custom_conversion": {
+        "samples": 0,
+        "fraction": 0.0
+      },
+      "integer_rejection": {
+        "samples": 0,
+        "fraction": 0.0
+      }
+    },
+    "top_leaf_frames": [
+      {
+        "frame": "0x1813bc7 (python3.12)",
+        "fraction": 0.015117157974300832
+      },
+      {
+        "frame": "0x1a780c9 (python3.12)",
+        "fraction": 0.013857394809775762
+      },
+      {
+        "frame": "0x180c019 (python3.12)",
+        "fraction": 0.011085915847820609
+      },
+      {
+        "frame": "0x18139da (python3.12)",
+        "fraction": 0.011085915847820609
+      },
+      {
+        "frame": "0x1802293 (python3.12)",
+        "fraction": 0.010833963214915596
+      },
+      {
+        "frame": "bytearray_replace (python3.12)",
+        "fraction": 0.009574200050390527
+      },
+      {
+        "frame": "0x18022a1 (python3.12)",
+        "fraction": 0.009574200050390527
+      },
+      {
+        "frame": "0x1813bbc (python3.12)",
+        "fraction": 0.008818342151675485
+      },
+      {
+        "frame": "BIO_listen (python3.12)",
+        "fraction": 0.00781053162005543
+      },
+      {
+        "frame": "0x1813746 (python3.12)",
+        "fraction": 0.00655076845553036
+      },
+      {
+        "frame": "0x1999684 (python3.12)",
+        "fraction": 0.0062988158226253465
+      },
+      {
+        "frame": "0x1801b78 (python3.12)",
+        "fraction": 0.006046863189720333
+      }
+    ]
+  },
+  "native_socket": {
+    "path": "build/profile-special-native.txt",
+    "total_samples": 5592,
+    "steady_call_samples": 3914,
+    "inclusive": {
+      "stdlib_retry": {
+        "samples": 0,
+        "fraction": 0.0
+      },
+      "stdlib_json_encoder": {
+        "samples": 0,
+        "fraction": 0.0
+      },
+      "python_marker_walk": {
+        "samples": 0,
+        "fraction": 0.0
+      },
+      "native_socket": {
+        "samples": 2937,
+        "fraction": 0.7503832396525294
+      },
+      "custom_conversion": {
+        "samples": 1492,
+        "fraction": 0.3811957077158917
+      },
+      "integer_rejection": {
+        "samples": 0,
+        "fraction": 0.0
+      }
+    },
+    "top_leaf_frames": [
+      {
+        "frame": "dumps_socket (mojson.so)",
+        "fraction": 0.11318344404701074
+      },
+      {
+        "frame": "mojson::ser_dict_items[LITMutOrigin,::Bool,LITOrigin[$1._mlir_value],::Bool,::Bool,::Bool,::Origin[True, $0],::Origin[$1, $2]](::Pointer[True, $0, mojson::Buf, $6, AddressSpace.GENERIC],::Pointer[$1, $2, mojson::Ctx, $7, AddressSpace.GENERIC],::SIMD[DType.int, 1],::SIMD[DType.int, 1],::SIMD[DType.int, 1]),c_.mut`1=true,NONSTR=true,SORT=false,SOCKET=true (mojson.so)",
+        "fraction": 0.07128257537046499
+      },
+      {
+        "frame": "0x1813bc7 (python3.12)",
+        "fraction": 0.01430761369443025
+      },
+      {
+        "frame": "0x18022a1 (python3.12)",
+        "fraction": 0.012263668880940215
+      },
+      {
+        "frame": "mojson::ser_list[LITMutOrigin,::Bool,LITOrigin[$1._mlir_value],::Bool,::Bool,::Bool,::Origin[True, $0],::Origin[$1, $2]](::Pointer[True, $0, mojson::Buf, $6, AddressSpace.GENERIC],::Pointer[$1, $2, mojson::Ctx, $7, AddressSpace.GENERIC],::SIMD[DType.int, 1],::SIMD[DType.int, 1],::Bool),c_.mut`1=true,NONSTR=true,SORT=false,SOCKET=true (mojson.so)",
+        "fraction": 0.012263668880940215
+      },
+      {
+        "frame": "BIO_listen (python3.12)",
+        "fraction": 0.011752682677567705
+      },
+      {
+        "frame": "0x1813bbc (python3.12)",
+        "fraction": 0.011241696474195196
+      },
+      {
+        "frame": "0x18139da (python3.12)",
+        "fraction": 0.010730710270822688
+      },
+      {
+        "frame": "0x1814d40 (python3.12)",
+        "fraction": 0.010475217169136432
+      },
+      {
+        "frame": "_nc_init_color (python3.12)",
+        "fraction": 0.010219724067450179
+      },
+      {
+        "frame": "0x1801b78 (python3.12)",
+        "fraction": 0.008431272355646398
+      },
+      {
+        "frame": "0x18139d0 (python3.12)",
+        "fraction": 0.007664793050587634
+      }
+    ]
+  },
+  "limitations": [
+    "Sampling fractions are not benchmark speedups.",
+    "Several CPython/orjson frames have stripped or misleading native symbols.",
+    "Custom-type conversion remains necessary for the Reflex serializer callback; it does not invoke stdlib JSON."
+  ]
+}

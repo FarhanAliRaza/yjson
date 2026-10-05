@@ -1,0 +1,166 @@
+# mojson
+
+A JSON serializer for CPython written in Mojo, with an orjson-style API.
+NaN / Infinity are written the way Python's `json` writes them
+(`NaN`, `Infinity`, `-Infinity`), and NumPy arrays and scalars are supported directly.
+
+## Build
+
+Requirements: CPython 3.12 and its headers, a C compiler, x86-64 with AVX2,
+and Mojo 1.1 (`pip install mojo`). The default build uses `.venv-bench/bin/python`
+for headers if available, otherwise `python3.12`; override with `PYTHON=...`.
+
+```bash
+./build.sh            # -> build/mojson.so
+export PYTHONPATH="$PWD/build${PYTHONPATH:+:$PYTHONPATH}"
+```
+
+## Use
+
+```python
+import mojson
+mojson.dumps({"a": [1, 2.5, None], "b": float("nan")})   # b'{"a":[1,2.5,null],"b":NaN}'
+mojson.dumps(obj).decode()                                # if you need a str
+mojson.loads(b'{"a": 1}')                                # -> {"a": 1}
+```
+
+See `examples/usage.py` (NumPy, NaN, files, errors).
+
+`dumps(obj, /, default=None, option=None)` returns bytes. In addition to the
+basic JSON types, it supports datetime/date/time, UUID, Enum, dataclass
+instances, and subclasses of str/int/list/dict. Dataclass fields beginning
+with `_` are omitted. Tuple subclasses use `default` rather than being treated
+as arrays. Encoding errors are `JSONEncodeError`, an alias of `TypeError`;
+exceptions raised by a default callback are attached as `__cause__`.
+
+```python
+import datetime
+import decimal
+import mojson
+
+data = {"created": datetime.datetime(2024, 1, 2), "amount": decimal.Decimal("12.50")}
+out = mojson.dumps(
+    data,
+    default=str,
+    option=mojson.OPT_NAIVE_UTC | mojson.OPT_UTC_Z | mojson.OPT_INDENT_2,
+)
+mojson.dumps({2: "b", 1: "a"}, option=mojson.OPT_NON_STR_KEYS | mojson.OPT_SORT_KEYS)
+mojson.dumps({"cached": mojson.Fragment(b'{"a":1}')})
+```
+
+Options use the same bit values as [orjson](https://github.com/ijl/orjson#option):
+`OPT_INDENT_2`, `OPT_SORT_KEYS`, `OPT_NON_STR_KEYS`, `OPT_STRICT_INTEGER`,
+`OPT_APPEND_NEWLINE`, `OPT_NAIVE_UTC`, `OPT_UTC_Z`, `OPT_OMIT_MICROSECONDS`,
+and `OPT_PASSTHROUGH_DATACLASS`, `OPT_PASSTHROUGH_DATETIME`,
+`OPT_PASSTHROUGH_SUBCLASS`. `OPT_SERIALIZE_NUMPY` is accepted; NumPy support
+is already automatic. The deprecated `OPT_SERIALIZE_DATACLASS` and
+`OPT_SERIALIZE_UUID` are zero. Flags can be combined with `|`.
+
+Integers support the range `-2**63` through `2**64 - 1`; strict mode restricts
+values to `-(2**53 - 1)` through `2**53 - 1`. Non-string integer keys retain
+the 64-bit range in strict mode. Non-string key conversion preserves duplicate
+JSON keys. Fragments insert their contents verbatim, including under indentation;
+validate the contents yourself when needed.
+
+The compact default path keeps the original SIMD loops. Indentation and sorting
+use separate compiled traversal variants. Enabling options, custom conversions,
+or uncommon types costs additional work; their speed should be measured on your
+payload. `loads` uses Python's standard parser with UTF-8, nonfinite-number,
+and surrogate checks. It accepts str/bytes/bytearray/contiguous memoryview and
+raises `JSONDecodeError` (a subclass of `json.JSONDecodeError`). Its parsing
+speed and maximum nesting follow the stdlib backend, rather than orjson's parser.
+
+`dumps_socket(obj, /, default=None)` is a separate native encoder for Reflex
+wire packets. It accepts arbitrary-size integers (subject to CPython's decimal
+digit limit), preserves NaN/Infinity and `None`, escapes lone surrogates, and
+protects strings that collide with Reflex's special-value markers. It returns
+bytes and accepts no formatting options. Framework custom types use `default`.
+The integration in `bench/reflex_codec.py` replaces the socket boundary with
+this function, eliminating stdlib retries and repeated Python container walks.
+Ordinary `dumps()` keeps its integer range and UTF-8 error behavior.
+
+## Test and benchmark
+
+```bash
+pip install orjson numpy
+python tests/check_correctness.py path/to/jsonexamples     # corpus optional
+python tests/check_features.py                            # options, types, callbacks, decoding
+python bench/bench_paired.py path/to/jsonexamples          # mojson vs orjson, robust
+python bench/bench_features.py                            # enabled feature paths vs orjson
+python bench/bench_regression.py                          # requires build/baseline/mojson.so
+python bench/bench_all_libraries.py path/to/jsonexamples   # + msgspec, ujson, rapidjson, json, simplejson
+python bench/bench_numpy.py
+```
+
+Benchmark corpus: `jsonexamples/` from https://github.com/simdjson/simdjson-data.
+
+The [Reflex PR 6116 comparison](bench/REFLEX.md) documents a pinned framework
+checkout, unchanged upstream codec tests, paired encode/event benchmarks, and
+real browser checks for both dump backends. Published measurements and validation
+are in [bench/results](bench/results/README.md), including the general 14-file
+comparison, native socket benchmarks and the default-path regression check.
+The orjson baseline retains the PR's original
+codec; mojson replaces its socket retry logic with native serialization.
+Earlier option and indentation results remain in `build/fix-options.json`
+and `build/indent-reflex-benchmark.json`.
+
+### Local comparison with uv
+
+If Mojo is already installed in `.venv`, keep that compiler environment and use
+a separate CPython 3.12 environment for the extension:
+
+```bash
+uv venv --python 3.12 .venv-bench
+uv pip install --python .venv-bench/bin/python orjson numpy
+PATH="$PWD/.venv/bin:$PATH" ./build.sh
+.venv-bench/bin/python tools/fetch_corpus.py
+.venv-bench/bin/python tests/check_correctness.py build/jsonexamples
+.venv-bench/bin/python tests/check_features.py
+.venv-bench/bin/python bench/bench_paired.py build/jsonexamples --cpu 2 --micro --output build/paired-local.json
+```
+
+Choose an available logical CPU for `--cpu`, or omit it. The paired benchmark
+checks output equality, warms both serializers, calibrates a common batch size
+to at least 10 ms, and alternates order across 40 pairs. It reports median time
+per call, the median `orjson time / mojson time` ratio, and ratio quartiles.
+Ratios above 1 mean mojson is faster. The optional JSON report includes every
+sample and environment metadata. The corpus downloader records the source
+revision and SHA-256 hashes in `build/jsonexamples/manifest.json.txt`.
+
+## What's inside (src/mojson.mojo)
+
+- Direct reads of CPython 3.12 object layouts (type pointer, list items, compact ints, float bits, str data)
+  and `external_call` into the CPython C API; output written straight into a `bytes` object.
+- Floats: Żmij shortest round-trip core (one 64x128 multiply), SSE BCD digit conversion and `pshufb`
+  decimal-point insertion (ported from zmij), exponent table, 4-float batches.
+- Ints: itoap-style writer, and 4-at-a-time SIMD batches using zmij's 16-bit-lane digit trick.
+- Strings: compact-ASCII / cached-UTF-8 access (as orjson), 64-byte SIMD escape scan with ctz jump,
+  page-safe 32-byte masked tail.
+- Dicts: register-resident write cursor, per-call key cache (repeated key objects copy their escaped bytes).
+  CPython's key-table kind keeps Unicode-only dictionaries on this writer even
+  with `OPT_NON_STR_KEYS`. Sorted Unicode keys use native records, stack storage
+  for up to 32 entries, insertion sort up to 16 entries, and `qsort` above that.
+- NumPy: buffer-protocol fast path for contiguous float64/float32/int64/int32/uint8/bool, `.tolist()` fallback.
+
+`tools/` holds the Python reference implementations used to validate the float core
+(`zmij_reference.py`, `ref.py`) and zmij's power-of-ten table.
+
+## Limitations
+
+- NaN/Infinity output intentionally differs from orjson's `null`. The strict
+  decoder rejects these tokens, so nonfinite output does not round-trip through `loads`.
+- NumPy float32 values are formatted after promotion to float64, which can
+  produce more decimal digits than orjson. Non-contiguous arrays use `.tolist()`.
+- CPython 3.12 internal layouts only; x86-64 AVX2 only (no runtime AVX-512 dispatch yet).
+- Keep `build/_mojson_support.py` alongside `build/mojson.so`; the build copies
+  this stdlib-only helper automatically. The extension has no orjson runtime dependency.
+- The string tail reads up to 31 bytes past a string's end within the same memory page (safe, but
+  AddressSanitizer/valgrind will flag it).
+- A built `.so` needs the Mojo runtime libraries (`libKGENCompilerRTShared.so`, `libAsyncRTRuntimeGlobals.so`,
+  `libMSupportGlobals.so`) available, e.g. from the `mojo` pip package; a wheel would have to bundle them.
+
+## Credits
+
+Float algorithm and power-of-ten table from Żmij by Victor Zverovich (https://github.com/vitaut/zmij, MIT);
+integer writer structure from itoap; design informed by orjson's source (https://github.com/ijl/orjson).
+See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the upstream notices.

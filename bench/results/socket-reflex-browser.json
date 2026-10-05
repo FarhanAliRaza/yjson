@@ -1,0 +1,70 @@
+{
+  "mojson": {
+    "values": {
+      "counter": "2",
+      "row-count": "500",
+      "first-row": "0: Person 0",
+      "last-row": "499: Person 499",
+      "first-row-notes": "caf\u00e9 \ud83d\ude00 row 0: \"quoted\" \\ slash\nnext",
+      "last-row-active": "false",
+      "last-row-revision": "2",
+      "refresh-count": "2",
+      "special-result": "NaN | Infinity | -Infinity | null | __reflex_nan__ | __reflex_esc__ | \ud83d\ude00 caf\u00e9 | quote \" slash \\ newline\nnext",
+      "echoed": "\ud83d\ude00 caf\u00e9 \"quoted\" \\ slash"
+    },
+    "expected": {
+      "counter": "2",
+      "row-count": "500",
+      "first-row": "0: Person 0",
+      "last-row": "499: Person 499",
+      "first-row-notes": "caf\u00e9 \ud83d\ude00 row 0: \"quoted\" \\ slash\nnext",
+      "last-row-active": "false",
+      "last-row-revision": "2",
+      "refresh-count": "2",
+      "special-result": "NaN | Infinity | -Infinity | null | __reflex_nan__ | __reflex_esc__ | \ud83d\ude00 caf\u00e9 | quote \" slash \\ newline\nnext",
+      "echoed": "\ud83d\ude00 caf\u00e9 \"quoted\" \\ slash"
+    },
+    "allPassed": true
+  },
+  "orjson": {
+    "values": {
+      "counter": "2",
+      "row-count": "500",
+      "first-row": "0: Person 0",
+      "last-row": "499: Person 499",
+      "first-row-notes": "caf\u00e9 \ud83d\ude00 row 0: \"quoted\" \\ slash\nnext",
+      "last-row-active": "false",
+      "last-row-revision": "2",
+      "refresh-count": "2",
+      "special-result": "NaN | Infinity | -Infinity | null | __reflex_nan__ | __reflex_esc__ | \ud83d\ude00 caf\u00e9 | quote \" slash \\ newline\nnext",
+      "echoed": "\ud83d\ude00 caf\u00e9 \"quoted\" \\ slash"
+    },
+    "expected": {
+      "counter": "2",
+      "row-count": "500",
+      "first-row": "0: Person 0",
+      "last-row": "499: Person 499",
+      "first-row-notes": "caf\u00e9 \ud83d\ude00 row 0: \"quoted\" \\ slash\nnext",
+      "last-row-active": "false",
+      "last-row-revision": "2",
+      "refresh-count": "2",
+      "special-result": "NaN | Infinity | -Infinity | null | __reflex_nan__ | __reflex_esc__ | \ud83d\ude00 caf\u00e9 | quote \" slash \\ newline\nnext",
+      "echoed": "\ud83d\ude00 caf\u00e9 \"quoted\" \\ slash"
+    },
+    "allPassed": true
+  },
+  "console": {
+    "mojson": [
+      {
+        "type": "text",
+        "text": "## Console messages\n<no console messages found>"
+      }
+    ],
+    "orjson": [
+      {
+        "type": "text",
+        "text": "## Console messages\n<no console messages found>"
+      }
+    ]
+  }
+}

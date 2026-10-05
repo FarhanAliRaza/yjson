@@ -1,0 +1,17 @@
+/build/
+/.venv*/
+/.agents/
+/.codex/
+/.aws/
+/repo/
+/skills-lock.json
+__pycache__/
+*.py[cod]
+*.so
+*.o
+.ruff_cache/
+.pytest_cache/
+.mojocache/
+.DS_Store
+.env
+.env.*
