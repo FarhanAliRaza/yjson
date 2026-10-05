@@ -110,6 +110,8 @@ checkout, unchanged upstream codec tests, paired encode/event benchmarks, and
 real browser checks for both dump backends. Published measurements and validation
 are in [bench/results](bench/results/README.md), including the general 14-file
 comparison, native socket benchmarks and the default-path regression check.
+The same directory holds the [CPython 3.12 - 3.15 measurements](bench/results/README.md#cpython-312---315-version-port)
+from the version port: no change against the previous build, and consistent timings on every interpreter.
 The orjson baseline retains the PR's original
 codec; mojson replaces its socket retry logic with native serialization.
 Earlier option and indentation results remain in `build/fix-options.json`

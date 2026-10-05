@@ -44,6 +44,54 @@ To reproduce after building:
 .venv-bench/bin/python bench/bench_paired.py build/jsonexamples --cpu 2 --pairs 40 --batch-ms 25 --micro --output build/general-benchmark.json
 ```
 
+## CPython 3.12 - 3.15 (version port)
+
+[Reports](python-versions/): `regression-3.12.*` and `paired-3.1x.*`.
+Measured in a shared cloud container (Intel(R) Xeon(R) Processor @ 2.80GHz, AVX2 build, CPU 2 pinned,
+40 alternating pairs, batches of at least 20 ms), Mojo 1.1.0, orjson 3.12.0 on
+every interpreter: CPython 3.12.3, 3.13.14, 3.14.8 and 3.15.0rc3. The container
+is slower and noisier than the desktop runs above, so compare columns here with
+each other rather than with the table above.
+
+`regression-3.12` loads the build from before the port and the ported build in
+one process on CPython 3.12. Corpus geometric mean **1.010×** (ported / previous);
+every case lies between 0.99× and 1.05× with overlapping middle halves, i.e. no
+measurable change. The ported encoder's absolute times are also flat across
+interpreters (for example `numbers` takes 209-214 µs and `mesh` 987-997 µs on all
+four), as expected since the hot paths only differ by compile-time constants.
+The ratios below move with orjson's own speed on each interpreter.
+
+| Case | 3.12 | 3.13 | 3.14 | 3.15 |
+| --- | ---: | ---: | ---: | ---: |
+| apache_builds | 1.14× | 1.03× | 1.10× | 1.09× |
+| canada | 1.08× | 0.92× | 0.95× | 0.99× |
+| citm_catalog | 1.05× | 1.03× | 1.04× | 1.04× |
+| github_events | 1.03× | 1.04× | 1.05× | 1.03× |
+| gsoc-2018 | 1.01× | 0.98× | 0.98× | 0.92× |
+| instruments | 1.07× | 1.06× | 1.09× | 1.08× |
+| marine_ik | 1.19× | 1.18× | 1.13× | 1.14× |
+| mesh | 1.26× | 1.30× | 1.28× | 1.28× |
+| mesh.pretty | 1.31× | 1.35× | 1.32× | 1.32× |
+| numbers | 1.40× | 1.51× | 1.52× | 1.50× |
+| random | 1.08× | 1.08× | 1.09× | 1.09× |
+| twitter | 1.01× | 1.01× | 1.01× | 0.99× |
+| twitterescaped | 0.99× | 1.01× | 1.01× | 1.02× |
+| update-center | 0.99× | 1.03× | 1.01× | 1.01× |
+| small dict | 1.03× | 0.93× | 1.05× | 1.11× |
+| empty dict | 1.14× | 1.12× | 1.07× | 1.16× |
+| int | 1.23× | 1.18× | 1.15× | 1.20× |
+| float | 1.25× | 1.18× | 1.17× | 1.17× |
+| short string | 1.29× | 1.19× | 1.21× | 1.25× |
+| mixed list | 1.17× | 1.08× | 1.14× | 1.20× |
+| corpus geomean | 1.11× | 1.10× | 1.10× | 1.10× |
+
+To reproduce, build for each interpreter (see the README), then:
+
+```bash
+.venv-bench/bin/python bench/bench_regression.py --cpu 2 --pairs 40 --batch-ms 20 --output build/bench/regression-3.12.json
+.venv-py3.14/bin/python bench/bench_paired.py build/jsonexamples --cpu 2 --pairs 40 --batch-ms 20 --micro --output build/bench/paired-3.14.json
+```
+
 ## Reflex PR 6116
 
 [Integration and reproduction details](../REFLEX.md).
