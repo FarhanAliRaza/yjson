@@ -1071,35 +1071,36 @@ def dict_has_general_keys(o: Int) -> Bool:
     # dk_kind == DICT_KEYS_GENERAL (0): unicode/split tables hold only exact str keys.
     return P8(unsafe_from_address=dict_keys(o))[unsafe_offset=DK_KIND] == 0
 
-# Insertion-ordered entry walk over a combined key table, equivalent to
-# PyDict_Next without the call: entries with a NULL value are deleted slots.
-# Split tables (ma_values set) keep values elsewhere and use PyDict_Next.
+# Insertion-ordered entry walk over a unicode-keyed combined table (16-byte
+# entries {key, value}), equivalent to PyDict_Next without the call: entries
+# with a NULL value are deleted slots. General tables (a non-str key was once
+# inserted) and split tables (ma_values set) use PyDict_Next. Kept to three
+# words so the dict loop's registers are not disturbed.
 struct DictWalk:
-    var entries: Int
-    var stride: Int
-    var key_off: Int
-    var count: Int
-    var index: Int
+    var cursor: Int
+    var end: Int
 
+    # An empty walk (cursor == end == 0) for tables that must use PyDict_Next.
     @always_inline
-    def __init__(out self, keys: Int):
+    def __init__(out self, o: Int, keys: Int):
         var header = P8(unsafe_from_address=keys)
-        var general = header[unsafe_offset=DK_KIND] == 0
-        self.entries = keys + DK_INDICES + (1 << Int(header[unsafe_offset=DK_LOG2_INDEX_BYTES]))
-        self.stride = 24 if general else 16
-        self.key_off = 8 if general else 0
-        self.count = rdb(keys, DK_NENTRIES)
-        self.index = 0
+        if DIRECT_DICT and rdb(o, DICT_VALUES) == 0 and header[unsafe_offset=DK_KIND] != 0:
+            self.cursor = keys + DK_INDICES + (1 << Int(header[unsafe_offset=DK_LOG2_INDEX_BYTES]))
+            self.end = self.cursor + rdb(keys, DK_NENTRIES) * 16
+        else:
+            self.cursor = 0
+            self.end = 0
 
-    # Returns the next live entry's address, or 0 when the table is exhausted.
+    # Returns the next live entry's address (key at +0, value at +8), or 0 at the end.
     @always_inline
     def next(mut self) -> Int:
-        while self.index < self.count:
-            var entry = self.entries + self.index * self.stride
-            self.index += 1
-            if rdb(entry, self.key_off + 8) != 0:
+        while self.cursor < self.end:
+            var entry = self.cursor
+            self.cursor += 16
+            if rdb(entry, 8) != 0:
                 return entry
         return 0
+
 
 # OPT_INDENT_2 in the compact writers: optional ',' then '\n' and 2*depth
 # spaces at p+n. Callers have at least 2*depth + 34 bytes of slack (the loops
@@ -1699,18 +1700,16 @@ def ser_list[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o_: Origin[mu
             len += 4 if is_true else 5
             i += 1
             continue
-        # Short leaf lists of floats and compact ints (coordinate pairs, small
-        # vectors): written in place, without the nested call and its prologue.
-        # Nothing here runs Python code, so no ancestor or mutation handling.
+        # Short leaf lists of floats (coordinate pairs, small vectors): written
+        # in place, without the nested call and its prologue. Nothing here runs
+        # Python code, so no ancestor or mutation handling.
         if not INDENT and (t == t_list or t == cp[].t_tuple) and depth < 255:
             var inner_count = ob_size(v)
             if inner_count >= 1 and inner_count <= 16:
                 var inner = list_items(v) if t == t_list else tuple_items(v)
                 var numeric = True
                 for j in range(inner_count):
-                    var e = rdi(inner, j)
-                    var et = ob_type(e)
-                    numeric = numeric and (et == t_float or (et == t_int and long_tag(e) < 16))
+                    numeric = numeric and ob_type(rdi(inner, j)) == t_float
                 if numeric:
                     var need = inner_count * 27 + 8
                     if unlikely(len + need > cap):
@@ -1721,14 +1720,10 @@ def ser_list[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o_: Origin[mu
                     (p + len)[] = 91
                     len += 1
                     for j in range(inner_count):
-                        var e = rdi(inner, j)
                         if j > 0:
                             (p + len)[] = 44
                             len += 1
-                        if ob_type(e) == t_float:
-                            len += float_at(p + len, e)
-                        else:
-                            len = int_fast(p, len, e)
+                        len += float_at(p + len, rdi(inner, j))
                     (p + len)[] = 93
                     len += 1
                     i += 1
@@ -1799,8 +1794,7 @@ def ser_dict_items[NONSTR: Bool, SORT: Bool, SOCKET: Bool, RECORDS: Bool, INDENT
     var count = ob_size(o)
     var remaining = count  # ma_used: stop after len items, like orjson (no final PyDict_Next call)
     var keys0 = dict_keys(o)
-    var direct = DIRECT_DICT and rdb(o, DICT_VALUES) == 0
-    var walk = DictWalk(keys0)
+    var walk = DictWalk(o, keys0)
     while remaining > 0:
         remaining -= 1
         comptime if RECORDS:
@@ -1808,14 +1802,12 @@ def ser_dict_items[NONSTR: Bool, SORT: Bool, SOCKET: Bool, RECORDS: Bool, INDENT
             v = rdi(sorted_items, pos * 4 + 1)
             pos += 1
         else:
-            if likely(direct):
-                var entry = walk.next()
-                if unlikely(entry == 0):
-                    bp[].len = len
-                    bp[].err = 8
-                    return False
-                k = rdb(entry, walk.key_off)
-                v = rdb(entry, walk.key_off + 8)
+            # A walkable table always yields ma_used live entries (mutation is
+            # caught below); an empty walk means PyDict_Next.
+            var entry = walk.next()
+            if likely(entry != 0):
+                k = rdb(entry, 0)
+                v = rdb(entry, 8)
             elif unlikely(external_call["PyDict_Next", Int32](o, Int(Pointer(to=pos)), Int(Pointer(to=k)), Int(Pointer(to=v))) == 0):
                 bp[].len = len
                 bp[].err = 8
@@ -2227,17 +2219,13 @@ def ser_configured_dict_direct[INDENT: Bool, SORT: Bool, SOCKET: Bool, o_: Origi
     var key = 0
     var value = 0
     var keys0 = dict_keys(o)
-    var direct = DIRECT_DICT and rdb(o, DICT_VALUES) == 0
-    var walk = DictWalk(keys0)
+    var walk = DictWalk(o, keys0)
     put_byte(bp, 123)
     for index in range(count):
-        if likely(direct):
-            var entry = walk.next()
-            if unlikely(entry == 0):
-                bp[].err = 8
-                return False
-            key = rdb(entry, walk.key_off)
-            value = rdb(entry, walk.key_off + 8)
+        var entry = walk.next()
+        if likely(entry != 0):
+            key = rdb(entry, 0)
+            value = rdb(entry, 8)
         elif external_call["PyDict_Next", Int32](o, Int(Pointer(to=position)), Int(Pointer(to=key)), Int(Pointer(to=value))) == 0:
             bp[].err = 8
             return False
