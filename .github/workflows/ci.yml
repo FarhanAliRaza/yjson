@@ -148,6 +148,7 @@ jobs:
       name: pypi
       url: https://pypi.org/project/yjson/
     permissions:
+      contents: read   # job-level permissions replace the workflow default; checkout needs this
       id-token: write  # PyPI trusted publishing (OIDC); no API token needed
     steps:
       - uses: actions/checkout@v7
