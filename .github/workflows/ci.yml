@@ -16,8 +16,9 @@ concurrency:
 
 env:
   FORCE_COLOR: "1"
-  # The Mojo compiler runs on its own interpreter, independent of the one the wheel targets.
-  MOJO_PYTHON: "3.13"
+  # The interpreter the Mojo compiler is installed on, independent of the one the wheel targets.
+  # (Not MOJO_PYTHON: the Mojo runtime reads that name as a path to a Python executable.)
+  MOJO_COMPILER_PYTHON: "3.13"
 
 jobs:
   sdist:
@@ -77,7 +78,7 @@ jobs:
           path: dist
       - name: Install the Mojo compiler
         run: |
-          UV_PROJECT_ENVIRONMENT=.venv-mojo uv sync --locked --only-group mojo --python "$MOJO_PYTHON"
+          UV_PROJECT_ENVIRONMENT=.venv-mojo uv sync --locked --only-group mojo --python "$MOJO_COMPILER_PYTHON"
           echo "$PWD/.venv-mojo/bin" >> "$GITHUB_PATH"
           echo "MOJO_LIB_DIR=$(.venv-mojo/bin/python -c 'import modular; print(modular.__path__[0] + "/lib")')" >> "$GITHUB_ENV"
           .venv-mojo/bin/mojo --version

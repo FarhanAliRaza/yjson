@@ -12,6 +12,7 @@
 #include <math.h>
 #include <stdlib.h>
 #include <dlfcn.h>
+#include <limits.h>
 
 #if PY_VERSION_HEX < 0x030B0000 || PY_VERSION_HEX >= 0x03100000
 #error "mojson supports CPython 3.11 through 3.15"
@@ -100,13 +101,20 @@ static int runtime_failure(const char *what) {
    the interpreter is already loaded, and PATH may hold no python3 or a
    different one, so point it at the object that provides Py_GetVersion:
    libpython3.X.so for shared builds, the executable for static ones. dlopen
-   of either returns the image that is already loaded. An empty path also
-   works (dlopen("") is the main program). */
+   of either returns the image that is already loaded. The path must be
+   absolute: for the executable dladdr reports argv[0], which may be relative
+   to a directory the program has since left. An empty path also works
+   (dlopen("") is the main program). */
 static void point_mojo_at_this_interpreter(void) {
     if (getenv("MOJO_PYTHON_LIBRARY")) return;
     Dl_info info;
+    char executable[PATH_MAX];
     const char *path = "";
-    if (dladdr((void *)&Py_GetVersion, &info) && info.dli_fname) path = info.dli_fname;
+    if (dladdr((void *)&Py_GetVersion, &info) && info.dli_fname && info.dli_fname[0] == '/') {
+        path = info.dli_fname;
+    } else if (realpath("/proc/self/exe", executable)) {
+        path = executable;
+    }
     setenv("MOJO_PYTHON_LIBRARY", path, 0);
 }
 

@@ -250,7 +250,8 @@ revision and SHA-256 hashes in `build/jsonexamples/manifest.json.txt`.
   `libAsyncRTRuntimeGlobals.so`, `libMSupportGlobals.so`) from the `mojo` pip package, found
   through the RUNPATH the compiler records. The published wheels bundle them (`auditwheel repair`).
   At import the module points the Mojo runtime at the running interpreter (it sets
-  `MOJO_PYTHON_LIBRARY` when unset), so no `python3` needs to be on `PATH`.
+  `MOJO_PYTHON_LIBRARY` when unset), so no `python3` needs to be on `PATH`. If `MOJO_PYTHON`
+  or `MOJO_PYTHON_LIBRARY` is already set, the runtime uses it, so it must be valid.
 
 ## Credits
 
