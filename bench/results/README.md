@@ -57,7 +57,7 @@ each other rather than with the table above.
 
 `regression-3.12` loads the build from before the version port (commit
 `0f0944d`) and the current build in one process on CPython 3.12: corpus
-geometric mean **1.170×** (current / original). The port itself changed nothing
+geometric mean **1.178×** (current / original). The port itself changed nothing
 (measured 1.002× before the performance work below, with identical 3.12 machine
 code in the hot paths); the gain comes from the encoder improvements. The
 encoder's absolute times are flat across interpreters: the hot paths differ only
@@ -66,27 +66,27 @@ on each interpreter.
 
 | Case | 3.11 | 3.12 | 3.13 | 3.14 | 3.15 |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| apache_builds | 1.22× | 1.28× | 1.20× | 1.27× | 1.29× |
-| canada | 1.07× | 1.14× | 1.08× | 1.05× | 1.10× |
-| citm_catalog | 1.19× | 1.22× | 1.23× | 1.27× | 1.27× |
-| github_events | 1.43× | 1.33× | 1.35× | 1.33× | 1.32× |
-| gsoc-2018 | 1.12× | 1.08× | 1.08× | 1.05× | 1.00× |
-| instruments | 1.71× | 1.41× | 1.42× | 1.50× | 1.45× |
-| marine_ik | 1.16× | 1.20× | 1.21× | 1.22× | 1.22× |
-| mesh | 1.15× | 1.21× | 1.24× | 1.25× | 1.29× |
-| mesh.pretty | 1.19× | 1.26× | 1.30× | 1.31× | 1.31× |
-| numbers | 1.28× | 1.42× | 1.49× | 1.50× | 1.51× |
-| random | 1.36× | 1.36× | 1.36× | 1.39× | 1.39× |
-| twitter | 1.37× | 1.33× | 1.32× | 1.35× | 1.33× |
-| twitterescaped | 1.37× | 1.28× | 1.36× | 1.35× | 1.34× |
-| update-center | 1.31× | 1.28× | 1.30× | 1.30× | 1.26× |
-| small dict | 1.28× | 1.01× | 1.24× | 1.17× | 1.19× |
-| empty dict | 1.15× | 1.05× | 1.17× | 1.03× | 1.19× |
-| int | 1.15× | 1.13× | 1.25× | 1.08× | 1.29× |
-| float | 1.26× | 1.23× | 1.30× | 1.08× | 1.24× |
-| short string | 1.26× | 1.17× | 1.29× | 1.17× | 1.30× |
-| mixed list | 1.10× | 1.00× | 1.20× | 1.11× | 1.18× |
-| corpus geomean | 1.27× | 1.27× | 1.27× | 1.29× | 1.28× |
+| apache_builds | 1.26× | 1.38× | 1.27× | 1.25× | 1.33× |
+| canada | 1.07× | 1.12× | 1.04× | 1.05× | 1.09× |
+| citm_catalog | 1.21× | 1.26× | 1.24× | 1.28× | 1.26× |
+| github_events | 1.44× | 1.32× | 1.38× | 1.34× | 1.35× |
+| gsoc-2018 | 1.09× | 1.15× | 1.13× | 1.14× | 1.08× |
+| instruments | 1.73× | 1.44× | 1.47× | 1.53× | 1.51× |
+| marine_ik | 1.16× | 1.20× | 1.21× | 1.24× | 1.24× |
+| mesh | 1.16× | 1.23× | 1.20× | 1.25× | 1.28× |
+| mesh.pretty | 1.21× | 1.28× | 1.25× | 1.29× | 1.32× |
+| numbers | 1.30× | 1.41× | 1.51× | 1.53× | 1.54× |
+| random | 1.37× | 1.40× | 1.39× | 1.43× | 1.41× |
+| twitter | 1.38× | 1.39× | 1.37× | 1.36× | 1.41× |
+| twitterescaped | 1.36× | 1.32× | 1.38× | 1.38× | 1.42× |
+| update-center | 1.31× | 1.36× | 1.34× | 1.33× | 1.25× |
+| small dict | 1.20× | 1.18× | 1.22× | 1.11× | 1.22× |
+| empty dict | 1.04× | 1.13× | 1.18× | 1.07× | 1.15× |
+| int | 1.17× | 1.18× | 1.28× | 1.13× | 1.22× |
+| float | 1.21× | 1.21× | 1.24× | 1.23× | 1.23× |
+| short string | 1.17× | 1.28× | 1.28× | 1.17× | 1.27× |
+| mixed list | 1.12× | 1.20× | 1.18× | 1.16× | 1.21× |
+| corpus geomean | 1.28× | 1.30× | 1.29× | 1.31× | 1.31× |
 
 To reproduce, build for each interpreter (see the README), then:
 
@@ -132,6 +132,12 @@ Findings and changes, in the order they were made:
 - **`OPT_INDENT_2` on the compact writers** as a compile-time variant instead
   of the generic walker: 0.69× → 1.51×. The generic walker now serves only
   `OPT_STRICT_INTEGER` and `OPT_PASSTHROUGH_SUBCLASS`.
+- **Containers first in the type dispatch.** The list and dict loops write
+  every scalar inline, so the generic dispatch is reached almost only for
+  nested containers; testing dict and list before str/int/float/None/bool
+  saves five compares per container. Corpus neutral (+0.6%, fewer
+  instructions), lists of empty containers 0.83× → 0.95–0.97×, single-key
+  nested dicts 0.78× → 0.89×, 3-key dicts 1.21× → 1.31×.
 
 Not changed, with reasons: the float formatter (already the zmij core, about
 300 instructions per 17-digit value; orjson now uses zmij as well), and long
@@ -145,7 +151,9 @@ Choosing the literal with masks and testing both singletons in one non-short-
 circuit expression brought that shape to 1.0×, but the type pointer it needs
 is either a loop-invariant register (which spills the list loop's hot state)
 or a load per element; both variants cost 3% on the corpus in paired runs
-with the roles swapped, so the compact loops keep the branch. Exponential
+with the roles swapped, and a third attempt that hoisted the pointer in the
+list loop only cost 1.5% and gave back the empty-container gain, so the
+compact loops keep the branch. Exponential
 back-off after a failed SIMD batch (for lists mixing ints with other types)
 was rejected the same way: one more live counter cost the integer array files
 8%.
@@ -168,7 +176,7 @@ remaining differences are in dispatch and per-element overhead rather than in
 a different algorithm.
 
 Corpus, 3.14, before the performance work → current (same process, 40 pairs):
-geometric mean **1.179×**. twitter 1.37×, twitterescaped 1.35×, instruments
+geometric mean **1.184×**. twitter 1.37×, twitterescaped 1.35×, instruments
 1.39×, random 1.32×, update-center 1.29×, github_events 1.29×, citm_catalog
 1.22×, apache_builds 1.22×, canada 1.10×, marine_ik 1.08×; the numeric array
 files (mesh, numbers) are unchanged within noise.
@@ -177,34 +185,34 @@ Shapes on 3.14, orjson time / mojson time (before → after):
 
 | Shape | Before | After |
 | --- | ---: | ---: |
-| float pairs x10k (canada) | 1.06× | 1.09× |
-| float pairs as tuples x10k | 1.09× | 1.11× |
-| floats x10k flat | 1.28× | 1.25× |
-| short floats x10k | 1.28× | 1.24× |
-| small ints x10k | 0.72× | 1.35× |
-| large ints x10k | 1.98× | 1.92× |
-| mixed scalars x10k | 0.89× | 0.84× |
-| ascii str 8 x2k | 1.17× | 1.08× |
-| ascii str 32 x2k | 1.26× | 1.12× |
-| ascii str 128 x2k | 1.21× | 1.10× |
-| ascii str 1024 x2k | 0.93× | 0.95× |
-| ascii str 128 escapes x2k | 0.96× | 0.96× |
-| unicode str 32 x2k | 1.14× | 1.00× |
-| dict 3 str keys x2k | 1.04× | 1.29× |
-| dict 20 str keys x500 | 1.06× | 1.63× |
-| dict 20 str->str x500 | 1.14× | 1.65× |
-| dict 100 int values x100 | 0.87× | 1.22× |
-| nested dict depth 6 x500 | 0.85× | 0.81× |
-| list of empty dicts x10k | 0.29× | 0.88× |
-| list of empty lists x10k | 0.27× | 0.84× |
-| bools and none x10k | 0.34× | 0.57× |
-| wide dict 10k keys | 0.86× | 1.17× |
-| wide dict 10k str values | 0.90× | 1.12× |
-| dict with float pair values x2k | 1.12× | 1.16× |
-| str keys sorted x500 | 0.48× | 1.04× |
-| nonstr keys unsorted x500 | 0.34× | 1.52× |
-| nonstr keys sorted x500 | 0.34× | 1.52× |
-| indent 2 dict 20 keys x500 | 0.69× | 1.51× |
+| float pairs x10k (canada) | 0.95× | 1.14× |
+| float pairs as tuples x10k | 1.03× | 1.12× |
+| floats x10k flat | 1.24× | 1.28× |
+| short floats x10k | 1.22× | 1.24× |
+| small ints x10k | 0.73× | 1.36× |
+| large ints x10k | 2.01× | 1.91× |
+| mixed scalars x10k | 0.87× | 0.84× |
+| ascii str 8 x2k | 1.15× | 1.11× |
+| ascii str 32 x2k | 1.26× | 1.15× |
+| ascii str 128 x2k | 1.21× | 1.15× |
+| ascii str 1024 x2k | 1.00× | 0.97× |
+| ascii str 128 escapes x2k | 0.95× | 0.95× |
+| unicode str 32 x2k | 1.10× | 0.99× |
+| dict 3 str keys x2k | 1.00× | 1.28× |
+| dict 20 str keys x500 | 1.04× | 1.58× |
+| dict 20 str->str x500 | 1.14× | 1.60× |
+| dict 100 int values x100 | 0.88× | 1.22× |
+| nested dict depth 6 x500 | 0.86× | 0.86× |
+| list of empty dicts x10k | 0.30× | 0.97× |
+| list of empty lists x10k | 0.26× | 0.99× |
+| bools and none x10k | 0.33× | 0.57× |
+| wide dict 10k keys | 0.87× | 1.18× |
+| wide dict 10k str values | 0.88× | 1.10× |
+| dict with float pair values x2k | 1.05× | 1.15× |
+| str keys sorted x500 | 0.48× | 0.99× |
+| nonstr keys unsorted x500 | 0.36× | 1.53× |
+| nonstr keys sorted x500 | 0.36× | 1.51× |
+| indent 2 dict 20 keys x500 | 0.67× | 1.58× |
 
 ### Algorithms from the literature, and whether they apply
 
@@ -259,6 +267,81 @@ type dispatch). Sources are linked from the main README's credits where used.
   (Cornflakes, Cap'n Proto-style layouts, FlatBuffers) avoids text entirely;
   simdjson's parsing results (Langdale & Lemire 2019) concern the decoder,
   which mojson delegates to the standard library by design.
+
+## Reflex PR 6116, rerun on the current build
+
+[Reports](python-versions/): `socket-reflex-benchmark-3.12.*`, `reflex-options-3.12.*`.
+Same procedure as [REFLEX.md](../REFLEX.md) (the PR head `f2b00b4` checked out
+with git instead of a source archive, `uv sync --frozen --extra orjson` on
+CPython 3.12.3, orjson 3.12.0), in the cloud container used for the tables
+above, so absolute times are slower than the desktop run below and only the
+ratios compare. Validation before timing: 142 PR codec tests with each
+backend, 14 selected app tests, 8 wire semantic checks (4 byte-identical; the
+rest differ only in float spelling, `1e-07` vs `1e-7`), and 3,000 fuzzed
+native wire packets with the stdlib fallback disabled, all passing.
+
+| Workload | orjson µs | mojson µs | Ratio [quartiles] | Desktop run |
+| --- | ---: | ---: | ---: | ---: |
+| socket encode / 5 rows | 4.28 | 3.00 | 1.43× [1.40–1.47] | 1.64× |
+| socket encode / 500 rows | 183.6 | 59.8 | 3.05× [2.97–3.13] | 3.54× |
+| socket None / 500 rows | 997.9 | 58.6 | 15.9× [15.1–17.3] | 11.65× |
+| socket special values | 27.9 | 3.4 | 8.04× [7.42–8.45] | 6.52× |
+| artifact compact | 92.3 | 77.0 | 1.18× [1.13–1.24] | 1.14× |
+| artifact indent | 102.6 | 87.5 | 1.18× [1.15–1.20] | 0.99× |
+| artifact sorted | 110.2 | 115.5 | 0.95× [0.94–0.98] | 0.98× |
+| wire 3 events / 5 rows | 499.4 | 497.6 | 1.01× [0.99–1.03] | 1.01× |
+| wire 3 events / 500 rows | 3949 | 3493 | 1.12× [1.04–1.20] | 1.18× |
+
+The indented artifact moved from parity to 1.18× with the indent work above.
+The sorted artifact is the one Reflex workload still behind (0.95×): 500 small
+row dicts, each sorted through the native records path, where the per-dict
+C call and reference counting outweigh the sort itself. The stdlib `json`
+rows of the report (0.04–1.25×) are the PR's own fallback codec, kept for
+reference. Options-only run, 500-row native payload: no flags 1.37×,
+passthrough 1.38×, socket flags 2.17× (was 2.22× on the desktop).
+
+## Reflex PR 6116, every event workload
+
+[Reports](python-versions/): `reflex-all-events-3.12.*`,
+`reflex-event-default-share-3.12.txt`. `bench_reflex.py --all-events` runs
+each workload of the PR's `tests/benchmarks/test_event_processing.py` through
+the real `BaseStateEventProcessor` and `StateManagerMemory`, with every
+emitted delta encoded by the app's `_sio_dumps` (orjson vs the mojson socket
+path), 40 alternating pairs of at least 25 ms on CPython 3.12.3. The
+fixture's `nested_elements` var is quadratic in the counter, so the counter
+is reset to its initial value after each run; the deltas then stay the size
+CodSpeed's single round sees (the unbounded version exhausted memory on the
+100-event burst). "Encode" is the time to encode that run's captured packets
+alone, under orjson, and its share of the orjson workload time.
+
+| Workload | orjson µs | mojson µs | Ratio [quartiles] | Encode µs | Encode share |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| event cold / 1 event | 645 | 656 | 1.00× [0.97–1.05] | 34 | 5% |
+| event warm / 1 event | 443 | 464 | 0.97× [0.89–1.01] | 34 | 8% |
+| burst same token / 10 events | 3642 | 3639 | 1.00× [0.95–1.05] | 441 | 12% |
+| burst independent / 10 events | 3175 | 3183 | 1.00× [0.96–1.02] | 344 | 11% |
+| burst same token / 100 events | 84618 | 83649 | 0.99× [0.42–2.35] | 18254 | 22% |
+| burst independent / 100 events | 32962 | 34191 | 0.99× [0.93–1.06] | 3665 | 11% |
+| counter batch / 4 events | 1279 | 1283 | 1.00× [0.97–1.03] | 138 | 11% |
+| table batch / 6 events | 55447 | 55321 | 1.01× [0.97–1.03] | 7946 | 14% |
+| on_event router_data / 10 events (control) | 164 | 165 | 1.00× [0.97–1.02] | | |
+
+Every event workload is at parity (0.97–1.01×), and the two codecs' encode-only
+times are equal too (34 µs each for the warm delta). The reason is in
+`reflex-event-default-share-3.12.txt`: these deltas are mostly
+`NestedElement` pydantic models and table row objects, which both codecs hand
+to Reflex's Python `default()` serializer. The warm delta (1.1 KB) makes 19
+`default()` calls and costs 34 µs to encode with either codec, but the same
+packet pre-converted to plain dicts costs 4.1 µs with orjson and 2.8 µs with
+mojson. The three table deltas (130 KB, 1,670 `default()` calls) cost 3.8 ms
+with either codec, 328 µs (orjson) and 124 µs (mojson) as plain data. JSON
+writing is therefore 3–12% of the encode call and encoding is 5–22% of the
+workload, so the codec can move these rows by about 1% at most, below the
+pair-to-pair noise. The 100-event same-token burst serializes 100 events
+through one state lock, which is why its quartiles are wide. The row that
+rewards the codec is the one with plain data, `wire 3 events / 500 rows`
+(1.11×, 500 row dicts per delta). The control row has no encoding and is
+flat, as expected.
 
 ## Reflex PR 6116
 

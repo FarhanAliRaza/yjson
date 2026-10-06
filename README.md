@@ -131,7 +131,11 @@ are in [bench/results](bench/results/README.md), including the general 14-file
 comparison, native socket benchmarks and the default-path regression check.
 The same directory holds the [CPython 3.11 - 3.15 measurements](bench/results/README.md#cpython-311---315-version-port)
 and the [profile-driven improvements](bench/results/README.md#profile-driven-encoder-improvements-cpython-314)
-measured on 3.14 (corpus 1.18× faster than before them; 1.27–1.29× of orjson on every interpreter).
+measured on 3.14 (corpus 1.18× faster than before them; 1.28–1.32× of orjson on every interpreter).
+The [all-events Reflex run](bench/results/README.md#reflex-pr-6116-every-event-workload)
+measures every workload of the PR's event benchmark: all at parity, because
+those deltas spend 88–97% of their encode time in Reflex's Python `default()`
+serializer for pydantic models, which neither codec can skip.
 The orjson baseline retains the PR's original
 codec; mojson replaces its socket retry logic with native serialization.
 Earlier option and indentation results remain in `build/fix-options.json`

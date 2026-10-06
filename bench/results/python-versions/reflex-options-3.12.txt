@@ -1,0 +1,4 @@
+Python 3.12.3, orjson 3.12.0, Reflex build/reflex-pr6116/reflex/__init__.py, 40 alternating pairs
+native no flags             mojson      68.10     49.76 us  1.37x [1.35, 1.39]
+native passthrough          mojson      67.50     49.41 us  1.38x [1.34, 1.40]
+native socket flags         mojson     107.32     49.57 us  2.17x [2.11, 2.21]
