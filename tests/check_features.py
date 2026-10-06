@@ -564,6 +564,151 @@ class Features(unittest.TestCase):
         except yjson.JSONDecodeError as error:
             self.assertEqual((error.pos, error.lineno, error.colno), (5, 1, 6))
 
+    def test_numpy_dtypes_and_scalars(self):
+        import numpy as np
+        option = yjson.OPT_SERIALIZE_NUMPY
+        values = [0, 1, 2, 3, 7, 8, 9, 10, 99, 100, 127]
+        for dtype in ("i1", "i2", "i4", "i8", "u1", "u2", "u4", "u8", "f2", "f4", "f8", "?"):
+            array = np.array(values, dtype=dtype)
+            for shape in ((-1,), (1, -1), (11, 1)):
+                for extra in (0, yjson.OPT_INDENT_2, yjson.OPT_SORT_KEYS, yjson.OPT_STRICT_INTEGER):
+                    with self.subTest(dtype=dtype, shape=shape, option=extra):
+                        self.same({"a": array.reshape(shape)}, option | extra)
+            with self.subTest(dtype=dtype, scalar=True):
+                self.same([array[3], array[-1]], option)
+        self.same(np.array([-2**63, 2**63 - 1]), option)
+        self.same(np.array([2**64 - 1], dtype="u8"), option)
+        self.assertEqual(yjson.dumps(np.uint64(2**64 - 1)), b"18446744073709551615")
+        self.same([np.empty((0, 4, 2)), np.empty((2, 0))], option | yjson.OPT_INDENT_2)
+
+    def test_numpy_float32_shortest(self):
+        # float32 and float16 use their own shortest round-trip digits, as orjson writes them.
+        import numpy as np
+        option = yjson.OPT_SERIALIZE_NUMPY
+        rng = np.random.default_rng(32)
+        bits = rng.integers(0, 2**32, size=200000, dtype=np.uint64).astype(np.uint32)
+        f32 = bits.view(np.float32)
+        f32 = f32[np.isfinite(f32)]
+        self.same(f32, option)
+        self.same(f32[:64].reshape(8, 8), option | yjson.OPT_INDENT_2)
+        f16 = np.arange(65536, dtype=np.uint16).view(np.float16)
+        self.same(f16[np.isfinite(f16)], option)
+        for value in (3.4028235e38, 1e-45, 1e-7, 1e-6, 1e12, 1e13, 0.1, 1 / 3):
+            with self.subTest(value=value):
+                self.same(np.float32(value), option)
+                if np.isfinite(np.float16(value)):
+                    self.same(np.float16(value), option)
+        self.assertEqual(yjson.dumps(np.array([1.0, 3.4028235e38], np.float32)), b"[1.0,3.4028235e+38]")
+
+    def test_numpy_datetime64(self):
+        import numpy as np
+        option = yjson.OPT_SERIALIZE_NUMPY
+        rng = np.random.default_rng(64)
+        # The epoch neighbourhood and random instants, every unit, every datetime option.
+        for unit, limit in (("Y", 8000), ("M", 96000), ("W", 400000), ("D", 2900000), ("h", 7 * 10**7),
+                            ("m", 4 * 10**9), ("s", 2 * 10**11), ("ms", 2 * 10**14), ("us", 2 * 10**17), ("ns", 2**62)):
+            low = 0 if unit in ("Y", "M") else -limit // 4  # year 0 is nearer than 9999; orjson aborts on negative months
+            values = np.concatenate([np.arange(0, 40), rng.integers(low, limit, size=200)]).astype(np.int64)
+            array = values.view(f"M8[{unit}]")
+            for extra in (0, yjson.OPT_NAIVE_UTC, yjson.OPT_NAIVE_UTC | yjson.OPT_UTC_Z, yjson.OPT_OMIT_MICROSECONDS, yjson.OPT_INDENT_2):
+                with self.subTest(unit=unit, option=extra):
+                    self.same(array, option | extra)
+                    self.same({"a": array.reshape(20, 12)}, option | extra)
+                    self.same([array[0], array[-1]], option | extra)
+        self.assertEqual(yjson.dumps(np.datetime64("1969-12", "M")), b'"1969-12-01T00:00:00"')
+        self.assertEqual(yjson.dumps(np.datetime64("9999-12-31T23:59:59.999999", "us")), b'"9999-12-31T23:59:59.999999"')
+        for bad in (np.datetime64("NaT", "s"), np.datetime64("-1"), np.datetime64("10000"), np.datetime64("2021-01-01T00:00:00.5", "ps"),
+                    np.datetime64("2021-01-01T00:00:00", "10s"), np.array([np.datetime64("NaT", "D")])):
+            with self.subTest(value=bad), self.assertRaises(TypeError):
+                yjson.dumps(bad)
+
+    def test_numpy_errors_follow_orjson(self):
+        import numpy as np
+        option = yjson.OPT_SERIALIZE_NUMPY
+        fortran = np.array([[1, 2], [3, 4]], order="F")
+        for array, message in ((fortran, "numpy array is not C contiguous; use ndarray.tolist() in default"),
+                               (np.arange(6)[::2], "numpy array is not C contiguous; use ndarray.tolist() in default"),
+                               (np.array(5), "unsupported datatype in numpy array"),
+                               (np.array([1 + 2j]), "unsupported datatype in numpy array"),
+                               (np.array(["a"]), "unsupported datatype in numpy array"),
+                               (np.array([1, 2], dtype=">i4"), "numpy array is not native-endianness")):
+            with self.subTest(array=array):
+                with self.assertRaises(TypeError) as context:
+                    yjson.dumps(array)
+                self.assertEqual(str(context.exception), message)
+        # default takes non-contiguous and unsupported arrays, but not byte-swapped ones
+        for array in (fortran, np.arange(6)[::2], np.array(5), np.array([1 + 2j])):
+            with self.subTest(array=array):
+                self.same(array, option, default=lambda a: a.real if isinstance(a, complex) else a.tolist() if a.ndim else a.item())
+        with self.assertRaises(TypeError):
+            yjson.dumps(np.array([1, 2], dtype=">i4"), default=lambda a: 1)
+        for scalar in (np.complex64(1), np.timedelta64(1, "s"), np.bytes_(b"a"), np.longdouble(1.5)):
+            with self.subTest(scalar=scalar), self.assertRaises(TypeError) as context:
+                yjson.dumps(scalar)
+            self.assertEqual(str(context.exception), f"Type is not JSON serializable: {type(scalar).__module__}.{type(scalar).__name__}")
+        self.same(np.str_("text"), option)
+
+    def test_timezone_libraries(self):
+        import zoneinfo
+
+        class LikePytz(dt.tzinfo):
+            """pytz-style zone: attached with tzinfo= it reports LMT, normalize() gives the real offset."""
+            def utcoffset(self, value): return dt.timedelta(hours=8, minutes=6)
+            def dst(self, value): return dt.timedelta(0)
+            def tzname(self, value): return "LMT"
+            def normalize(self, value): return value.replace(tzinfo=dt.timezone(dt.timedelta(hours=8)))
+
+        when = dt.datetime(2018, 1, 1, 2, 3, 4, tzinfo=LikePytz())
+        self.assertEqual(yjson.dumps(when), b'"2018-01-01T02:03:04+08:00"')
+        self.same(when)
+        self.same({when: 1}, yjson.OPT_NON_STR_KEYS)
+        for zone in ("Europe/Amsterdam", "Asia/Kolkata", "America/New_York", "Australia/Adelaide", "UTC"):
+            for value in (dt.datetime(2024, 7, 2, 3, 4, 5, 6, tzinfo=zoneinfo.ZoneInfo(zone)), dt.datetime(1937, 1, 1, 12, tzinfo=zoneinfo.ZoneInfo(zone))):
+                for option in (0, yjson.OPT_UTC_Z, yjson.OPT_OMIT_MICROSECONDS | yjson.OPT_UTC_Z):
+                    with self.subTest(zone=zone, option=option):
+                        self.same([value], option)
+        self.same(dt.datetime(2024, 1, 2, tzinfo=dt.timezone(dt.timedelta(hours=-5, minutes=-30))))
+
+    def test_orjson_api_details(self):
+        import inspect
+        self.assertEqual(str(inspect.signature(yjson.dumps)), "(obj, /, default=None, option=None)")
+        self.assertEqual((yjson.dumps.__module__, yjson.loads.__module__, yjson.Fragment.__module__), ("yjson", "yjson", "yjson"))
+        self.assertRegex(yjson.__version__, r"^\d+\.\d+(\.\d+)?$")
+        with self.assertRaises(TypeError) as context:
+            yjson.dumps(yjson.Fragment("\ud800"))
+        self.assertEqual(str(context.exception), "str is not valid UTF-8: surrogates not allowed")
+
+        class Custom:
+            pass
+
+        class Recursive:
+            def __init__(self, depth): self.depth = depth
+
+        def unwrap(value): return Recursive(value.depth - 1) if value.depth else 0
+        self.assertEqual(yjson.dumps(Recursive(254), default=unwrap), b"0")
+        self.assertEqual(yjson.dumps([Recursive(254), Recursive(254)], default=unwrap), b"[0,0]")
+        with self.assertRaises(TypeError) as context:
+            yjson.dumps(Recursive(255), default=unwrap)
+        self.assertEqual(str(context.exception), "default serializer exceeds recursion limit")
+
+        def failing(value): raise KeyError("missing")
+        with self.assertRaises(TypeError) as context:
+            yjson.dumps(Custom(), default=failing)
+        self.assertEqual(str(context.exception), "Type is not JSON serializable: Custom")
+        self.assertIsInstance(context.exception.__cause__, KeyError)
+
+        class Subclass(uuid.UUID):
+            pass
+
+        with self.assertRaises(TypeError):
+            yjson.dumps(Subclass(int=5))
+        self.same(Subclass(int=5), default=str)
+        with self.assertRaises(TypeError):
+            yjson.dumps({Subclass(int=5): 1}, option=yjson.OPT_NON_STR_KEYS)
+        self.assertIsNotNone(yjson.loads(b"[" * 1024 + b"]" * 1024))
+        with self.assertRaises(yjson.JSONDecodeError):
+            yjson.loads(b"[" * 1025 + b"]" * 1025)
+
 
 if __name__ == "__main__":
     unittest.main()

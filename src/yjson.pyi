@@ -21,6 +21,8 @@ def dumps_socket(
     ...
 def loads(obj: str | bytes | bytearray | memoryview, /) -> Any: ...
 
+__version__: str
+
 OPT_INDENT_2: int
 OPT_NAIVE_UTC: int
 OPT_NON_STR_KEYS: int

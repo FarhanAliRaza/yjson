@@ -259,14 +259,19 @@ static RequestCache *request_cache(Request *request) {
 
 static PyObject *dumps(PyObject *, PyObject *const *, Py_ssize_t, PyObject *);
 static PyObject *dumps_socket(PyObject *, PyObject *const *, Py_ssize_t, PyObject *);
+/* The "--" line gives inspect.signature() a __text_signature__ (the $module placeholder stands for the bound capsule). */
 static PyMethodDef dumps_method = {
     "dumps", (PyCFunction)(void (*)(void))dumps, METH_FASTCALL | METH_KEYWORDS,
-    "dumps(obj, /, default=None, option=None) -> bytes"
+    "dumps($module, obj, /, default=None, option=None)\n--\n\nSerialize obj to JSON bytes."
 };
 static PyMethodDef socket_method = {
     "dumps_socket", (PyCFunction)(void (*)(void))dumps_socket, METH_FASTCALL | METH_KEYWORDS,
-    "dumps_socket(obj, /, default=None, classify=None) -> bytes"
+    "dumps_socket($module, obj, /, default=None, classify=None)\n--\n\n"
+    "Compact JSON with Python json semantics: big integers, NaN/Infinity, escaped lone surrogates."
 };
+#ifndef YJSON_VERSION
+#define YJSON_VERSION "0.0.0"
+#endif
 
 static void destroy_state(PyObject *capsule) {
     ModuleState *state = PyCapsule_GetPointer(capsule, "yjson.state");
@@ -283,7 +288,10 @@ static void destroy_state(PyObject *capsule) {
     PyMem_Free(state);
 }
 
-static void wrap_error(int callback) {
+/* A failing callback (default, classify, a plan) raises "Type is not JSON
+   serializable: <type of obj>" with the callback's exception as __cause__, as
+   orjson does; other non-TypeError failures keep their text. */
+static void wrap_error(int callback, PyObject *obj) {
     if (!PyErr_Occurred()) {
         PyErr_SetString(PyExc_TypeError, "Unable to serialize object");
         return;
@@ -291,7 +299,7 @@ static void wrap_error(int callback) {
     if ((!callback && (PyErr_ExceptionMatches(PyExc_TypeError) || PyErr_ExceptionMatches(PyExc_MemoryError)))
         || PyErr_ExceptionMatches(PyExc_KeyboardInterrupt) || PyErr_ExceptionMatches(PyExc_SystemExit)) return;
     PyObject *value = PyErr_GetRaisedException();
-    PyObject *message = PyObject_Str(value);
+    PyObject *message = callback ? PyUnicode_FromFormat("Type is not JSON serializable: %s", Py_TYPE(obj)->tp_name) : PyObject_Str(value);
     PyObject *error = message ? PyObject_CallOneArg(PyExc_TypeError, message) : NULL;
     Py_XDECREF(message);
     if (error) {
@@ -304,8 +312,12 @@ static void wrap_error(int callback) {
 }
 
 static inline __attribute__((always_inline)) PyObject *dumps_impl(PyObject *capsule, PyObject *const *args, Py_ssize_t nargs, PyObject *kwnames, int socket, PyObject *classify) {
-    if (nargs < 1 || nargs > 3) {
-        PyErr_SetString(PyExc_TypeError, "dumps() requires one object and at most three positional arguments");
+    if (nargs < 1) {
+        PyErr_SetString(PyExc_TypeError, "dumps() missing 1 required positional argument: 'obj'");
+        return NULL;
+    }
+    if (nargs > 3) {
+        PyErr_SetString(PyExc_TypeError, "dumps() takes at most 3 positional arguments");
         return NULL;
     }
     ModuleState *state = PyCapsule_GetPointer(capsule, "yjson.state");
@@ -345,7 +357,7 @@ static inline __attribute__((always_inline)) PyObject *dumps_impl(PyObject *caps
         }
         PyMem_Free(request.cache);
     }
-    if (!result) wrap_error(0);
+    if (!result) wrap_error(0, args[0]);
     return result;
 }
 
@@ -436,8 +448,8 @@ long yjson_options(uintptr_t request) { return ((Request *)request)->option; }
 
 int yjson_enter_fallback(uintptr_t request_ptr) {
     Request *request = (Request *)request_ptr;
-    if (request->conversions >= 254) {
-        PyErr_SetString(PyExc_TypeError, "default serializer recursion limit exceeded");
+    if (request->conversions >= 255) {
+        PyErr_SetString(PyExc_TypeError, "default serializer exceeds recursion limit");
         return 0;
     }
     request->conversions++;
@@ -507,18 +519,35 @@ static void two_digits(char *dst, int value) {
     dst[1] = (char)('0' + value % 10);
 }
 
-/* Exact stdlib types have no user callbacks; custom tzinfo stays in the cold helper. */
+/* The UTC offset of an aware datetime, following orjson: pendulum timezones
+   (they have convert()) answer through the datetime, pytz zones (normalize())
+   are normalized first so a zone attached with tzinfo= gets its real offset
+   rather than LMT, and anything with dst() (dateutil, zoneinfo, every tzinfo
+   subclass) answers utcoffset(dt). New reference, or NULL with an error set. */
+static PyObject *tz_offset(PyObject *obj, PyObject *tzinfo) {
+    if (Py_IS_TYPE(tzinfo, Py_TYPE(PyDateTimeAPI->TimeZone_UTC)) || PyObject_HasAttrString(tzinfo, "convert")) {
+        return PyObject_CallMethod(obj, "utcoffset", NULL);
+    }
+    if (PyObject_HasAttrString(tzinfo, "normalize")) {
+        PyObject *normalized = PyObject_CallMethod(tzinfo, "normalize", "O", obj);
+        if (!normalized) return NULL;
+        PyObject *offset = PyObject_CallMethod(normalized, "utcoffset", NULL);
+        Py_DECREF(normalized);
+        return offset;
+    }
+    if (PyObject_HasAttrString(tzinfo, "dst")) return PyObject_CallMethod(tzinfo, "utcoffset", "O", obj);
+    PyErr_SetString(PyExc_TypeError, "datetime's timezone library is not supported: use datetime.timezone.utc, pendulum, pytz, or dateutil");
+    return NULL;
+}
+
+/* Exact stdlib types have no user callbacks; subclasses stay in the cold helper. */
 static PyObject *datetime_string(PyObject *obj, long option, int *handled, char separator) {
     int is_datetime = PyDateTime_CheckExact(obj), is_time = PyTime_CheckExact(obj);
     *handled = is_datetime || is_time || PyDate_CheckExact(obj);
     if (!*handled) return NULL;
     PyObject *tzinfo = is_datetime ? PyDateTime_DATE_GET_TZINFO(obj) : (is_time ? PyDateTime_TIME_GET_TZINFO(obj) : Py_None);
     if (is_time && tzinfo != Py_None) {
-        PyErr_SetString(PyExc_TypeError, "datetime.time must not have tzinfo");
-        return NULL;
-    }
-    if (tzinfo != Py_None && !Py_IS_TYPE(tzinfo, Py_TYPE(PyDateTimeAPI->TimeZone_UTC))) {
-        *handled = 0;
+        PyErr_SetString(PyExc_TypeError, "datetime.time must not have tzinfo set");
         return NULL;
     }
     char text[40];
@@ -547,17 +576,25 @@ static PyObject *datetime_string(PyObject *obj, long option, int *handled, char 
     }
     if (is_datetime && (tzinfo != Py_None || (option & 2))) {
         long seconds = 0;
-        int offset_microseconds = 0;
-        if (tzinfo != Py_None) {
-            PyObject *offset = PyObject_CallMethod(obj, "utcoffset", NULL);
+        int offset_microseconds = 0, has_offset = 1;
+        if (tzinfo != Py_None && tzinfo != PyDateTimeAPI->TimeZone_UTC) {
+            PyObject *offset = tz_offset(obj, tzinfo);
             if (!offset) return NULL;
-            seconds = (long)PyDateTime_DELTA_GET_DAYS(offset) * 86400 + PyDateTime_DELTA_GET_SECONDS(offset);
-            offset_microseconds = PyDateTime_DELTA_GET_MICROSECONDS(offset);
+            if (offset == Py_None) {
+                has_offset = (option & 2) != 0;  /* the zone declines: written as naive */
+            } else if (!PyDelta_Check(offset)) {
+                Py_DECREF(offset);
+                PyErr_SetString(PyExc_TypeError, "tzinfo.utcoffset() must return a timedelta or None");
+                return NULL;
+            } else {
+                seconds = (long)PyDateTime_DELTA_GET_DAYS(offset) * 86400 + PyDateTime_DELTA_GET_SECONDS(offset);
+                offset_microseconds = PyDateTime_DELTA_GET_MICROSECONDS(offset);
+            }
             Py_DECREF(offset);
         }
-        if (seconds == 0 && offset_microseconds == 0 && (option & 128)) {
+        if (has_offset && seconds == 0 && offset_microseconds == 0 && (option & 128)) {
             text[size++] = 'Z';
-        } else {
+        } else if (has_offset) {
             text[size++] = seconds < 0 ? '-' : '+';
             if (seconds < 0) seconds = -seconds;
             int minutes = (int)((seconds + 30) / 60);
@@ -639,7 +676,7 @@ static PyObject *socket_plan(Request *request, PyTypeObject *type) {
         if (cache->plan_types[i] == type) return cache->plans[i];
     PyObject *plan = PyObject_CallOneArg(request->classify, (PyObject *)type);
     if (!plan) {
-        if (PyErr_ExceptionMatches(PyExc_Exception)) wrap_error(1);
+        if (PyErr_ExceptionMatches(PyExc_Exception)) wrap_error(1, (PyObject *)type);
         return NULL;
     }
     int valid = plan == Py_None || PyCallable_Check(plan);
@@ -681,6 +718,249 @@ static PyObject *attribute_dict(PyObject *obj, PyObject *names) {
     return result;
 }
 
+
+/* ---- NumPy ----
+   Arrays are read through the array interface (__array_struct__), whose
+   layout has been fixed since the protocol's version 2. */
+typedef struct {
+    int two;              /* always 2 */
+    int nd;
+    char typekind;        /* 'b' 'i' 'u' 'f' 'c' 'M' 'm' 'O' 'S' 'U' 'V' */
+    int itemsize;
+    int flags;
+    Py_ssize_t *shape, *strides;
+    void *data;
+    PyObject *descr;
+} PyArrayInterface;
+#define NPY_ARRAY_C_CONTIGUOUS 0x0001
+#define NPY_ARRAY_NOTSWAPPED 0x0200
+
+/* NPY_DATETIMEUNIT, as numpy numbers it (3 is unused). */
+enum { NPY_FR_Y = 0, NPY_FR_M = 1, NPY_FR_W = 2, NPY_FR_D = 4, NPY_FR_h = 5, NPY_FR_m = 6, NPY_FR_s = 7, NPY_FR_ms = 8,
+       NPY_FR_us = 9, NPY_FR_ns = 10, NPY_FR_ps = 11, NPY_FR_fs = 12, NPY_FR_as = 13, NPY_FR_GENERIC = 14 };
+static const char *const datetime_unit_names[] = {"years", "months", "weeks", "", "days", "hours", "minutes", "seconds",
+    "milliseconds", "microseconds", "nanoseconds", "picoseconds", "femtoseconds", "attoseconds", "generic"};
+
+/* Unit of a datetime64 dtype from its type string ("<M8[ns]"; "<M8" is the
+   generic unit). -1 with a TypeError set for anything else, such as "10s". */
+static int datetime_unit(PyObject *dtype) {
+    static const struct { const char *code; int unit; } units[] = {
+        {"Y", NPY_FR_Y}, {"M", NPY_FR_M}, {"W", NPY_FR_W}, {"D", NPY_FR_D}, {"h", NPY_FR_h}, {"m", NPY_FR_m}, {"s", NPY_FR_s},
+        {"ms", NPY_FR_ms}, {"us", NPY_FR_us}, {"ns", NPY_FR_ns}, {"ps", NPY_FR_ps}, {"fs", NPY_FR_fs}, {"as", NPY_FR_as},
+        {"generic", NPY_FR_GENERIC}};
+    PyObject *text = PyObject_GetAttrString(dtype, "str");
+    if (!text) return -1;
+    const char *s = PyUnicode_Check(text) ? PyUnicode_AsUTF8(text) : NULL;
+    if (!s) {
+        Py_DECREF(text);
+        if (!PyErr_Occurred()) PyErr_SetString(PyExc_TypeError, "numpy array is malformed");
+        return -1;
+    }
+    int unit = -1;
+    const char *open = strchr(s, '[');
+    if (!open) {
+        unit = NPY_FR_GENERIC;
+    } else {
+        const char *close = strchr(open, ']');
+        size_t n = close ? (size_t)(close - open - 1) : strlen(open + 1);
+        for (size_t i = 0; i < sizeof(units) / sizeof(units[0]); i++) {
+            if (strlen(units[i].code) == n && memcmp(units[i].code, open + 1, n) == 0) unit = units[i].unit;
+        }
+        if (unit < 0) PyErr_Format(PyExc_TypeError, "unsupported numpy.datetime64 unit: %.*s", (int)n, open + 1);
+    }
+    Py_DECREF(text);
+    return unit;
+}
+
+static long long floor_div(long long a, long long b) {
+    long long q = a / b;
+    return (a % b != 0 && ((a < 0) != (b < 0))) ? q - 1 : q;
+}
+
+/* Proleptic Gregorian date of a day count from 1970-01-01 (H. Hinnant's civil_from_days). */
+static void civil_from_days(long long z, long long *year, int *month, int *day) {
+    z += 719468;
+    long long era = (z >= 0 ? z : z - 146096) / 146097;
+    unsigned doe = (unsigned)(z - era * 146097);
+    unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    unsigned mp = (5 * doy + 2) / 153;
+    *day = (int)(doy - (153 * mp + 2) / 5 + 1);
+    *month = (int)(mp < 10 ? mp + 3 : mp - 9);
+    *year = (long long)yoe + era * 400 + (*month <= 2);
+}
+
+static int datetime64_unrepresentable(long long value, int unit) {
+    PyErr_Format(PyExc_TypeError, "unrepresentable numpy.datetime64: %lld %s", value, datetime_unit_names[unit]);
+    return -1;
+}
+
+/* Writes a quoted "YYYY-MM-DDTHH:MM:SS[.ffffff][+00:00|Z]" for a datetime64
+   value in `unit`, as orjson does (years 0000-9999, sub-microsecond digits
+   dropped, OPT_OMIT_MICROSECONDS / OPT_NAIVE_UTC / OPT_UTC_Z applied).
+   Returns the length, or -1 with a TypeError set. NaT is unrepresentable. */
+int yjson_datetime64_text(long long value, int unit, long option, char *dst) {
+    long long year, days = 0, seconds = 0, microsecond = 0;
+    int month = 1, day = 1;
+    switch (unit) {
+    case NPY_FR_Y:
+        year = value + 1970;
+        if (year < 0 || year > 9999) return datetime64_unrepresentable(value, unit);
+        break;
+    case NPY_FR_M:
+        year = 1970 + floor_div(value, 12);
+        month = (int)(value - floor_div(value, 12) * 12) + 1;
+        if (year < 0 || year > 9999) return datetime64_unrepresentable(value, unit);
+        break;
+    case NPY_FR_W:
+        if (__builtin_mul_overflow(value, 7LL, &days)) return datetime64_unrepresentable(value, unit);
+        goto from_days;
+    case NPY_FR_D:
+        days = value;
+        goto from_days;
+    case NPY_FR_h:
+        days = floor_div(value, 24); seconds = (value - days * 24) * 3600;
+        goto from_days;
+    case NPY_FR_m:
+        days = floor_div(value, 1440); seconds = (value - days * 1440) * 60;
+        goto from_days;
+    case NPY_FR_s:
+        days = floor_div(value, 86400); seconds = value - days * 86400;
+        goto from_days;
+    case NPY_FR_ms: case NPY_FR_us: case NPY_FR_ns: {
+        long long per_second = unit == NPY_FR_ms ? 1000 : unit == NPY_FR_us ? 1000000 : 1000000000;
+        long long whole = floor_div(value, per_second), fraction = value - whole * per_second;
+        microsecond = unit == NPY_FR_ms ? fraction * 1000 : unit == NPY_FR_us ? fraction : fraction / 1000;
+        days = floor_div(whole, 86400); seconds = whole - days * 86400;
+        goto from_days;
+    }
+    default:
+        PyErr_Format(PyExc_TypeError, "unsupported numpy.datetime64 unit: %s", datetime_unit_names[unit]);
+        return -1;
+    from_days:
+        if (days < -719528 || days > 2932896) return datetime64_unrepresentable(value, unit);  /* 0000-01-01 .. 9999-12-31 */
+        civil_from_days(days, &year, &month, &day);
+    }
+    int n = 0;
+    dst[n++] = '"';
+    two_digits(dst + n, (int)(year / 100)); two_digits(dst + n + 2, (int)(year % 100)); n += 4;
+    dst[n++] = '-'; two_digits(dst + n, month); n += 2;
+    dst[n++] = '-'; two_digits(dst + n, day); n += 2;
+    dst[n++] = 'T'; two_digits(dst + n, (int)(seconds / 3600)); n += 2;
+    dst[n++] = ':'; two_digits(dst + n, (int)(seconds / 60 % 60)); n += 2;
+    dst[n++] = ':'; two_digits(dst + n, (int)(seconds % 60)); n += 2;
+    if (microsecond && !(option & 8)) {
+        dst[n++] = '.';
+        for (int i = 5; i >= 0; i--) { dst[n + i] = (char)('0' + microsecond % 10); microsecond /= 10; }
+        n += 6;
+    }
+    if (option & 2) {
+        if (option & 128) dst[n++] = 'Z';
+        else { memcpy(dst + n, "+00:00", 6); n += 6; }
+    }
+    dst[n++] = '"';
+    return n;
+}
+
+/* A datetime64 scalar as a complete JSON string (bytes), or NULL with an error.
+   The value sits after the object header (PyDatetimeScalarObject.obval);
+   the unit comes from the dtype. */
+static PyObject *numpy_datetime64_scalar(PyObject *obj, long option) {
+    if (Py_TYPE(obj)->tp_basicsize < (Py_ssize_t)(sizeof(PyObject) + sizeof(long long))) {
+        PyErr_SetString(PyExc_TypeError, "numpy.datetime64 scalar is malformed");
+        return NULL;
+    }
+    long long value;
+    memcpy(&value, (char *)obj + sizeof(PyObject), sizeof value);
+    PyObject *dtype = PyObject_GetAttrString(obj, "dtype");
+    if (!dtype) return NULL;
+    int unit = datetime_unit(dtype);
+    Py_DECREF(dtype);
+    if (unit < 0) return NULL;
+    char text[48];
+    int n = yjson_datetime64_text(value, unit, option, text);
+    return n < 0 ? NULL : PyBytes_FromStringAndSize(text, n);
+}
+
+static PyArrayInterface *array_interface(PyObject *obj, PyObject **capsule) {
+    *capsule = PyObject_GetAttrString(obj, "__array_struct__");
+    if (!*capsule) return NULL;
+    PyArrayInterface *array = PyCapsule_GetPointer(*capsule, NULL);
+    if (!array || array->two != 2) {
+        Py_CLEAR(*capsule);
+        if (!PyErr_Occurred()) PyErr_SetString(PyExc_TypeError, "numpy array is malformed");
+        return NULL;
+    }
+    return array;
+}
+
+/* datetime64 arrays export no buffer. Fills info (data, ndim, shape, unit,
+   capsule, element count) for a C-contiguous native-order one and returns 1;
+   the capsule keeps the array alive until the writer releases it. 0 means
+   the fallback decides (not datetime64, non-contiguous, 0-d); -1 an error. */
+int yjson_numpy_datetime_array(uintptr_t request, uintptr_t object, uintptr_t *info) {
+    (void)request;
+    PyObject *obj = (PyObject *)object;
+    PyObject *dtype = PyObject_GetAttrString(obj, "dtype");
+    if (!dtype) return -1;
+    PyObject *kind = PyObject_GetAttrString(dtype, "kind");
+    if (!kind) { Py_DECREF(dtype); return -1; }
+    int is_datetime = PyUnicode_Check(kind) && PyUnicode_CompareWithASCIIString(kind, "M") == 0;
+    Py_DECREF(kind);
+    int unit = is_datetime ? datetime_unit(dtype) : 0;
+    Py_DECREF(dtype);
+    if (!is_datetime) return 0;
+    if (unit < 0) return -1;
+    PyObject *capsule;
+    PyArrayInterface *array = array_interface(obj, &capsule);
+    if (!array) return -1;
+    if ((array->flags & NPY_ARRAY_C_CONTIGUOUS) == 0 || (array->flags & NPY_ARRAY_NOTSWAPPED) == 0 || array->nd < 1
+        || array->itemsize != 8 || array->typekind != 'M') {
+        Py_DECREF(capsule);
+        return 0;
+    }
+    Py_ssize_t count = 1;
+    for (int d = 0; d < array->nd; d++) count *= array->shape[d];
+    info[0] = (uintptr_t)array->data;
+    info[1] = (uintptr_t)array->nd;
+    info[2] = (uintptr_t)array->shape;
+    info[3] = (uintptr_t)unit;
+    info[4] = (uintptr_t)capsule;
+    info[5] = (uintptr_t)count;
+    return 1;
+}
+
+static int numpy_dtype_supported(char typekind, int itemsize) {
+    switch (typekind) {
+    case 'b': return itemsize == 1;
+    case 'i': case 'u': return itemsize == 1 || itemsize == 2 || itemsize == 4 || itemsize == 8;
+    case 'f': return itemsize == 2 || itemsize == 4 || itemsize == 8;
+    case 'M': return itemsize == 8;
+    default: return 0;
+    }
+}
+
+/* Why the native writers declined an ndarray, with orjson's wording and
+   whether default may take it. *message stays NULL for an array they should
+   have taken. Returns 0 with an error set when the array cannot be read. */
+static int numpy_array_reason(PyObject *obj, const char **message, int *can_default) {
+    PyObject *capsule;
+    PyArrayInterface *array = array_interface(obj, &capsule);
+    if (!array) return 0;
+    *message = NULL;
+    *can_default = 1;
+    if ((array->flags & NPY_ARRAY_C_CONTIGUOUS) == 0) {
+        *message = "numpy array is not C contiguous; use ndarray.tolist() in default";
+    } else if ((array->flags & NPY_ARRAY_NOTSWAPPED) == 0) {
+        *message = "numpy array is not native-endianness";
+        *can_default = 0;
+    } else if (array->nd == 0 || !numpy_dtype_supported(array->typekind, array->itemsize)) {
+        *message = "unsupported datatype in numpy array";
+    }
+    Py_DECREF(capsule);
+    return 1;
+}
+
 static uintptr_t convert_object(uintptr_t request_ptr, uintptr_t object, int *is_fragment, uintptr_t ancestors_ptr, long depth) {
     Request *request = (Request *)request_ptr;
     PyObject *obj = (PyObject *)object;
@@ -688,8 +968,10 @@ static uintptr_t convert_object(uintptr_t request_ptr, uintptr_t object, int *is
         *is_fragment = 1;
         PyObject *data = PyObject_GetAttrString(obj, "_data");
         if (data && !PyBytes_CheckExact(data)) {
+            /* Fragment() keeps a str it could not encode so the error surfaces here, as orjson's does. */
+            PyErr_SetString(PyExc_TypeError, PyUnicode_Check(data) ? "str is not valid UTF-8: surrogates not allowed"
+                                                                   : "Fragment requires bytes or str");
             Py_DECREF(data);
-            PyErr_SetString(PyExc_TypeError, "Fragment requires bytes data");
             return 0;
         }
         return (uintptr_t)data;
@@ -708,7 +990,7 @@ static uintptr_t convert_object(uintptr_t request_ptr, uintptr_t object, int *is
         && (PyObject_TypeCheck(obj, (PyTypeObject *)request->state->enum_type)
             || PyObject_TypeCheck(obj, (PyTypeObject *)request->state->uuid_type))) {
         PyObject *result = PyObject_CallOneArg(request->default_fn, obj);
-        if (!result && PyErr_ExceptionMatches(PyExc_Exception)) wrap_error(1);
+        if (!result && PyErr_ExceptionMatches(PyExc_Exception)) wrap_error(1, obj);
         return (uintptr_t)result;
     }
     if (!(request->option & 2048) && !PyType_Check(obj)) {
@@ -727,10 +1009,27 @@ static uintptr_t convert_object(uintptr_t request_ptr, uintptr_t object, int *is
         if (PyList_Check(obj)) return (uintptr_t)PyList_GetSlice(obj, 0, PyList_GET_SIZE(obj));
         if (PyDict_Check(obj)) return (uintptr_t)PyDict_Copy(obj);
     }
-    if (strncmp(Py_TYPE(obj)->tp_name, "numpy.", 6) == 0) {
-        return (uintptr_t)PyObject_CallMethod(obj, "tolist", NULL);
+    /* The Mojo writers take numeric scalars and C-contiguous arrays of the
+       supported dtypes directly. datetime64 scalars are formatted here; an
+       array they declined follows orjson's rules (default, or an error naming
+       why); other numpy types (complex, timedelta64, void, ...) go to default. */
+    const char *type_name = Py_TYPE(obj)->tp_name;
+    if (type_name[0] == 'n' && strncmp(type_name, "numpy.", 6) == 0) {
+        if (strcmp(type_name + 6, "datetime64") == 0) {
+            *is_fragment = 1;
+            return (uintptr_t)numpy_datetime64_scalar(obj, request->option);
+        }
+        if (strcmp(type_name + 6, "ndarray") == 0) {
+            const char *message = NULL;
+            int can_default = 0;
+            if (!numpy_array_reason(obj, &message, &can_default)) return 0;
+            if (!message) return (uintptr_t)PyObject_CallMethod(obj, "tolist", NULL);
+            if (!can_default || request->default_fn == Py_None) {
+                PyErr_SetString(PyExc_TypeError, message);
+                return 0;
+            }
+        }
     }
-    if (PyObject_TypeCheck(obj, (PyTypeObject *)request->state->uuid_type)) return (uintptr_t)PyObject_Str(obj);
     int special_datetime = !(request->option & 512) && (PyDate_Check(obj) || PyTime_Check(obj));
     PyObject *schema = !(request->option & 2048) && !PyType_Check(obj)
         ? _PyType_Lookup(Py_TYPE(obj), request->state->dataclass_name) : NULL;
@@ -752,7 +1051,7 @@ static uintptr_t convert_object(uintptr_t request_ptr, uintptr_t object, int *is
             }
             if (plan != Py_None) {
                 PyObject *result = PyObject_CallOneArg(plan, obj);
-                if (!result && PyErr_ExceptionMatches(PyExc_Exception)) wrap_error(1);
+                if (!result && PyErr_ExceptionMatches(PyExc_Exception)) wrap_error(1, obj);
                 return (uintptr_t)result;
             }
         }
@@ -761,7 +1060,7 @@ static uintptr_t convert_object(uintptr_t request_ptr, uintptr_t object, int *is
             return 0;
         }
         PyObject *result = PyObject_CallOneArg(request->default_fn, obj);
-        if (!result && PyErr_ExceptionMatches(PyExc_Exception)) wrap_error(1);
+        if (!result && PyErr_ExceptionMatches(PyExc_Exception)) wrap_error(1, obj);
         return (uintptr_t)result;
     }
     PyObject *option = PyLong_FromLong(request->option);
@@ -1121,12 +1420,18 @@ int yjson_install(uintptr_t module_ptr, uintptr_t context) {
     }
     if (!state->convert || !state->key_string || !state->fragment_type || !state->dataclass_fields_type || !state->uuid_type
         || !state->dataclass_name || !state->field_kind_name || !state->field_sentinel || !state->enum_type) goto fail;
-    PyObject *func = PyCFunction_New(&dumps_method, capsule);
-    if (!func) goto fail;
-    int status = PyObject_SetAttrString(module, "dumps", func);
+    PyObject *module_name = PyUnicode_FromString("yjson"), *version = PyUnicode_FromString(YJSON_VERSION);
+    if (!module_name || !version) { Py_XDECREF(module_name); Py_XDECREF(version); goto fail; }
+    int status = PyObject_SetAttrString(module, "__version__", version);
+    Py_DECREF(version);
+    if (status < 0) { Py_DECREF(module_name); goto fail; }
+    PyObject *func = PyCFunction_NewEx(&dumps_method, capsule, module_name);
+    if (!func) { Py_DECREF(module_name); goto fail; }
+    status = PyObject_SetAttrString(module, "dumps", func);
     Py_DECREF(func);
-    if (status < 0) goto fail;
-    func = PyCFunction_New(&socket_method, capsule);
+    if (status < 0) { Py_DECREF(module_name); goto fail; }
+    func = PyCFunction_NewEx(&socket_method, capsule, module_name);
+    Py_DECREF(module_name);
     if (!func) goto fail;
     status = PyObject_SetAttrString(module, "dumps_socket", func);
     Py_DECREF(func);

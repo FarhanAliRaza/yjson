@@ -51,8 +51,16 @@ try:
     for _ in range(300):
         n = int(rng.integers(0, 2000))
         a = rng.normal(size=n) * 10.0 ** rng.integers(-30, 30, size=n); a[rng.random(n) < 0.1] = np.nan; a[rng.random(n) < 0.03] = np.inf
-        for arr in (a, a.astype(np.float32), rng.integers(-10**15, 10**15, n), rng.random(n) < 0.5, a.reshape(-1, 1) if n else a, a[::2]):
+        for arr in (a, rng.integers(-10**15, 10**15, n), rng.random(n) < 0.5, a.reshape(-1, 1) if n else a, a[::2].copy()):
             if canon(yjson.dumps(arr)) != json.dumps(arr.tolist()): bad += 1
+        # float32 is written with its own shortest digits (as orjson does), so compare after rounding back
+        f32 = a.astype(np.float32)
+        if not np.array_equal(np.array(json.loads(yjson.dumps(f32)), dtype=np.float32), f32, equal_nan=True): bad += 1
+        # non-contiguous views follow orjson: default takes them, otherwise an error
+        if n > 1:
+            try: yjson.dumps(a[::2]); bad += 1; print("no error for a non-contiguous array")
+            except TypeError: pass
+            if canon(yjson.dumps(a[::2], default=lambda v: v.tolist())) != json.dumps(a[::2].tolist()): bad += 1
     print("numpy checks done")
 except ImportError:
     print("numpy not installed, skipped")

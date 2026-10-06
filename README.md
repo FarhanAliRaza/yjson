@@ -58,9 +58,14 @@ See `examples/usage.py` (NumPy, NaN, files, errors).
 `dumps(obj, /, default=None, option=None)` returns bytes. In addition to the
 basic JSON types, it supports datetime/date/time, UUID, Enum, dataclass
 instances, and subclasses of str/int/list/dict. Dataclass fields beginning
-with `_` are omitted. Tuple subclasses use `default` rather than being treated
-as arrays. Encoding errors are `JSONEncodeError`, an alias of `TypeError`;
-exceptions raised by a default callback are attached as `__cause__`.
+with `_` are omitted. Tuple and UUID subclasses use `default` rather than
+being serialized natively, as in orjson. Aware datetimes work with
+`datetime.timezone`, zoneinfo, dateutil, pendulum and pytz (a pytz zone
+attached with `tzinfo=` is normalized first, so it gets its real offset rather
+than LMT). Encoding errors are `JSONEncodeError`, an alias of `TypeError`; when
+a `default` callback raises, the error reads `Type is not JSON serializable:
+<type>` and the callback's exception is attached as `__cause__`. A `default`
+may nest up to 255 deep.
 
 ```python
 import datetime
@@ -90,6 +95,21 @@ values to `-(2**53 - 1)` through `2**53 - 1`. Non-string integer keys retain
 the 64-bit range in strict mode. Non-string key conversion preserves duplicate
 JSON keys. Fragments insert their contents verbatim, including under indentation;
 validate the contents yourself when needed.
+
+NumPy arrays and scalars of bool, int8-int64, uint8-uint64, float16, float32,
+float64 and datetime64 are written from their raw buffers, in every option
+mode (indentation included). float32 and float16 values are written with their
+own shortest round-trip digits (`3.4028235e+38`, not the float64 expansion),
+and datetime64 values as `YYYY-MM-DDTHH:MM:SS[.ffffff]` for years 0000-9999 in
+units from years to nanoseconds, honoring `OPT_NAIVE_UTC`, `OPT_UTC_Z` and
+`OPT_OMIT_MICROSECONDS`; NaT and finer units raise. The remaining rules follow
+orjson: arrays that are not C-contiguous, 0-dimensional, or of another dtype go
+to `default` and otherwise raise (`numpy array is not C contiguous; use
+ndarray.tolist() in default`, `unsupported datatype in numpy array`), arrays in
+non-native byte order always raise, and other numpy scalars (complex,
+timedelta64, bytes_, ...) go to `default`. Unlike orjson, yjson does not
+require `OPT_SERIALIZE_NUMPY`, writes NaN and infinity as `NaN`/`Infinity`,
+and represents the whole of year 9999.
 
 `OPT_INDENT_2`, `OPT_SORT_KEYS` and `OPT_NON_STR_KEYS` run on the same
 compiled writers as the compact default (indentation is a compile-time variant
@@ -143,9 +163,11 @@ python bench/bench_numpy.py
 ```
 
 `tests/suite/` is orjson 3.12.0's own test suite run against yjson (see
-`THIRD_PARTY_NOTICES.md`). It reports every difference as a failure, including
-the intended ones (NaN/Infinity written as Python's `json` writes them, stdlib
-parsing), and runs each test in a forked child so a crash fails one test:
+`THIRD_PARTY_NOTICES.md`). It reports every difference as a failure, and runs
+each test in a forked child so a crash fails one test. Seven tests fail by
+design: five write NaN/Infinity (yjson writes them as Python's `json` does,
+orjson writes `null`), and two check the stdlib parser's error message and
+position for an empty document and an unterminated string:
 
 ```bash
 pip install -r tests/suite/requirements.txt
