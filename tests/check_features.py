@@ -603,7 +603,9 @@ class Features(unittest.TestCase):
         for value in (3.4028235e38, 1e-45, 1e-7, 1e-6, 1e12, 1e13, 0.1, 1 / 3):
             with self.subTest(value=value):
                 self.same(np.float32(value), option)
-                if np.isfinite(np.float16(value)):
+                with np.errstate(over="ignore"):
+                    half = np.float16(value)
+                if np.isfinite(half):
                     self.same(np.float16(value), option)
         self.assertEqual(yjson.dumps(np.array([1.0, 3.4028235e38], np.float32)), b"[1.0,3.4028235e+38]")
 
