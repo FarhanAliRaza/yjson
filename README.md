@@ -101,6 +101,7 @@ python tests/check_correctness.py path/to/jsonexamples     # corpus optional
 python tests/check_features.py                            # options, types, callbacks, decoding
 python bench/bench_paired.py path/to/jsonexamples          # mojson vs orjson, robust
 python bench/bench_features.py                            # enabled feature paths vs orjson
+python bench/bench_shapes.py --cpu 2                      # per payload shape vs orjson (where it wins or loses)
 python bench/bench_regression.py                          # requires a baseline build in build/baseline/
 python bench/bench_all_libraries.py path/to/jsonexamples   # + msgspec, ujson, rapidjson, json, simplejson
 python bench/bench_numpy.py
@@ -164,10 +165,17 @@ revision and SHA-256 hashes in `build/jsonexamples/manifest.json.txt`.
 - Ints: itoap-style writer, and 4-at-a-time SIMD batches using zmij's 16-bit-lane digit trick.
 - Strings: compact-ASCII / cached-UTF-8 access (as orjson), 64-byte SIMD escape scan with ctz jump,
   page-safe 32-byte masked tail.
-- Dicts: register-resident write cursor, per-call key cache (repeated key objects copy their escaped bytes).
-  CPython's key-table kind keeps Unicode-only dictionaries on this writer even
-  with `OPT_NON_STR_KEYS`. Sorted Unicode keys use native records, stack storage
-  for up to 32 entries, insertion sort up to 16 entries, and `qsort` above that.
+- Dicts: entries are read straight from CPython's key table (no `PyDict_Next`
+  call per key; split tables fall back to it), register-resident write cursor,
+  per-call key cache (repeated key objects copy their escaped bytes), and inline
+  `true`/`false`/`{}`/`[]` values. CPython's key-table kind keeps Unicode-only
+  dictionaries on this writer even with `OPT_NON_STR_KEYS`. `OPT_SORT_KEYS` and
+  non-str keys snapshot the entries as native records (stack storage up to 31
+  entries), sorted with an inlined insertion/quicksort rather than `qsort`
+  callbacks; int, float, bool and None keys are converted to text without
+  creating Python strings.
+- Lists: 4-wide SIMD batches for ints and floats, and short leaf lists of
+  numbers (coordinate pairs) written in place without a nested call.
 - NumPy: buffer-protocol fast path for contiguous float64/float32/int64/int32/uint8/bool, `.tolist()` fallback.
 
 `tools/` holds the Python reference implementations used to validate the float core

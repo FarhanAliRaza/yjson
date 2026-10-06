@@ -3,7 +3,9 @@
    and passes every value to both compilers: python_api.c re-checks them with
    _Static_assert and mojson.mojo consumes them as compile-time constants. */
 #define PY_SSIZE_T_CLEAN
+#define Py_BUILD_CORE 1
 #include <Python.h>
+#include "internal/pycore_dict.h"
 #include <stddef.h>
 #include <stdio.h>
 
@@ -29,6 +31,11 @@ int main(void) {
     printf("MOJSON_BYTES_DATA=%zu\n", offsetof(PyBytesObject, ob_sval));
     printf("MOJSON_DICT_USED=%zu\n", offsetof(PyDictObject, ma_used));
     printf("MOJSON_DICT_KEYS=%zu\n", offsetof(PyDictObject, ma_keys));
+    printf("MOJSON_DICT_VALUES=%zu\n", offsetof(PyDictObject, ma_values));
+    printf("MOJSON_DK_LOG2_INDEX_BYTES=%zu\n", offsetof(PyDictKeysObject, dk_log2_index_bytes));
+    printf("MOJSON_DK_KIND=%zu\n", offsetof(PyDictKeysObject, dk_kind));
+    printf("MOJSON_DK_NENTRIES=%zu\n", offsetof(PyDictKeysObject, dk_nentries));
+    printf("MOJSON_DK_INDICES=%zu\n", offsetof(PyDictKeysObject, dk_indices));
     printf("MOJSON_STR_LENGTH=%zu\n", offsetof(PyASCIIObject, length));
     printf("MOJSON_STR_STATE=%zu\n", offsetof(PyASCIIObject, state));
     printf("MOJSON_STR_ASCII_DATA=%zu\n", sizeof(PyASCIIObject));
