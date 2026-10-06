@@ -61,3 +61,16 @@ The MIT License (MIT)
  OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE
  OR OTHER DEALINGS IN THE SOFTWARE.
 ```
+
+## orjson test suite
+
+The tests in `tests/suite/` and their fixtures in `tests/suite/data/` are copied
+from [orjson](https://github.com/ijl/orjson) 3.12.0 (tag `3.12.0`, commit
+`6737895`), with the module renamed so they exercise yjson. Each test file keeps
+its upstream copyright line and `SPDX-License-Identifier` header, which state its
+license: `(Apache-2.0 OR MIT)` or `MPL-2.0`. The upstream license texts are
+[LICENSE-APACHE](https://github.com/ijl/orjson/blob/3.12.0/LICENSE-APACHE),
+[LICENSE-MIT](https://github.com/ijl/orjson/blob/3.12.0/LICENSE-MIT) and
+[LICENSE-MPL-2.0](https://github.com/ijl/orjson/blob/3.12.0/LICENSE-MPL-2.0).
+The MPL-2.0 files are distributed under the MPL-2.0; their source is this
+repository.

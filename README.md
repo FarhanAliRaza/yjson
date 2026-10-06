@@ -142,6 +142,16 @@ python bench/bench_all_libraries.py path/to/jsonexamples   # + msgspec, ujson, r
 python bench/bench_numpy.py
 ```
 
+`tests/suite/` is orjson 3.12.0's own test suite run against yjson (see
+`THIRD_PARTY_NOTICES.md`). It reports every difference as a failure, including
+the intended ones (NaN/Infinity written as Python's `json` writes them, stdlib
+parsing), and runs each test in a forked child so a crash fails one test:
+
+```bash
+pip install -r tests/suite/requirements.txt
+python -m pytest tests/suite
+```
+
 Benchmark corpus: `jsonexamples/` from https://github.com/simdjson/simdjson-data.
 
 The [Reflex PR 6116 comparison](https://github.com/FarhanAliRaza/yjson/blob/v0.1.1/bench/REFLEX.md)
