@@ -1101,8 +1101,31 @@ struct DictWalk:
                 return entry
         return 0
 
+# OPT_INDENT_2 in the compact writers: optional ',' then '\n' and 2*depth
+# spaces at p+n. Callers have at least 2*depth + 34 bytes of slack (the loops
+# keep 160 and ser_value routes depth >= 60 to the generic walker).
 @always_inline
-def ser_value[NONSTR: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=True], c_: Origin](bp: Pointer[Buf, o_], cp: Pointer[Ctx, c_], o: Int, depth: Int) -> Bool:
+def indent_at(p: P8, n: Int, depth: Int, comma: Bool) -> Int:
+    var m = n
+    if comma:
+        (p + m)[] = 44
+        m += 1
+    (p + m)[] = 10
+    m += 1
+    var spaces = 2 * depth
+    var w = 0
+    while w < spaces:
+        (p + m + w).store(SIMD[DType.uint8, 32](32))
+        w += 32
+    return m + spaces
+
+@always_inline
+def close_indent[o_: Origin[mut=True]](bp: Pointer[Buf, o_], depth: Int):
+    bp[].ensure(2 * depth + 40)
+    bp[].len = indent_at(bp[].p, bp[].len, depth, False)
+
+@always_inline
+def ser_value[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o_: Origin[mut=True], c_: Origin](bp: Pointer[Buf, o_], cp: Pointer[Ctx, c_], o: Int, depth: Int) -> Bool:
     ref ctx = cp[]
     var t = ob_type(o)
     if t == ctx.t_str:
@@ -1125,19 +1148,25 @@ def ser_value[NONSTR: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=True], c_: 
             lit4(bp, 102, 97, 108, 115)
             put_byte(bp, 101)
         return True
+    comptime if INDENT:
+        # The indented writers reserve 2*depth bytes per separator from the
+        # loops' fixed slack; very deep nesting uses the generic walker.
+        if unlikely(depth >= 60) and (t == ctx.t_dict or t == ctx.t_list or t == ctx.t_tuple):
+            return ser_configured[True, SORT, SOCKET](bp, cp, o, depth)
     if t == ctx.t_dict:
         comptime if NONSTR or SORT:
             if dict_has_general_keys(o):
-                return ser_dict_records[NONSTR, SORT, SOCKET](bp, cp, o, depth + 1)
+                return ser_dict_records[NONSTR, SORT, SOCKET, INDENT](bp, cp, o, depth + 1)
         comptime if SORT:
-            return ser_dict_records[NONSTR, True, SOCKET](bp, cp, o, depth + 1)
+            return ser_dict_records[NONSTR, True, SOCKET, INDENT](bp, cp, o, depth + 1)
         else:
-            return ser_dict_items[NONSTR, False, SOCKET, False](bp, cp, o, depth + 1, 0)
+            return ser_dict_items[NONSTR, False, SOCKET, False, INDENT](bp, cp, o, depth + 1, 0)
     if t == ctx.t_list or t == ctx.t_tuple:
-        return ser_list[NONSTR, SORT, SOCKET](bp, cp, o, depth + 1, t == ctx.t_list)
-    if is_numpy_type(t):
-        return ser_numpy[NONSTR, SORT, SOCKET](bp, cp, o, depth)
-    return ser_fallback[False, SORT, False, NONSTR, SOCKET](bp, cp, o, depth)
+        return ser_list[NONSTR, SORT, SOCKET, INDENT](bp, cp, o, depth + 1, t == ctx.t_list)
+    comptime if not INDENT:
+        if is_numpy_type(t):
+            return ser_numpy[NONSTR, SORT, SOCKET](bp, cp, o, depth)
+    return ser_fallback[INDENT, SORT, False, NONSTR, SOCKET](bp, cp, o, depth)
 
 
 @always_inline
@@ -1558,7 +1587,7 @@ def ser_list_num[NONSTR: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=True], c
             i += 1
             continue
         bp[].len = len
-        if not ser_value[NONSTR, SORT, SOCKET](bp, cp, v, depth):
+        if not ser_value[NONSTR, SORT, SOCKET, False](bp, cp, v, depth):
             return False
         if is_list:
             if ob_size(o) != cnt:
@@ -1574,7 +1603,7 @@ def ser_list_num[NONSTR: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=True], c
     return True
 
 @no_inline
-def ser_list[NONSTR: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=True], c_: Origin](bp: Pointer[Buf, o_], cp: Pointer[Ctx, c_], o: Int, depth: Int, is_list: Bool) -> Bool:
+def ser_list[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o_: Origin[mut=True], c_: Origin](bp: Pointer[Buf, o_], cp: Pointer[Ctx, c_], o: Int, depth: Int, is_list: Bool) -> Bool:
     if depth > 255:
         bp[].err = 3
         return False
@@ -1588,10 +1617,11 @@ def ser_list[NONSTR: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=True], c_: O
     var t_list = ctx.t_list
     var cnt = ob_size(o)
     var items = list_items(o) if is_list else tuple_items(o)
-    if cnt >= 8:
-        var t0 = ob_type(rdi(items, 0))
-        if t0 == ctx.t_int or t0 == ctx.t_float:
-            return ser_list_num[NONSTR, SORT, SOCKET](bp, cp, o, depth, is_list)
+    comptime if not INDENT:
+        if cnt >= 8:
+            var t0 = ob_type(rdi(items, 0))
+            if t0 == ctx.t_int or t0 == ctx.t_float:
+                return ser_list_num[NONSTR, SORT, SOCKET](bp, cp, o, depth, is_list)
     put_byte(bp, 91)
     var p = bp[].p
     var len = bp[].len
@@ -1606,9 +1636,12 @@ def ser_list[NONSTR: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=True], c_: O
             cap = bp[].cap
         var v = rdi(items, i)
         var t = ob_type(v)
-        if i > 0:
-            (p + len)[] = 44
-            len += 1
+        comptime if INDENT:
+            len = indent_at(p, len, depth, i > 0)
+        else:
+            if i > 0:
+                (p + len)[] = 44
+                len += 1
         if t == t_int:
             var r = int_fast(p, len, v)
             if r >= 0:
@@ -1669,7 +1702,7 @@ def ser_list[NONSTR: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=True], c_: O
         # Short leaf lists of floats and compact ints (coordinate pairs, small
         # vectors): written in place, without the nested call and its prologue.
         # Nothing here runs Python code, so no ancestor or mutation handling.
-        if (t == t_list or t == cp[].t_tuple) and depth < 255:
+        if not INDENT and (t == t_list or t == cp[].t_tuple) and depth < 255:
             var inner_count = ob_size(v)
             if inner_count >= 1 and inner_count <= 16:
                 var inner = list_items(v) if t == t_list else tuple_items(v)
@@ -1701,7 +1734,7 @@ def ser_list[NONSTR: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=True], c_: O
                     i += 1
                     continue
         bp[].len = len
-        if not ser_value[NONSTR, SORT, SOCKET](bp, cp, v, depth):
+        if not ser_value[NONSTR, SORT, SOCKET, INDENT](bp, cp, v, depth):
             return False
         if is_list:
             if ob_size(o) != cnt:
@@ -1713,6 +1746,9 @@ def ser_list[NONSTR: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=True], c_: O
         cap = bp[].cap
         i += 1
     bp[].len = len
+    comptime if INDENT:
+        if cnt > 0:
+            close_indent(bp, depth - 1)
     put_byte(bp, 93)
     return True
 
@@ -1721,7 +1757,7 @@ def ser_list[NONSTR: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=True], c_: O
 # text for non-str keys without temporary Python strings), and the compact
 # writer consumes them in place of the live table.
 @no_inline
-def ser_dict_records[NONSTR: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=True], c_: Origin](bp: Pointer[Buf, o_], cp: Pointer[Ctx, c_], o: Int, depth: Int) -> Bool:
+def ser_dict_records[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o_: Origin[mut=True], c_: Origin](bp: Pointer[Buf, o_], cp: Pointer[Ctx, c_], o: Int, depth: Int) -> Bool:
     if depth > 255:
         bp[].err = 3
         return False
@@ -1733,12 +1769,12 @@ def ser_dict_records[NONSTR: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=True
     if items == 0:
         return False
     var count = ob_size(o)
-    var ok = ser_dict_items[NONSTR, SORT, SOCKET, True](bp, cp, o, depth, items)
+    var ok = ser_dict_items[NONSTR, SORT, SOCKET, True, INDENT](bp, cp, o, depth, items)
     external_call["mojson_release_records", NoneType](items, count, Int(storage))
     return ok
 
 @no_inline
-def ser_dict_items[NONSTR: Bool, SORT: Bool, SOCKET: Bool, RECORDS: Bool, o_: Origin[mut=True], c_: Origin](bp: Pointer[Buf, o_], cp: Pointer[Ctx, c_], o: Int, depth: Int, sorted_items: Int) -> Bool:
+def ser_dict_items[NONSTR: Bool, SORT: Bool, SOCKET: Bool, RECORDS: Bool, INDENT: Bool, o_: Origin[mut=True], c_: Origin](bp: Pointer[Buf, o_], cp: Pointer[Ctx, c_], o: Int, depth: Int, sorted_items: Int) -> Bool:
     if depth > 255:
         bp[].err = 3
         return False
@@ -1802,9 +1838,12 @@ def ser_dict_items[NONSTR: Bool, SORT: Bool, SOCKET: Bool, RECORDS: Bool, o_: Or
                 bp[].grow(klen * 6 + 160)
                 p = bp[].p
                 cap = bp[].cap
-            if not first:
-                (p + len)[] = 44
-                len += 1
+            comptime if INDENT:
+                len = indent_at(p, len, depth, not first)
+            else:
+                if not first:
+                    (p + len)[] = 44
+                    len += 1
             first = False
             if unlikely(ksz < 0):
                 _ = external_call["memcpy", Int](Int(p + len), ksrc, klen)
@@ -1843,9 +1882,12 @@ def ser_dict_items[NONSTR: Bool, SORT: Bool, SOCKET: Bool, RECORDS: Bool, o_: Or
                     bp[].grow(klen + 160)
                     p = bp[].p
                     cap = bp[].cap
-                if not first:
-                    (p + len)[] = 44
-                    len += 1
+                comptime if INDENT:
+                    len = indent_at(p, len, depth, not first)
+                else:
+                    if not first:
+                        (p + len)[] = 44
+                        len += 1
                 first = False
                 var off = sk[unsafe_offset=1]
                 if klen <= 32:
@@ -1859,8 +1901,11 @@ def ser_dict_items[NONSTR: Bool, SORT: Bool, SOCKET: Bool, RECORDS: Bool, o_: Or
                 comptime if SOCKET:
                     if unlikely(ksrc == 0):
                         bp[].len = len
-                        if not first:
-                            put_byte(bp, 44)
+                        comptime if INDENT:
+                            indent_sep(bp, depth, not first)
+                        else:
+                            if not first:
+                                put_byte(bp, 44)
                         first = False
                         if not write_surrogate_string(bp, k):
                             return False
@@ -1870,8 +1915,11 @@ def ser_dict_items[NONSTR: Bool, SORT: Bool, SOCKET: Bool, RECORDS: Bool, o_: Or
                         cap = bp[].cap
                     else:
                         bp[].len = len
-                        if not first:
-                            put_byte(bp, 44)
+                        comptime if INDENT:
+                            indent_sep(bp, depth, not first)
+                        else:
+                            if not first:
+                                put_byte(bp, 44)
                         first = False
                         if not write_cached_key(bp, cp, k):
                             return False
@@ -1890,9 +1938,12 @@ def ser_dict_items[NONSTR: Bool, SORT: Bool, SOCKET: Bool, RECORDS: Bool, o_: Or
                         bp[].grow(need)
                         p = bp[].p
                         cap = bp[].cap
-                    if not first:
-                        (p + len)[] = 44
-                        len += 1
+                    comptime if INDENT:
+                        len = indent_at(p, len, depth, not first)
+                    else:
+                        if not first:
+                            (p + len)[] = 44
+                            len += 1
                     first = False
                     var kstart = len
                     len = escape_at(p, len, ksrc, ksz)
@@ -1902,7 +1953,11 @@ def ser_dict_items[NONSTR: Bool, SORT: Bool, SOCKET: Bool, RECORDS: Bool, o_: Or
                         sk[unsafe_offset=1] = kstart
                         sk[unsafe_offset=2] = (gen << 16) | kl
         (p + len)[] = 58
-        len += 1
+        comptime if INDENT:
+            (p + len + 1)[] = 32
+            len += 2
+        else:
+            len += 1
         var t = ob_type(v)
         if t == t_str:
             var vsz = 0
@@ -1953,7 +2008,7 @@ def ser_dict_items[NONSTR: Bool, SORT: Bool, SOCKET: Bool, RECORDS: Bool, o_: Or
             len += 4 if is_true else 5
             continue
         bp[].len = len
-        if not ser_value[NONSTR, SORT, SOCKET](bp, cp, v, depth):
+        if not ser_value[NONSTR, SORT, SOCKET, INDENT](bp, cp, v, depth):
             return False
         comptime if not RECORDS:
             # A callback may have mutated the dict: a resize replaces (and frees) the key table.
@@ -1965,6 +2020,9 @@ def ser_dict_items[NONSTR: Bool, SORT: Bool, SOCKET: Bool, RECORDS: Bool, o_: Or
         len = bp[].len
         cap = bp[].cap
     bp[].len = len
+    comptime if INDENT:
+        if count > 0:
+            close_indent(bp, depth - 1)
     put_byte(bp, 125)
     return True
 
@@ -1998,13 +2056,11 @@ def ser_fallback[INDENT: Bool, SORT: Bool, CONFIG: Bool, NONSTR: Bool, SOCKET: B
             else:
                 ok = ser_configured[INDENT, SORT, SOCKET](bp, cp, converted, depth)
         else:
-            comptime if SORT:
-                if fragment == 2:
-                    ok = ser_configured_dict[False, True, SOCKET](bp, cp, converted, depth, True)
-                else:
-                    ok = ser_value[NONSTR, True, SOCKET](bp, cp, converted, depth)
+            if fragment == 2:
+                # dataclass fields keep their declaration order (never sorted)
+                ok = ser_dict_items[NONSTR, SORT, SOCKET, False, INDENT](bp, cp, converted, depth + 1, 0)
             else:
-                ok = ser_value[NONSTR, False, SOCKET](bp, cp, converted, depth)
+                ok = ser_value[NONSTR, SORT, SOCKET, INDENT](bp, cp, converted, depth)
         generation[] += 1
     external_call["Py_DecRef", NoneType](converted)
     external_call["mojson_leave_fallback", NoneType](cp[].request)
@@ -2065,7 +2121,7 @@ def ser_configured_child[INDENT: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=
             else:
                 return write_int[False](bp, o)
         if o == cp[].none_addr or tp == cp[].t_bool:
-            return ser_value[False, False, SOCKET](bp, cp, o, depth)
+            return ser_value[False, False, SOCKET, False](bp, cp, o, depth)
     return ser_configured[INDENT, SORT, SOCKET](bp, cp, o, depth)
 
 @inline(.never)
@@ -2078,8 +2134,8 @@ def ser_configured[INDENT: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=True],
         var option = ctx.option
         if (option & (64 | 256)) == 0:
             if (option & 4) != 0:
-                return ser_value[True, SORT, SOCKET](bp, cp, o, depth)
-            return ser_value[False, SORT, SOCKET](bp, cp, o, depth)
+                return ser_value[True, SORT, SOCKET, False](bp, cp, o, depth)
+            return ser_value[False, SORT, SOCKET, False](bp, cp, o, depth)
     var tp = ob_type(o)
     if tp == ctx.t_str:
         return write_str[SOCKET](bp, o)
@@ -2095,7 +2151,7 @@ def ser_configured[INDENT: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=True],
         write_float(bp, o)
         return True
     if o == ctx.none_addr or tp == ctx.t_bool:
-        return ser_value[False, False, SOCKET](bp, cp, o, depth)
+        return ser_value[False, False, SOCKET, False](bp, cp, o, depth)
     if tp == ctx.t_list or tp == ctx.t_tuple:
         Pointer[Int, MutUntrackedOrigin](unsafe_from_address=cp[].ancestors)[unsafe_offset=depth + 1] = o
         var count = ob_size(o)
@@ -2255,20 +2311,32 @@ def mojson_encode(context: Int, obj: Int, request: Int) abi("C") -> Int:
     ctx.option = option
     var ok: Bool
     if (option & (1 | 4 | 32 | 64 | 256 | 65536)) == 0:
-        ok = ser_value[False, False, False](Pointer(to=buffer), Pointer(to=ctx), obj, 0)
+        ok = ser_value[False, False, False, False](Pointer(to=buffer), Pointer(to=ctx), obj, 0)
     elif (option & 65536) != 0:
-        ok = ser_value[True, False, True](Pointer(to=buffer), Pointer(to=ctx), obj, 0)
-    elif (option & (1 | 64 | 256)) == 0:
-        if (option & 32) != 0:
-            if (option & 4) != 0:
-                ok = ser_value[True, True, False](Pointer(to=buffer), Pointer(to=ctx), obj, 0)
+        ok = ser_value[True, False, True, False](Pointer(to=buffer), Pointer(to=ctx), obj, 0)
+    elif (option & (64 | 256)) == 0:
+        # NON_STR_KEYS, SORT_KEYS and INDENT_2 all run on the compact writers.
+        if (option & 1) != 0:
+            if (option & 32) != 0:
+                if (option & 4) != 0:
+                    ok = ser_value[True, True, False, True](Pointer(to=buffer), Pointer(to=ctx), obj, 0)
+                else:
+                    ok = ser_value[False, True, False, True](Pointer(to=buffer), Pointer(to=ctx), obj, 0)
+            elif (option & 4) != 0:
+                ok = ser_value[True, False, False, True](Pointer(to=buffer), Pointer(to=ctx), obj, 0)
             else:
-                ok = ser_value[False, True, False](Pointer(to=buffer), Pointer(to=ctx), obj, 0)
+                ok = ser_value[False, False, False, True](Pointer(to=buffer), Pointer(to=ctx), obj, 0)
+        elif (option & 32) != 0:
+            if (option & 4) != 0:
+                ok = ser_value[True, True, False, False](Pointer(to=buffer), Pointer(to=ctx), obj, 0)
+            else:
+                ok = ser_value[False, True, False, False](Pointer(to=buffer), Pointer(to=ctx), obj, 0)
         elif (option & 4) != 0:
-            ok = ser_value[True, False, False](Pointer(to=buffer), Pointer(to=ctx), obj, 0)
+            ok = ser_value[True, False, False, False](Pointer(to=buffer), Pointer(to=ctx), obj, 0)
         else:
-            ok = ser_value[False, False, False](Pointer(to=buffer), Pointer(to=ctx), obj, 0)
+            ok = ser_value[False, False, False, False](Pointer(to=buffer), Pointer(to=ctx), obj, 0)
     elif (option & 1) != 0:
+        # STRICT_INTEGER / PASSTHROUGH_SUBCLASS: generic walker, indented
         if (option & 32) != 0:
             ok = ser_configured[True, True, False](Pointer(to=buffer), Pointer(to=ctx), obj, 0)
         else:

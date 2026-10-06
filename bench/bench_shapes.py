@@ -15,7 +15,10 @@ import statistics as st
 import sys
 import timeit
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build"))
+_pre = argparse.ArgumentParser(add_help=False)
+_pre.add_argument("--build", default=str(Path(__file__).resolve().parents[1] / "build"),
+                  help="Directory holding the mojson build to measure (default: build/)")
+sys.path.insert(0, _pre.parse_known_args()[0].build)
 import mojson
 import orjson
 
@@ -79,11 +82,14 @@ def main():
     parser.add_argument("--batch-ms", type=float, default=10)
     parser.add_argument("--cpu", type=int)
     parser.add_argument("--filter", default="")
+    parser.add_argument("--build", help="Directory holding the mojson build to measure (default: build/)")
+    parser.add_argument("--output", type=Path, help="Save the table as JSON")
     args = parser.parse_args()
     if args.cpu is not None:
         os.sched_setaffinity(0, {args.cpu})
     print(f"CPython {sys.version.split()[0]}, orjson {orjson.__version__}, {mojson.__file__}")
     print(f"{'shape':32} {'orjson us':>10} {'mojson us':>10} {'ratio':>7}  [p25 - p75]", flush=True)
+    rows = []
     for name, obj in shapes():
         if args.filter not in name:
             continue
@@ -97,6 +103,15 @@ def main():
         gc.collect()
         orjson_ns, mojson_ns, ratio, quartiles = measure(obj, args.pairs, args.batch_ms / 1000, option)
         print(f"{name:32} {orjson_ns / 1000:10.2f} {mojson_ns / 1000:10.2f} {ratio:6.2f}x  [{quartiles[0]:.2f} - {quartiles[2]:.2f}]", flush=True)
+        rows.append({"name": name, "option": option, "orjson_us": orjson_ns / 1000, "mojson_us": mojson_ns / 1000,
+                     "ratio": ratio, "p25": quartiles[0], "p75": quartiles[2]})
+    if args.output:
+        import json
+        import platform
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps({"python": platform.python_version(), "orjson": orjson.__version__,
+                                           "mojson_path": mojson.__file__, "pairs": args.pairs, "batch_ms": args.batch_ms,
+                                           "results": rows}, indent=2) + "\n")
 
 
 if __name__ == "__main__":

@@ -76,10 +76,13 @@ the 64-bit range in strict mode. Non-string key conversion preserves duplicate
 JSON keys. Fragments insert their contents verbatim, including under indentation;
 validate the contents yourself when needed.
 
-The compact default path keeps the original SIMD loops. Indentation and sorting
-use separate compiled traversal variants. Enabling options, custom conversions,
-or uncommon types costs additional work; their speed should be measured on your
-payload. `loads` uses Python's standard parser with UTF-8, nonfinite-number,
+`OPT_INDENT_2`, `OPT_SORT_KEYS` and `OPT_NON_STR_KEYS` run on the same
+compiled writers as the compact default (indentation is a compile-time variant
+of those loops; sorting and non-str keys snapshot the dict as native records),
+so they stay close to orjson's speed for the same option. `OPT_STRICT_INTEGER`
+and `OPT_PASSTHROUGH_SUBCLASS` use a generic traversal that checks every value
+and is slower. Custom conversions and uncommon types cost additional work;
+measure their speed on your payload (`bench/bench_shapes.py`). `loads` uses Python's standard parser with UTF-8, nonfinite-number,
 and surrogate checks. It accepts str/bytes/bytearray/contiguous memoryview and
 raises `JSONDecodeError` (a subclass of `json.JSONDecodeError`). Its parsing
 speed and maximum nesting follow the stdlib backend, rather than orjson's parser.
