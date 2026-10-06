@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mojson"
+version = "0.1.0"
+description = "JSON serializer for CPython written in Mojo, with an orjson-style API"
+readme = "README.md"
+requires-python = ">=3.11,<3.16"
+authors = [{ name = "Farhan Ali Raza" }]
+keywords = ["json", "orjson", "mojo", "serialization", "numpy", "simd"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Mojo",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+# The extension has no runtime dependencies; NumPy support is detected at run time.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/FarhanAliRaza/mojson"
+Repository = "https://github.com/FarhanAliRaza/mojson"
+Issues = "https://github.com/FarhanAliRaza/mojson/issues"
+Changelog = "https://github.com/FarhanAliRaza/mojson/releases"
+
+# Development tooling, installed with `uv sync --group <name>` / `--only-group <name>`.
+# None of these are runtime dependencies of the wheel.
+[dependency-groups]
+# The tests compare against orjson; NumPy exercises the array fast paths.
+test = ["orjson", "numpy"]
+# auditwheel bundles the Mojo runtime library into the wheel and sets the manylinux tag.
+wheel = ["auditwheel>=6.4", "patchelf"]
+# The Mojo compiler. CI installs this group into its own environment (.venv-mojo).
+mojo = ["mojo==1.1.0"]
+dev = [{ include-group = "test" }, { include-group = "wheel" }]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+py-modules = ["_mojson_support"]
