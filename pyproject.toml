@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "yjson"
-version = "0.1.0"
+version = "0.1.1"
 description = "JSON serializer for CPython written in Mojo, with an orjson-style API"
 readme = "README.md"
 requires-python = ">=3.11,<3.16"
