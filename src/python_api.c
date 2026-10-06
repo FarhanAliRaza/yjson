@@ -241,11 +241,21 @@ typedef struct {
     int single_ancestor;
     PyObject *keepalive;
     PyObject *classify;  /* NULL: every unhandled object goes to default */
+    struct RequestCache *cache;  /* allocated by the first callback that needs it */
+} Request;
+
+/* Callback-path state, kept out of Request so the hot path does not zero it per call. */
+typedef struct RequestCache {
     int plan_count;
     PyTypeObject *plan_types[PLAN_CACHE_SIZE];
     PyObject *plans[PLAN_CACHE_SIZE];
     PyObject *pinned[PINNED_LEVELS];  /* borrowed: each is held by keepalive */
-} Request;
+} RequestCache;
+
+static RequestCache *request_cache(Request *request) {
+    if (!request->cache && !(request->cache = PyMem_Calloc(1, sizeof(RequestCache)))) PyErr_NoMemory();
+    return request->cache;
+}
 
 static PyObject *dumps(PyObject *, PyObject *const *, Py_ssize_t, PyObject *);
 static PyObject *dumps_socket(PyObject *, PyObject *const *, Py_ssize_t, PyObject *);
@@ -328,9 +338,12 @@ static inline __attribute__((always_inline)) PyObject *dumps_impl(PyObject *caps
     Request request = {.state = state, .capsule = capsule, .default_fn = default_fn, .option = option, .classify = classify};
     PyObject *result = (PyObject *)yjson_encode(state->context, (uintptr_t)args[0], (uintptr_t)&request);
     Py_XDECREF(request.keepalive);
-    for (int i = 0; i < request.plan_count; i++) {
-        Py_DECREF(request.plans[i]);
-        Py_DECREF(request.plan_types[i]);
+    if (request.cache) {
+        for (int i = 0; i < request.cache->plan_count; i++) {
+            Py_DECREF(request.cache->plans[i]);
+            Py_DECREF(request.cache->plan_types[i]);
+        }
+        PyMem_Free(request.cache);
     }
     if (!result) wrap_error(0);
     return result;
@@ -443,6 +456,8 @@ static int retain_ancestors(Request *request, uintptr_t ancestors_ptr, long dept
     }
     if (request->single_ancestor) {
         if (depth == 1 && request->keepalive == ancestors[1]) return 1;
+        RequestCache *cache = request_cache(request);
+        if (!cache) return 0;
         for (long i = 1; i <= depth; i++) Py_INCREF(ancestors[i]);
         PyObject *expanded = PyList_New(depth + 1);
         if (!expanded) {
@@ -453,12 +468,14 @@ static int retain_ancestors(Request *request, uintptr_t ancestors_ptr, long dept
         PyList_SET_ITEM(expanded, 0, request->keepalive);
         for (long i = 1; i <= depth; i++) {
             PyList_SET_ITEM(expanded, i, ancestors[i]);
-            if (i < PINNED_LEVELS) request->pinned[i] = ancestors[i];
+            if (i < PINNED_LEVELS) cache->pinned[i] = ancestors[i];
         }
         request->keepalive = expanded;
         request->single_ancestor = 0;
         return 1;
     }
+    RequestCache *cache = request_cache(request);
+    if (!cache) return 0;
     if (!request->keepalive) {
         /* Creating the list can run GC and arbitrary finalizers. Pin first. */
         for (long i = 1; i <= depth; i++) Py_INCREF(ancestors[i]);
@@ -466,7 +483,7 @@ static int retain_ancestors(Request *request, uintptr_t ancestors_ptr, long dept
         int ok = request->keepalive != NULL;
         for (long i = 1; i <= depth; i++) {
             if (ok && PyList_Append(request->keepalive, ancestors[i]) < 0) ok = 0;
-            else if (ok && i < PINNED_LEVELS) request->pinned[i] = ancestors[i];
+            else if (ok && i < PINNED_LEVELS) cache->pinned[i] = ancestors[i];
         }
         for (long i = 1; i <= depth; i++) Py_DECREF(ancestors[i]);
         return ok;
@@ -474,9 +491,9 @@ static int retain_ancestors(Request *request, uintptr_t ancestors_ptr, long dept
     for (long i = 1; i <= depth; i++) {
         /* An object in keepalive stays alive for the whole call, so its address
            cannot be reused: pointer equality means it is already pinned. */
-        if (i < PINNED_LEVELS && request->pinned[i] == ancestors[i]) continue;
+        if (i < PINNED_LEVELS && cache->pinned[i] == ancestors[i]) continue;
         if (PyList_Append(request->keepalive, ancestors[i]) < 0) return 0;
-        if (i < PINNED_LEVELS) request->pinned[i] = ancestors[i];
+        if (i < PINNED_LEVELS) cache->pinned[i] = ancestors[i];
     }
     return 1;
 }
@@ -616,8 +633,10 @@ fail:
    (write the object as that dict), a callable (write its result), or None
    (use default). Returns a borrowed plan, or NULL with an exception set. */
 static PyObject *socket_plan(Request *request, PyTypeObject *type) {
-    for (int i = 0; i < request->plan_count; i++)
-        if (request->plan_types[i] == type) return request->plans[i];
+    RequestCache *cache = request_cache(request);
+    if (!cache) return NULL;
+    for (int i = 0; i < cache->plan_count; i++)
+        if (cache->plan_types[i] == type) return cache->plans[i];
     PyObject *plan = PyObject_CallOneArg(request->classify, (PyObject *)type);
     if (!plan) {
         if (PyErr_ExceptionMatches(PyExc_Exception)) wrap_error(1);
@@ -634,15 +653,15 @@ static PyObject *socket_plan(Request *request, PyTypeObject *type) {
         PyErr_SetString(PyExc_TypeError, "classify must return None, a callable, or a tuple of attribute names");
         return NULL;
     }
-    if (request->plan_count == PLAN_CACHE_SIZE) {
+    if (cache->plan_count == PLAN_CACHE_SIZE) {
         /* Rare: more distinct types than slots. Keep the newest answer in the last slot. */
-        Py_DECREF(request->plans[PLAN_CACHE_SIZE - 1]);
-        Py_DECREF(request->plan_types[PLAN_CACHE_SIZE - 1]);
-        request->plan_count--;
+        Py_DECREF(cache->plans[PLAN_CACHE_SIZE - 1]);
+        Py_DECREF(cache->plan_types[PLAN_CACHE_SIZE - 1]);
+        cache->plan_count--;
     }
     /* Strong reference: a freed type's address could be reused by another type. */
-    request->plan_types[request->plan_count] = (PyTypeObject *)Py_NewRef(type);
-    request->plans[request->plan_count++] = plan;
+    cache->plan_types[cache->plan_count] = (PyTypeObject *)Py_NewRef(type);
+    cache->plans[cache->plan_count++] = plan;
     return plan;
 }
 
