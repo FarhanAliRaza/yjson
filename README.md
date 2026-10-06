@@ -6,7 +6,7 @@ NaN / Infinity are written the way Python's `json` writes them
 
 ## Build
 
-Requirements: CPython 3.12, 3.13, 3.14 or 3.15 (default GIL builds) with headers,
+Requirements: CPython 3.11, 3.12, 3.13, 3.14 or 3.15 (default GIL builds) with headers,
 a C compiler, x86-64 with AVX2, and Mojo 1.1 (`pip install mojo`). The build
 targets one interpreter at a time: it uses `.venv-bench/bin/python` if present,
 otherwise `python3`; override with `PYTHON=...`.
@@ -23,8 +23,11 @@ loops read CPython object fields directly; `build.sh` probes those offsets from
 the target headers (`src/layout_probe.c`) and passes them to both compilers.
 The C shim re-checks them with `_Static_assert`, and the module verifies them
 against live objects at import, so an unsupported interpreter fails with an
-`ImportError` instead of reading memory wrongly. The only layout difference in
-this range is the tuple item offset (3.14 added a cached tuple hash).
+`ImportError` instead of reading memory wrongly. The layout differences in this
+range are small: 3.11 has a longer str header (the legacy `wstr` field) and
+keeps an int's sign and digit count in `ob_size`, for which the build selects a
+tag-synthesizing variant that leaves the 3.12+ code untouched; 3.14 moved tuple
+items by adding a cached tuple hash.
 
 ## Use
 
@@ -110,7 +113,7 @@ checkout, unchanged upstream codec tests, paired encode/event benchmarks, and
 real browser checks for both dump backends. Published measurements and validation
 are in [bench/results](bench/results/README.md), including the general 14-file
 comparison, native socket benchmarks and the default-path regression check.
-The same directory holds the [CPython 3.12 - 3.15 measurements](bench/results/README.md#cpython-312---315-version-port)
+The same directory holds the [CPython 3.11 - 3.15 measurements](bench/results/README.md#cpython-311---315-version-port)
 from the version port: no change against the previous build, and consistent timings on every interpreter.
 The orjson baseline retains the PR's original
 codec; mojson replaces its socket retry logic with native serialization.
@@ -120,7 +123,7 @@ and `build/indent-reflex-benchmark.json`.
 ### Local comparison with uv
 
 If Mojo is already installed in `.venv`, keep that compiler environment and use
-a separate CPython environment for the extension (3.12 shown; any of 3.12 - 3.15 works):
+a separate CPython environment for the extension (3.12 shown; any of 3.11 - 3.15 works):
 
 ```bash
 uv venv --python 3.12 .venv-bench
@@ -135,7 +138,7 @@ PATH="$PWD/.venv/bin:$PATH" ./build.sh
 To build and test every supported version side by side:
 
 ```bash
-for v in 3.13 3.14 3.15; do
+for v in 3.11 3.13 3.14 3.15; do
   uv venv --python $v .venv-py$v && uv pip install --python .venv-py$v/bin/python orjson numpy
   PATH="$PWD/.venv/bin:$PATH" PYTHON=.venv-py$v/bin/python ./build.sh
   .venv-py$v/bin/python tests/check_correctness.py build/jsonexamples
@@ -154,7 +157,7 @@ revision and SHA-256 hashes in `build/jsonexamples/manifest.json.txt`.
 ## What's inside (src/mojson.mojo)
 
 - Direct reads of CPython object layouts (type pointer, list/tuple items, compact ints, float bits, str data)
-  for 3.12 - 3.15, with the offsets supplied by the build and verified at import,
+  for 3.11 - 3.15, with the offsets supplied by the build and verified at import,
   and `external_call` into the CPython C API; output written straight into a `bytes` object.
 - Floats: Żmij shortest round-trip core (one 64x128 multiply), SSE BCD digit conversion and `pshufb`
   decimal-point insertion (ported from zmij), exponent table, 4-float batches.
@@ -176,7 +179,7 @@ revision and SHA-256 hashes in `build/jsonexamples/manifest.json.txt`.
   decoder rejects these tokens, so nonfinite output does not round-trip through `loads`.
 - NumPy float32 values are formatted after promotion to float64, which can
   produce more decimal digits than orjson. Non-contiguous arrays use `.tolist()`.
-- CPython 3.12 - 3.15 default (GIL) builds only: free-threaded (`t`) builds lay
+- CPython 3.11 - 3.15 default (GIL) builds only: free-threaded (`t`) builds lay
   objects out differently and are rejected at build time. One build serves one
   minor version. x86-64 AVX2 only (no runtime AVX-512 dispatch yet).
 - Keep `build/_mojson_support.py` alongside the built `mojson.*.so`; the build copies

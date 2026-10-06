@@ -6,8 +6,8 @@
 #include <math.h>
 #include <stdlib.h>
 
-#if PY_VERSION_HEX < 0x030C0000 || PY_VERSION_HEX >= 0x03100000
-#error "mojson supports CPython 3.12 through 3.15"
+#if PY_VERSION_HEX < 0x030B0000 || PY_VERSION_HEX >= 0x03100000
+#error "mojson supports CPython 3.11 through 3.15"
 #endif
 #ifdef Py_GIL_DISABLED
 #error "mojson reads the default (GIL) object layouts; free-threaded builds are not supported"
@@ -25,8 +25,17 @@ MOJSON_LAYOUT(MOJSON_OB_TYPE, offsetof(PyObject, ob_type));
 MOJSON_LAYOUT(MOJSON_OB_SIZE, offsetof(PyVarObject, ob_size));
 MOJSON_LAYOUT(MOJSON_TP_NAME, offsetof(PyTypeObject, tp_name));
 MOJSON_LAYOUT(MOJSON_FLOAT_VALUE, offsetof(PyFloatObject, ob_fval));
+#if PY_VERSION_HEX >= 0x030C0000
+MOJSON_LAYOUT(MOJSON_LONG_TAGGED, 1);
 MOJSON_LAYOUT(MOJSON_LONG_TAG, offsetof(PyLongObject, long_value.lv_tag));
 MOJSON_LAYOUT(MOJSON_LONG_DIGITS, offsetof(PyLongObject, long_value.ob_digit));
+/* Compact integers: lv_tag = ndigits << 3 | sign (0 positive, 1 zero, 2 negative). */
+_Static_assert(_PyLong_NON_SIZE_BITS == 3 && _PyLong_SIGN_MASK == 3, "mojson requires the 3.12 lv_tag encoding");
+#else
+MOJSON_LAYOUT(MOJSON_LONG_TAGGED, 0);
+MOJSON_LAYOUT(MOJSON_LONG_TAG, offsetof(PyVarObject, ob_size));
+MOJSON_LAYOUT(MOJSON_LONG_DIGITS, offsetof(PyLongObject, ob_digit));
+#endif
 MOJSON_LAYOUT(MOJSON_LIST_ITEMS, offsetof(PyListObject, ob_item));
 MOJSON_LAYOUT(MOJSON_TUPLE_ITEMS, offsetof(PyTupleObject, ob_item));
 MOJSON_LAYOUT(MOJSON_BYTES_DATA, offsetof(PyBytesObject, ob_sval));
@@ -37,9 +46,7 @@ MOJSON_LAYOUT(MOJSON_STR_STATE, offsetof(PyASCIIObject, state));
 MOJSON_LAYOUT(MOJSON_STR_ASCII_DATA, sizeof(PyASCIIObject));
 MOJSON_LAYOUT(MOJSON_STR_UTF8_LENGTH, offsetof(PyCompactUnicodeObject, utf8_length));
 MOJSON_LAYOUT(MOJSON_STR_UTF8, offsetof(PyCompactUnicodeObject, utf8));
-/* Compact integers: lv_tag = ndigits << 3 | sign (0 positive, 1 zero, 2 negative). */
 _Static_assert(PyLong_SHIFT == 30, "mojson requires 30-bit CPython integer digits");
-_Static_assert(_PyLong_NON_SIZE_BITS == 3 && _PyLong_SIGN_MASK == 3, "mojson requires the 3.12 lv_tag encoding");
 _Static_assert(sizeof(digit) == 4, "mojson requires 32-bit integer digits");
 /* Py_buffer fields read by the NumPy fast path. */
 _Static_assert(offsetof(Py_buffer, len) == 16 && offsetof(Py_buffer, itemsize) == 24 && offsetof(Py_buffer, ndim) == 36
@@ -48,6 +55,17 @@ _Static_assert(offsetof(Py_buffer, len) == 16 && offsetof(Py_buffer, itemsize) =
 
 /* All Python ownership and keyword parsing lives here, outside the Mojo loops. */
 extern uintptr_t mojson_encode(uintptr_t context, uintptr_t object, uintptr_t request);
+
+#if PY_VERSION_HEX < 0x030C0000
+static PyObject *PyErr_GetRaisedException(void) {
+    PyObject *type, *value, *traceback;
+    PyErr_Fetch(&type, &value, &traceback);
+    PyErr_NormalizeException(&type, &value, &traceback);
+    if (value && traceback) PyException_SetTraceback(value, traceback);
+    Py_XDECREF(type); Py_XDECREF(traceback);
+    return value;
+}
+#endif
 
 static int runtime_failure(const char *what) {
     PyErr_Format(PyExc_ImportError, "mojson was built for CPython %d.%d; this interpreter's %s layout differs",
@@ -93,9 +111,14 @@ int mojson_check_runtime(void) {
     if (!utf8 || (state & 0x60) != 0x20 || (Py_ssize_t)WORD(wide, MOJSON_STR_UTF8_LENGTH) != utf8_length || (const char *)WORD(wide, MOJSON_STR_UTF8) != utf8) {
         runtime_failure("compact str utf8 cache"); goto done;
     }
+#if MOJSON_LONG_TAGGED
     uintptr_t tag = WORD(negative, MOJSON_LONG_TAG);
-    if ((tag & 3) != 2 || (tag >> 3) != 1 || *(uint32_t *)((char *)negative + MOJSON_LONG_DIGITS) != 5
-        || (WORD(zero, MOJSON_LONG_TAG) & 3) != 1 || (WORD(wide_int, MOJSON_LONG_TAG) >> 3) != 2
+    int int_ok = (tag & 3) == 2 && (tag >> 3) == 1 && (WORD(zero, MOJSON_LONG_TAG) & 3) == 1 && (WORD(wide_int, MOJSON_LONG_TAG) >> 3) == 2;
+#else
+    int int_ok = (Py_ssize_t)WORD(negative, MOJSON_LONG_TAG) == -1 && (Py_ssize_t)WORD(zero, MOJSON_LONG_TAG) == 0
+        && (Py_ssize_t)WORD(wide_int, MOJSON_LONG_TAG) == 2 && *(uint32_t *)((char *)zero + MOJSON_LONG_DIGITS) == 0;
+#endif
+    if (!int_ok || *(uint32_t *)((char *)negative + MOJSON_LONG_DIGITS) != 5
         || ((uint64_t)((uint32_t *)((char *)wide_int + MOJSON_LONG_DIGITS))[1] << 30) != (1ULL << 40)) {
         runtime_failure("int"); goto done;
     }

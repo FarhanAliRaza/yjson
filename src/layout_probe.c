@@ -13,8 +13,17 @@ int main(void) {
     printf("MOJSON_OB_SIZE=%zu\n", offsetof(PyVarObject, ob_size));
     printf("MOJSON_TP_NAME=%zu\n", offsetof(PyTypeObject, tp_name));
     printf("MOJSON_FLOAT_VALUE=%zu\n", offsetof(PyFloatObject, ob_fval));
+#if PY_VERSION_HEX >= 0x030C0000
+    /* 3.12+: lv_tag = ndigits << 3 | sign */
+    printf("MOJSON_LONG_TAGGED=1\n");
     printf("MOJSON_LONG_TAG=%zu\n", offsetof(PyLongObject, long_value.lv_tag));
     printf("MOJSON_LONG_DIGITS=%zu\n", offsetof(PyLongObject, long_value.ob_digit));
+#else
+    /* 3.11: ob_size = signed digit count */
+    printf("MOJSON_LONG_TAGGED=0\n");
+    printf("MOJSON_LONG_TAG=%zu\n", offsetof(PyVarObject, ob_size));
+    printf("MOJSON_LONG_DIGITS=%zu\n", offsetof(PyLongObject, ob_digit));
+#endif
     printf("MOJSON_LIST_ITEMS=%zu\n", offsetof(PyListObject, ob_item));
     printf("MOJSON_TUPLE_ITEMS=%zu\n", offsetof(PyTupleObject, ob_item));
     printf("MOJSON_BYTES_DATA=%zu\n", offsetof(PyBytesObject, ob_sval));

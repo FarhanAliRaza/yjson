@@ -31,8 +31,10 @@ def rdi(addr: Int, off: Int) -> Int:
 # Byte offsets of the fields read directly. build.sh probes them from the target
 # interpreter's headers (src/layout_probe.c) and passes them with -D; the C shim
 # re-checks the same values with _Static_assert and against live objects at
-# import. The defaults are the CPython 3.12 layout (3.14 moved tuple items).
+# import. The defaults are the CPython 3.12 layout (3.11 has a longer str
+# header and stores the int sign/size in ob_size; 3.14 moved tuple items).
 comptime PY_MINOR = get_defined_int["MOJSON_PY_MINOR", 12]()
+comptime LONG_TAGGED = get_defined_int["MOJSON_LONG_TAGGED", 1]() != 0
 comptime OB_TYPE = get_defined_int["MOJSON_OB_TYPE", 8]()
 comptime OB_SIZE = get_defined_int["MOJSON_OB_SIZE", 16]()
 comptime TP_NAME = get_defined_int["MOJSON_TP_NAME", 24]()
@@ -75,9 +77,17 @@ def list_items(o: Int) -> Int:
 def tuple_items(o: Int) -> Int:
     return o + TUPLE_ITEMS
 
+# lv_tag: ndigits << 3 | sign (0 positive, 1 zero, 2 negative). On 3.11 the
+# same tag is synthesized from the signed digit count in ob_size, so every
+# integer path below is shared; 3.12+ reads the stored word.
 @always_inline
 def long_tag(o: Int) -> Int:
-    return rdb(o, LONG_TAG)
+    comptime if LONG_TAGGED:
+        return rdb(o, LONG_TAG)
+    else:
+        var size = rdb(o, LONG_TAG)
+        var count = -size if size < 0 else size
+        return (count << 3) | Int(size == 0) | (Int(size < 0) << 1)
 
 @always_inline
 def long_digits(o: Int) -> Pointer[UInt32, MutUntrackedOrigin]:
@@ -595,7 +605,7 @@ def write_int[SOCKET: Bool, o_: Origin[mut=True]](bp: Pointer[Buf, o_], o: Int) 
 
 @inline(.never)
 def write_long_int[SOCKET: Bool, o_: Origin[mut=True]](bp: Pointer[Buf, o_], o: Int, tag: Int) -> Bool:
-    # CPython 3.12+ stores the magnitude in little-endian base-2^30 digits.
+    # CPython stores the magnitude in little-endian base-2^30 digits.
     var count = tag >> 3
     if unlikely(count > 3):
         comptime if SOCKET:

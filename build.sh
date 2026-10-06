@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds mojson for one CPython (3.12 - 3.15, default GIL build, x86-64 with AVX2).
+# Builds mojson for one CPython (3.11 - 3.15, default GIL build, x86-64 with AVX2).
 # Needs Mojo 1.1:  pip install mojo
 # The output is build/mojson<EXT_SUFFIX> (e.g. mojson.cpython-313-x86_64-linux-gnu.so),
 # so builds for several interpreters can live side by side in build/.
@@ -10,8 +10,8 @@ PYTHON_BIN="${PYTHON:-.venv-bench/bin/python}"
 if [ ! -x "$PYTHON_BIN" ]; then PYTHON_BIN="${PYTHON:-python3}"; fi
 read -r PYTHON_INCLUDE EXT_SUFFIX PYTHON_TAG < <("$PYTHON_BIN" - <<'EOF'
 import sys, sysconfig
-if not (3, 12) <= sys.version_info[:2] <= (3, 15):
-    sys.exit(f"mojson supports CPython 3.12 through 3.15, not {sys.version.split()[0]}")
+if not (3, 11) <= sys.version_info[:2] <= (3, 15):
+    sys.exit(f"mojson supports CPython 3.11 through 3.15, not {sys.version.split()[0]}")
 if sysconfig.get_config_var("Py_GIL_DISABLED"):
     sys.exit("mojson does not support free-threaded CPython builds")
 print(sysconfig.get_path("include"), sysconfig.get_config_var("EXT_SUFFIX"), f"{sys.version_info[0]}.{sys.version_info[1]}")

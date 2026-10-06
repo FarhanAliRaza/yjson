@@ -1,4 +1,4 @@
-"""Feature compatibility, errors, and callback safety. Run with CPython 3.12 - 3.15."""
+"""Feature compatibility, errors, and callback safety. Run with CPython 3.11 - 3.15."""
 import dataclasses
 import datetime as dt
 import enum
@@ -439,6 +439,7 @@ class Features(unittest.TestCase):
                 call()
         self.assertEqual(mojson.dumps_socket({"ok": True}), b'{"ok":true}')
 
+    @unittest.skipIf(sys.version_info < (3, 12), "CPython imports _pylong for enormous int(str) only from 3.12")
     def test_socket_enormous_integer_import_ownership(self):
         import builtins
         import gc
