@@ -102,13 +102,30 @@ and surrogate checks. It accepts str/bytes/bytearray/contiguous memoryview and
 raises `JSONDecodeError` (a subclass of `json.JSONDecodeError`). Its parsing
 speed and maximum nesting follow the stdlib backend, rather than orjson's parser.
 
-`dumps_socket(obj, /, default=None)` is a separate native encoder for Reflex
+`dumps_socket(obj, /, default=None, classify=None)` is a separate native encoder for Reflex
 wire packets. It accepts arbitrary-size integers (subject to CPython's decimal
 digit limit), writes NaN/Infinity as bare tokens and escapes lone surrogates,
 matching the stdlib `json.dumps` wire with compact separators. It returns
 bytes and accepts no formatting options. Framework custom types use `default`.
+`classify=` lets a framework handle its own types without a Python call per
+object. yjson calls `classify(type)` once per call, for each type that would
+otherwise reach `default`, and caches the answer for that call:
+
+- a tuple of attribute names writes the object as `{name: getattr(obj, name)}`;
+- a callable writes its result (for `str` on a naive date, time or datetime,
+  yjson formats the value itself, matching `str()` exactly);
+- `None` calls `default` as usual.
+
+```python
+yjson.dumps_socket(rows, default=serialize,
+                   classify=lambda t: tuple(f.name for f in dataclasses.fields(t))
+                   if dataclasses.is_dataclass(t) else None)
+```
+
 Reflex installs it as `reflex[yjson]`: its `format.json_dumps` calls this
-function for compact output, with no stdlib retries or Python container walks.
+function for compact output, with no stdlib retries or Python container walks,
+and passes a `classify` derived from its serializer registry, so registered
+serializers still apply.
 Ordinary `dumps()` keeps its integer range and UTF-8 error behavior.
 
 ## Test and benchmark

@@ -390,6 +390,72 @@ class Features(unittest.TestCase):
         with self.assertRaises(TypeError):
             yjson.dumps(2**100)
 
+    def test_socket_classify_plans(self):
+        @dataclasses.dataclass
+        class Row:
+            name: str
+            _hidden: int
+            when: dt.date
+
+        class Wrapper:  # stands in for a proxy that forwards attribute access
+            def __init__(self, inner):
+                self._inner = inner
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+        asked, defaulted = [], []
+        def classify(kind):
+            asked.append(kind)
+            if kind in (Row, Wrapper):
+                return ("name", "_hidden", "when")
+            if kind is dt.date:
+                return str
+            if kind is set:
+                return sorted
+            return None
+        def default(obj):
+            defaulted.append(type(obj))
+            return repr(obj)
+        row = Row("a", 1, dt.date(2024, 1, 2))
+        value = [row, Wrapper(Row("b", 2, dt.date(2024, 3, 4))), row, {3, 1}, complex(1, 2), complex(0, 1)]
+        out = yjson.dumps_socket(value, default=default, classify=classify)
+        self.assertEqual(out, b'[{"name":"a","_hidden":1,"when":"2024-01-02"},'
+                              b'{"name":"b","_hidden":2,"when":"2024-03-04"},'
+                              b'{"name":"a","_hidden":1,"when":"2024-01-02"},[1,3],"(1+2j)","1j"]')
+        self.assertEqual(asked, [Row, dt.date, Wrapper, set, complex])  # once per type per call
+        self.assertEqual(defaulted, [complex, complex])
+        self.assertEqual(yjson.dumps_socket([row], default=str), yjson.dumps_socket([row], default=str, classify=None))
+        # A plan's result is encoded like any value, including further classified objects.
+        self.assertEqual(yjson.dumps_socket(row, classify=lambda kind: (lambda obj: [obj.when]) if kind is Row else str),
+                         b'["2024-01-02"]')
+        # The str plan writes naive dates and times natively; it must equal str().
+        utc, plus = dt.timezone.utc, dt.timezone(dt.timedelta(hours=5, minutes=30))
+        values = [dt.date(2024, 1, 2), dt.date(999, 12, 31), dt.datetime(2024, 1, 2, 3, 4, 5),
+                  dt.datetime(2024, 1, 2, 3, 4, 5, 6), dt.datetime(1, 1, 1), dt.time(0, 0), dt.time(23, 59, 59, 999999),
+                  dt.datetime(2024, 1, 2, 3, 4, tzinfo=utc), dt.datetime(2024, 1, 2, 3, 4, 5, 7, tzinfo=plus),
+                  dt.time(1, 2, tzinfo=plus), dt.timedelta(days=1, seconds=1, microseconds=1)]
+        self.assertEqual(json.loads(yjson.dumps_socket(values, classify=lambda kind: str)), [str(v) for v in values])
+        # More types than cache slots still answer correctly.
+        kinds = [type(f"K{i}", (), {"v": i}) for i in range(40)]
+        out = yjson.dumps_socket([k() for k in kinds] * 2, classify=lambda kind: ("v",))
+        self.assertEqual(json.loads(out), [{"v": i} for i in range(40)] * 2)
+        for bad in (1, ("ok", 2), ["name"]):
+            with self.assertRaises(TypeError):
+                yjson.dumps_socket(row, classify=lambda kind, bad=bad: bad)
+        def boom(kind):
+            raise KeyError("boom")
+        with self.assertRaises(TypeError) as caught:
+            yjson.dumps_socket(row, classify=boom)
+        self.assertIsInstance(caught.exception.__cause__, KeyError)
+        with self.assertRaises(TypeError):
+            yjson.dumps_socket(row, classify=("name",))
+        with self.assertRaises(TypeError) as caught:
+            yjson.dumps_socket(row, classify=lambda kind: ("missing",))
+        self.assertIsInstance(caught.exception.__cause__, AttributeError)
+        # dumps() has no classify; plain objects without a plan still need default.
+        with self.assertRaises(TypeError):
+            yjson.dumps(row, classify=classify)
+
     def test_socket_matches_stdlib_wire(self):
         # Strings pass through untouched and non-finite floats stay bare tokens, as json.dumps writes them.
         for text in ("__reflex_nan__", "__reflex_inf__", "__reflex_esc__x", "nan", "null", "NaN"):

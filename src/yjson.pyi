@@ -7,8 +7,17 @@ class Fragment:
     def __init__(self, value: bytes | str) -> None: ...
 
 def dumps(obj: Any, /, default: Callable[[Any], Any] | None = ..., option: int | None = ...) -> bytes: ...
-def dumps_socket(obj: Any, /, default: Callable[[Any], Any] | None = ...) -> bytes:
-    """Compact JSON with Python json semantics: big integers, NaN/Infinity, escaped lone surrogates."""
+def dumps_socket(
+    obj: Any,
+    /,
+    default: Callable[[Any], Any] | None = ...,
+    classify: Callable[[type], tuple[str, ...] | Callable[[Any], Any] | None] | None = ...,
+) -> bytes:
+    """Compact JSON with Python json semantics: big integers, NaN/Infinity, escaped lone surrogates.
+
+    classify(type) is asked once per call for each type that would go to default: a tuple of
+    attribute names writes the object as that dict, a callable writes its result, None uses default.
+    """
     ...
 def loads(obj: str | bytes | bytearray | memoryview, /) -> Any: ...
 

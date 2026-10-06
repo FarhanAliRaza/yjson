@@ -228,6 +228,11 @@ typedef struct {
     PyObject *enum_type;
 } ModuleState;
 
+/* Per-call cache of dumps_socket(classify=...) answers, one per type seen. */
+#define PLAN_CACHE_SIZE 16
+/* Ancestors already in keepalive, per nesting level, so sibling callbacks skip re-pinning. */
+#define PINNED_LEVELS 8
+
 typedef struct {
     ModuleState *state;
     PyObject *capsule, *default_fn;
@@ -235,6 +240,11 @@ typedef struct {
     int conversions;
     int single_ancestor;
     PyObject *keepalive;
+    PyObject *classify;  /* NULL: every unhandled object goes to default */
+    int plan_count;
+    PyTypeObject *plan_types[PLAN_CACHE_SIZE];
+    PyObject *plans[PLAN_CACHE_SIZE];
+    PyObject *pinned[PINNED_LEVELS];  /* borrowed: each is held by keepalive */
 } Request;
 
 static PyObject *dumps(PyObject *, PyObject *const *, Py_ssize_t, PyObject *);
@@ -245,7 +255,7 @@ static PyMethodDef dumps_method = {
 };
 static PyMethodDef socket_method = {
     "dumps_socket", (PyCFunction)(void (*)(void))dumps_socket, METH_FASTCALL | METH_KEYWORDS,
-    "dumps_socket(obj, /, default=None) -> bytes"
+    "dumps_socket(obj, /, default=None, classify=None) -> bytes"
 };
 
 static void destroy_state(PyObject *capsule) {
@@ -283,7 +293,7 @@ static void wrap_error(int callback) {
     }
 }
 
-static inline __attribute__((always_inline)) PyObject *dumps_impl(PyObject *capsule, PyObject *const *args, Py_ssize_t nargs, PyObject *kwnames, int socket) {
+static inline __attribute__((always_inline)) PyObject *dumps_impl(PyObject *capsule, PyObject *const *args, Py_ssize_t nargs, PyObject *kwnames, int socket, PyObject *classify) {
     if (nargs < 1 || nargs > 3) {
         PyErr_SetString(PyExc_TypeError, "dumps() requires one object and at most three positional arguments");
         return NULL;
@@ -315,31 +325,48 @@ static inline __attribute__((always_inline)) PyObject *dumps_impl(PyObject *caps
         }
     }
     if (socket) option |= 65536 | 4 | 512 | 2048;
-    Request request = {state, capsule, default_fn, option, 0, 0, NULL};
+    Request request = {.state = state, .capsule = capsule, .default_fn = default_fn, .option = option, .classify = classify};
     PyObject *result = (PyObject *)yjson_encode(state->context, (uintptr_t)args[0], (uintptr_t)&request);
     Py_XDECREF(request.keepalive);
+    for (int i = 0; i < request.plan_count; i++) {
+        Py_DECREF(request.plans[i]);
+        Py_DECREF(request.plan_types[i]);
+    }
     if (!result) wrap_error(0);
     return result;
 }
 
 static PyObject *dumps(PyObject *capsule, PyObject *const *args, Py_ssize_t nargs, PyObject *kwnames) {
-    return dumps_impl(capsule, args, nargs, kwnames, 0);
+    return dumps_impl(capsule, args, nargs, kwnames, 0, NULL);
 }
 
 static PyObject *dumps_socket(PyObject *capsule, PyObject *const *args, Py_ssize_t nargs, PyObject *kwnames) {
-    if (nargs > 2) {
+    if (nargs < 1 || nargs > 2) {
         PyErr_SetString(PyExc_TypeError, "dumps_socket() accepts an object and default callback");
         return NULL;
     }
+    PyObject *call[2] = {args[0], nargs == 2 ? args[1] : Py_None};
+    PyObject *classify = NULL;
+    int default_seen = nargs == 2;
     if (kwnames) {
         for (Py_ssize_t i = 0; i < PyTuple_GET_SIZE(kwnames); i++) {
-            if (PyUnicode_CompareWithASCIIString(PyTuple_GET_ITEM(kwnames, i), "default") != 0) {
-                PyErr_SetString(PyExc_TypeError, "dumps_socket() only accepts default=");
+            PyObject *name = PyTuple_GET_ITEM(kwnames, i);
+            if (PyUnicode_CompareWithASCIIString(name, "default") == 0 && !default_seen) {
+                call[1] = args[nargs + i]; default_seen = 1;
+            } else if (PyUnicode_CompareWithASCIIString(name, "classify") == 0 && !classify) {
+                classify = args[nargs + i];
+            } else {
+                PyErr_SetString(PyExc_TypeError, "dumps_socket() only accepts default= and classify=");
                 return NULL;
             }
         }
     }
-    return dumps_impl(capsule, args, nargs, kwnames, 1);
+    if (classify == Py_None) classify = NULL;
+    if (classify && !PyCallable_Check(classify)) {
+        PyErr_SetString(PyExc_TypeError, "classify must be callable");
+        return NULL;
+    }
+    return dumps_impl(capsule, call, 2, NULL, 1, classify);
 }
 
 /* Decimal conversion only for the cold, arbitrary-size integer path. CPython's
@@ -424,7 +451,10 @@ static int retain_ancestors(Request *request, uintptr_t ancestors_ptr, long dept
         }
         /* Transfer the existing and newly pinned references into the list. */
         PyList_SET_ITEM(expanded, 0, request->keepalive);
-        for (long i = 1; i <= depth; i++) PyList_SET_ITEM(expanded, i, ancestors[i]);
+        for (long i = 1; i <= depth; i++) {
+            PyList_SET_ITEM(expanded, i, ancestors[i]);
+            if (i < PINNED_LEVELS) request->pinned[i] = ancestors[i];
+        }
         request->keepalive = expanded;
         request->single_ancestor = 0;
         return 1;
@@ -436,12 +466,17 @@ static int retain_ancestors(Request *request, uintptr_t ancestors_ptr, long dept
         int ok = request->keepalive != NULL;
         for (long i = 1; i <= depth; i++) {
             if (ok && PyList_Append(request->keepalive, ancestors[i]) < 0) ok = 0;
+            else if (ok && i < PINNED_LEVELS) request->pinned[i] = ancestors[i];
         }
         for (long i = 1; i <= depth; i++) Py_DECREF(ancestors[i]);
         return ok;
     }
     for (long i = 1; i <= depth; i++) {
+        /* An object in keepalive stays alive for the whole call, so its address
+           cannot be reused: pointer equality means it is already pinned. */
+        if (i < PINNED_LEVELS && request->pinned[i] == ancestors[i]) continue;
         if (PyList_Append(request->keepalive, ancestors[i]) < 0) return 0;
+        if (i < PINNED_LEVELS) request->pinned[i] = ancestors[i];
     }
     return 1;
 }
@@ -456,7 +491,7 @@ static void two_digits(char *dst, int value) {
 }
 
 /* Exact stdlib types have no user callbacks; custom tzinfo stays in the cold helper. */
-static PyObject *datetime_string(PyObject *obj, long option, int *handled) {
+static PyObject *datetime_string(PyObject *obj, long option, int *handled, char separator) {
     int is_datetime = PyDateTime_CheckExact(obj), is_time = PyTime_CheckExact(obj);
     *handled = is_datetime || is_time || PyDate_CheckExact(obj);
     if (!*handled) return NULL;
@@ -477,7 +512,7 @@ static PyObject *datetime_string(PyObject *obj, long option, int *handled) {
         text[4] = '-'; two_digits(text + 5, PyDateTime_GET_MONTH(obj));
         text[7] = '-'; two_digits(text + 8, PyDateTime_GET_DAY(obj));
         size = 10;
-        if (is_datetime) text[size++] = 'T';
+        if (is_datetime) text[size++] = separator;
     }
     if (is_datetime || is_time) {
         int hour = is_time ? PyDateTime_TIME_GET_HOUR(obj) : PyDateTime_DATE_GET_HOUR(obj);
@@ -577,6 +612,56 @@ fail:
     return NULL;
 }
 
+/* classify(type) answers once per type per call: a tuple of attribute names
+   (write the object as that dict), a callable (write its result), or None
+   (use default). Returns a borrowed plan, or NULL with an exception set. */
+static PyObject *socket_plan(Request *request, PyTypeObject *type) {
+    for (int i = 0; i < request->plan_count; i++)
+        if (request->plan_types[i] == type) return request->plans[i];
+    PyObject *plan = PyObject_CallOneArg(request->classify, (PyObject *)type);
+    if (!plan) {
+        if (PyErr_ExceptionMatches(PyExc_Exception)) wrap_error(1);
+        return NULL;
+    }
+    int valid = plan == Py_None || PyCallable_Check(plan);
+    if (!valid && PyTuple_CheckExact(plan)) {
+        valid = 1;
+        for (Py_ssize_t i = 0; i < PyTuple_GET_SIZE(plan); i++)
+            if (!PyUnicode_Check(PyTuple_GET_ITEM(plan, i))) { valid = 0; break; }
+    }
+    if (!valid) {
+        Py_DECREF(plan);
+        PyErr_SetString(PyExc_TypeError, "classify must return None, a callable, or a tuple of attribute names");
+        return NULL;
+    }
+    if (request->plan_count == PLAN_CACHE_SIZE) {
+        /* Rare: more distinct types than slots. Keep the newest answer in the last slot. */
+        Py_DECREF(request->plans[PLAN_CACHE_SIZE - 1]);
+        Py_DECREF(request->plan_types[PLAN_CACHE_SIZE - 1]);
+        request->plan_count--;
+    }
+    /* Strong reference: a freed type's address could be reused by another type. */
+    request->plan_types[request->plan_count] = (PyTypeObject *)Py_NewRef(type);
+    request->plans[request->plan_count++] = plan;
+    return plan;
+}
+
+static PyObject *attribute_dict(PyObject *obj, PyObject *names) {
+    PyObject *result = _PyDict_NewPresized(PyTuple_GET_SIZE(names));
+    if (!result) return NULL;
+    for (Py_ssize_t i = 0; i < PyTuple_GET_SIZE(names); i++) {
+        PyObject *name = PyTuple_GET_ITEM(names, i);
+        PyObject *value = PyObject_GetAttr(obj, name);
+        if (!value || PyDict_SetItem(result, name, value) < 0) {
+            Py_XDECREF(value);
+            Py_DECREF(result);
+            return NULL;
+        }
+        Py_DECREF(value);
+    }
+    return result;
+}
+
 static uintptr_t convert_object(uintptr_t request_ptr, uintptr_t object, int *is_fragment, uintptr_t ancestors_ptr, long depth) {
     Request *request = (Request *)request_ptr;
     PyObject *obj = (PyObject *)object;
@@ -593,7 +678,7 @@ static uintptr_t convert_object(uintptr_t request_ptr, uintptr_t object, int *is
     *is_fragment = 0;
     if (!(request->option & 512)) {
         int handled;
-        PyObject *result = datetime_string(obj, request->option, &handled);
+        PyObject *result = datetime_string(obj, request->option, &handled, 'T');
         if (handled) return (uintptr_t)result;
     }
     if (!(request->option & 65536) && Py_IS_TYPE(obj, (PyTypeObject *)request->state->uuid_type)) return (uintptr_t)uuid_string(obj);
@@ -631,6 +716,27 @@ static uintptr_t convert_object(uintptr_t request_ptr, uintptr_t object, int *is
     PyObject *schema = !(request->option & 2048) && !PyType_Check(obj)
         ? _PyType_Lookup(Py_TYPE(obj), request->state->dataclass_name) : NULL;
     if (!special_datetime && !schema) {
+        if (request->classify) {
+            PyObject *plan = socket_plan(request, Py_TYPE(obj));
+            if (!plan) return 0;
+            if (PyTuple_CheckExact(plan)) {
+                *is_fragment = 2;
+                return (uintptr_t)attribute_dict(obj, plan);
+            }
+            if (plan == (PyObject *)&PyUnicode_Type
+                && (PyDate_CheckExact(obj) || PyDateTime_CheckExact(obj) || PyTime_CheckExact(obj))
+                && !(PyDateTime_CheckExact(obj) && PyDateTime_DATE_GET_TZINFO(obj) != Py_None)
+                && !(PyTime_CheckExact(obj) && PyDateTime_TIME_GET_TZINFO(obj) != Py_None)) {
+                /* str() of a naive date/datetime/time is isoformat(" "), written without a method call. */
+                int handled;
+                return (uintptr_t)datetime_string(obj, 0, &handled, ' ');
+            }
+            if (plan != Py_None) {
+                PyObject *result = PyObject_CallOneArg(plan, obj);
+                if (!result && PyErr_ExceptionMatches(PyExc_Exception)) wrap_error(1);
+                return (uintptr_t)result;
+            }
+        }
         if (request->default_fn == Py_None) {
             PyErr_Format(PyExc_TypeError, "Type is not JSON serializable: %s", Py_TYPE(obj)->tp_name);
             return 0;
@@ -684,7 +790,7 @@ static PyObject *key_string(Request *request, PyObject *key) {
             return PyUnicode_FromString(isnan(value) ? "NaN" : value > 0 ? "Infinity" : "-Infinity");
         }
         if (!isfinite(PyFloat_AS_DOUBLE(key))) return PyUnicode_FromString("null");
-        Request scalar = {request->state, request->capsule, Py_None, 0, 0, 0, NULL};
+        Request scalar = {.state = request->state, .capsule = request->capsule, .default_fn = Py_None};
         PyObject *bytes = (PyObject *)yjson_encode(request->state->context, (uintptr_t)key, (uintptr_t)&scalar);
         if (!bytes) return NULL;
         PyObject *text = PyUnicode_DecodeUTF8(PyBytes_AS_STRING(bytes), PyBytes_GET_SIZE(bytes), "strict");
@@ -692,7 +798,7 @@ static PyObject *key_string(Request *request, PyObject *key) {
         return text;
     }
     int handled;
-    PyObject *text = datetime_string(key, request->option, &handled);
+    PyObject *text = datetime_string(key, request->option, &handled, 'T');
     if (handled) return text;
     if (Py_IS_TYPE(key, (PyTypeObject *)request->state->uuid_type)) return uuid_string(key);
     PyObject *option = PyLong_FromLong(request->option);
@@ -837,7 +943,7 @@ static int nonstr_key_record(Request *request, PyObject *key, DictRecord *record
             *record = (DictRecord){Py_NewRef(key), NULL, text, (Py_ssize_t)strlen(text)};
             return 1;
         }
-        Request scalar = {request->state, request->capsule, Py_None, 0, 0, 0, NULL};
+        Request scalar = {.state = request->state, .capsule = request->capsule, .default_fn = Py_None};
         PyObject *bytes = (PyObject *)yjson_encode(request->state->context, (uintptr_t)key, (uintptr_t)&scalar);
         if (!bytes) return 0;
         *record = (DictRecord){bytes, NULL, PyBytes_AS_STRING(bytes), PyBytes_GET_SIZE(bytes)};
