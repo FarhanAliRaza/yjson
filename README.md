@@ -249,6 +249,8 @@ revision and SHA-256 hashes in `build/jsonexamples/manifest.json.txt`.
 - A `.so` straight from `build.sh` needs the Mojo runtime libraries (`libKGENCompilerRTShared.so`,
   `libAsyncRTRuntimeGlobals.so`, `libMSupportGlobals.so`) from the `mojo` pip package, found
   through the RUNPATH the compiler records. The published wheels bundle them (`auditwheel repair`).
+  At import the module points the Mojo runtime at the running interpreter (it sets
+  `MOJO_PYTHON_LIBRARY` when unset), so no `python3` needs to be on `PATH`.
 
 ## Credits
 

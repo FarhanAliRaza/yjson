@@ -11,6 +11,7 @@
 #include <stdint.h>
 #include <math.h>
 #include <stdlib.h>
+#include <dlfcn.h>
 
 #if PY_VERSION_HEX < 0x030B0000 || PY_VERSION_HEX >= 0x03100000
 #error "mojson supports CPython 3.11 through 3.15"
@@ -94,7 +95,23 @@ static int runtime_failure(const char *what) {
    confirms them against live objects of the running interpreter, including
    the str state bits and the dict key-table kind byte, which the headers do
    not expose as offsets. Runs once at import. */
+/* The Mojo runtime locates libpython by running `python3` from PATH (or
+   MOJO_PYTHON) unless MOJO_PYTHON_LIBRARY is set. Inside an extension module
+   the interpreter is already loaded, and PATH may hold no python3 or a
+   different one, so point it at the object that provides Py_GetVersion:
+   libpython3.X.so for shared builds, the executable for static ones. dlopen
+   of either returns the image that is already loaded. An empty path also
+   works (dlopen("") is the main program). */
+static void point_mojo_at_this_interpreter(void) {
+    if (getenv("MOJO_PYTHON_LIBRARY")) return;
+    Dl_info info;
+    const char *path = "";
+    if (dladdr((void *)&Py_GetVersion, &info) && info.dli_fname) path = info.dli_fname;
+    setenv("MOJO_PYTHON_LIBRARY", path, 0);
+}
+
 int mojson_check_runtime(void) {
+    point_mojo_at_this_interpreter();
     if ((Py_Version >> 16) != (PY_VERSION_HEX >> 16)) {
         PyErr_Format(PyExc_ImportError, "mojson was built for CPython %d.%d, not %lu.%lu",
                      PY_MAJOR_VERSION, PY_MINOR_VERSION, Py_Version >> 24, (Py_Version >> 16) & 0xFF);
@@ -930,6 +947,14 @@ int mojson_strict_integer(uintptr_t obj) {
         return 0;
     }
     return !PyErr_Occurred();
+}
+
+void mojson_import_error(uintptr_t detail, Py_ssize_t length) {
+    if (PyErr_Occurred()) return;
+    PyObject *text = PyUnicode_DecodeUTF8((const char *)detail, length, "replace");
+    if (!text) return;
+    PyErr_Format(PyExc_ImportError, "mojson could not initialize its Mojo runtime: %U", text);
+    Py_DECREF(text);
 }
 
 void mojson_error(int code) {

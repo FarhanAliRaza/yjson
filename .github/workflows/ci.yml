@@ -123,8 +123,9 @@ jobs:
           uv sync --locked --only-group test
           uv pip install wheelhouse/*.whl
       - name: Check that the installed wheel is what gets imported
+        # env -i: the import must not depend on a python3 on PATH or on any environment variable.
         run: |
-          .venv/bin/python - <<'PY'
+          env -i HOME="$HOME" .venv/bin/python - <<'PY'
           import sys, sysconfig, mojson
           assert mojson.__file__.startswith(sysconfig.get_paths()["purelib"]), mojson.__file__
           assert mojson.dumps({"ok": [1, 2.5, None]}) == b'{"ok":[1,2.5,null]}'
