@@ -15,3 +15,6 @@ __pycache__/
 .DS_Store
 .env
 .env.*
+/dist/
+/wheelhouse/
+*.egg-info/

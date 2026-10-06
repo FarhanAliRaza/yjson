@@ -4,6 +4,18 @@ A JSON serializer for CPython written in Mojo, with an orjson-style API.
 NaN / Infinity are written the way Python's `json` writes them
 (`NaN`, `Infinity`, `-Infinity`), and NumPy arrays and scalars are supported directly.
 
+## Install
+
+Wheels are published to PyPI for CPython 3.11 - 3.15 on x86-64 Linux
+(`manylinux_2_35`, i.e. glibc 2.35+ such as Ubuntu 22.04 or newer) and need a CPU
+with AVX2. They bundle the Mojo runtime library, so nothing else is required:
+
+```bash
+pip install mojson        # or: uv add mojson
+```
+
+Building from the sdist needs the Mojo compiler on `PATH` (see below).
+
 ## Build
 
 Requirements: CPython 3.11, 3.12, 3.13, 3.14 or 3.15 (default GIL builds) with headers,
@@ -125,6 +137,39 @@ codec; mojson replaces its socket retry logic with native serialization.
 Earlier option and indentation results remain in `build/fix-options.json`
 and `build/indent-reflex-benchmark.json`.
 
+### Packaging and CI
+
+`pyproject.toml` describes the package; `setup.py` only teaches setuptools to
+compile the extension through `build.sh`, so `uv build` and `pip install .`
+work with the Mojo compiler on `PATH`. The dependency groups `test`, `wheel`
+and `mojo` are pinned in `uv.lock`:
+
+```bash
+UV_PROJECT_ENVIRONMENT=.venv-mojo uv sync --only-group mojo --python 3.13   # Mojo 1.1
+export PATH="$PWD/.venv-mojo/bin:$PATH"
+uv build --sdist
+uv build --wheel --python 3.13 --out-dir dist dist/mojson-*.tar.gz           # cp313 wheel
+uv sync --only-group wheel                                                   # auditwheel + patchelf into .venv
+PATH="$PWD/.venv/bin:$PATH" auditwheel repair \
+    --ldpaths "$(.venv-mojo/bin/python -c 'import modular; print(modular.__path__[0] + "/lib")')" \
+    --disable-isa-ext-check --wheel-dir wheelhouse dist/*.whl
+```
+
+`auditwheel repair` copies `libKGENCompilerRTShared.so` and its dependencies
+into `mojson.libs/` and sets the `manylinux_2_35` tag (the floor set by the Mojo
+runtime). `--disable-isa-ext-check` is required because the extension targets
+x86-64-v3 (AVX2) by design.
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs the same steps on
+every push and pull request: it builds the sdist, builds one wheel per
+interpreter from that sdist, repairs it, installs it into a clean environment
+and runs `tests/check_features.py`, `tests/check_correctness.py` (with the
+simdjson corpus) and `examples/usage.py` against the installed wheel. Pushing a
+tag `vX.Y.Z` whose version matches `pyproject.toml` additionally publishes the
+sdist and wheels to PyPI through [trusted publishing](https://docs.pypi.org/trusted-publishers/)
+from the `pypi` GitHub environment, so no API token is stored. To release:
+bump `version` in `pyproject.toml`, commit, then `git tag v0.1.0 && git push origin v0.1.0`.
+
 ### Local comparison with uv
 
 If Mojo is already installed in `.venv`, keep that compiler environment and use
@@ -201,8 +246,12 @@ revision and SHA-256 hashes in `build/jsonexamples/manifest.json.txt`.
   this stdlib-only helper automatically. The extension has no orjson runtime dependency.
 - The string tail reads up to 31 bytes past a string's end within the same memory page (safe, but
   AddressSanitizer/valgrind will flag it).
-- A built `.so` needs the Mojo runtime libraries (`libKGENCompilerRTShared.so`, `libAsyncRTRuntimeGlobals.so`,
-  `libMSupportGlobals.so`) available, e.g. from the `mojo` pip package; a wheel would have to bundle them.
+- A `.so` straight from `build.sh` needs the Mojo runtime libraries (`libKGENCompilerRTShared.so`,
+  `libAsyncRTRuntimeGlobals.so`, `libMSupportGlobals.so`) from the `mojo` pip package, found
+  through the RUNPATH the compiler records. The published wheels bundle them (`auditwheel repair`).
+  At import the module points the Mojo runtime at the running interpreter (it sets
+  `MOJO_PYTHON_LIBRARY` when unset), so no `python3` needs to be on `PATH`. If `MOJO_PYTHON`
+  or `MOJO_PYTHON_LIBRARY` is already set, the runtime uses it, so it must be valid.
 
 ## Credits
 

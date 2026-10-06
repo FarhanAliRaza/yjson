@@ -2388,5 +2388,6 @@ def PyInit_mojson() abi("C") -> PythonObject:
             return PythonObject(from_owned=external_call["mojson_null", PyObjectPtr]())
         return mod
     except e:
-        external_call["mojson_error", NoneType](Int32(5))
+        var detail = String(e)
+        external_call["mojson_import_error", NoneType](Int(detail.unsafe_ptr()), detail.byte_length())
         return PythonObject(from_owned=external_call["mojson_null", PyObjectPtr]())
