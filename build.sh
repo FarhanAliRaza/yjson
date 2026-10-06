@@ -5,6 +5,8 @@
 # so builds for several interpreters can live side by side in build/.
 # MOJSON_DIRECT_DICT=0 makes the dict writers call PyDict_Next instead of
 # walking the key table (for comparison only; the default is the direct walk).
+# MCPU selects the target (default x86-64-v3 = AVX2; x86-64-v4 adds AVX-512
+# string scanning). The build only runs on CPUs with the chosen features.
 set -euo pipefail
 cd "$(dirname "$0")"
 mkdir -p build
@@ -31,7 +33,7 @@ done < <(build/layout_probe)
 LAYOUT_MOJO+=(-D "MOJSON_DIRECT_DICT=${MOJSON_DIRECT_DICT:-1}")
 OUT="build/mojson$EXT_SUFFIX"
 "$CC_BIN" -O3 -fPIC -Wall -Wextra -Werror "${LAYOUT_C[@]}" -I "$PYTHON_INCLUDE" -c src/python_api.c -o "build/python_api-$PYTHON_TAG.o"
-"${MOJO:-mojo}" build --mcpu x86-64-v3 "${LAYOUT_MOJO[@]}" src/mojson.mojo --emit shared-lib -Xlinker "$PWD/build/python_api-$PYTHON_TAG.o" -o "$OUT"
+"${MOJO:-mojo}" build --mcpu "${MCPU:-x86-64-v3}" "${LAYOUT_MOJO[@]}" src/mojson.mojo --emit shared-lib -Xlinker "$PWD/build/python_api-$PYTHON_TAG.o" -o "$OUT"
 cp src/_mojson_support.py build/_mojson_support.py
 cp src/mojson.pyi build/mojson.pyi
 echo "built $OUT for CPython $PYTHON_TAG"

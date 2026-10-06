@@ -206,6 +206,60 @@ Shapes on 3.14, orjson time / mojson time (before → after):
 | nonstr keys sorted x500 | 0.34× | 1.52× |
 | indent 2 dict 20 keys x500 | 0.69× | 1.51× |
 
+### Algorithms from the literature, and whether they apply
+
+Surveyed for the remaining cost centers (floats, integers, string escaping,
+type dispatch). Sources are linked from the main README's credits where used.
+
+- **Shortest float formatting.** The frontier is Schubfach (Giulietti 2020)
+  and its descendants: Dragonbox (Jeon), Tejú Jaguá (Neri, about 27% faster
+  than Dragonbox and 2× Ryū), yy (ibireme) and xjb (2025 preprint), which
+  the Żmij library combines into one 64×128-bit multiplication per double
+  with SIMD digit output. mojson already ports Żmij's core and digit output,
+  and orjson 3.12 now uses Żmij as well, so both sit on the same algorithm;
+  canada and numbers are at 1.05–1.5× of orjson by loop structure, not by
+  the conversion. A 2026 experimental review (Champagne Gareau, *Software:
+  Practice and Experience*) covers the same family; it was not reachable from
+  this environment, so the ranking above is from the libraries' own
+  published benchmarks.
+- **Integer formatting.** Champagne Gareau & Lemire, *Converting an Integer
+  to a Decimal String in Under Two Nanoseconds* (2026): all eight digits of
+  a value below 10^8 from two AVX-512 IFMA multiply-add instructions
+  (`vpmadd52lo/hi` with per-lane reciprocals of 10^k), 1.4–2× the best
+  table-based writers. It needs AVX-512 IFMA (Ice Lake / Zen 4 and newer);
+  the machine used here has AVX-512 F/BW/VL but not IFMA, and the
+  comparison target is a wheel without it, so it was not adopted. mojson's
+  4-wide batch (Żmij's 16-bit-lane BCD trick) is the AVX2 equivalent and
+  already writes small ints at 1.35× and large ints at 1.9× of orjson.
+- **String escaping.** Lemire, *Escaping strings faster with AVX-512*
+  (2022): expand 32 bytes to 64 with interleaved zeros, blend the escape
+  characters in, then `vpcompressb` the unused bytes out, at 8.5 GB/s against
+  2 GB/s for a lookup-table SIMD scan. It requires AVX-512 VBMI2, absent
+  here. The portable part of the idea, producing the escape mask directly in
+  a k-register (`vpcmpub`) instead of `pmovmskb`, needs only AVX-512BW/VL,
+  is what orjson's wheel uses when the CPU allows, and was tried here: the
+  escape scan gained a 64-byte k-mask variant and the build an `MCPU` knob.
+  Built for x86-64-v4 on this Xeon (AVX-512 F/BW/VL, Cascade Lake class) the
+  whole module came out 6% slower (corpus geomean 0.941×, every file down):
+  the compiler widens all SIMD code to 512-bit registers (about 3,900 zmm
+  instructions), which on this CPU generation lowers the clock for heavy
+  512-bit use, and the string shapes themselves were mixed (+5% on 128-byte
+  strings, −6% with escapes, −20% on non-ASCII). The default build stays
+  AVX2; `MCPU=x86-64-v4 ./build.sh` is an opt-in for CPUs without that
+  penalty (Sapphire Rapids, Zen 4 and newer), untested here.
+- **Type dispatch.** Ertl & Gregg (2003) on indirect-branch misprediction
+  in interpreters, and Rohou, Swamy & Seznec, *Branch prediction and the
+  performance of interpreters: don't trust folklore* (2015): modern TAGE-
+  class predictors handle dispatch on repeating patterns well, and nothing
+  predicts a uniformly random type sequence. That matches the measurements:
+  homogeneous lists dispatch at full speed, random mixes pay one mispredict
+  per element in every library, and the branch-free literal path tried above
+  removed it only by adding a per-element cost elsewhere.
+- **Not applicable.** Zero-copy and schema-driven serialization work
+  (Cornflakes, Cap'n Proto-style layouts, FlatBuffers) avoids text entirely;
+  simdjson's parsing results (Langdale & Lemire 2019) concern the decoder,
+  which mojson delegates to the standard library by design.
+
 ## Reflex PR 6116
 
 [Integration and reproduction details](../REFLEX.md).

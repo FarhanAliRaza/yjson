@@ -193,7 +193,10 @@ revision and SHA-256 hashes in `build/jsonexamples/manifest.json.txt`.
   produce more decimal digits than orjson. Non-contiguous arrays use `.tolist()`.
 - CPython 3.11 - 3.15 default (GIL) builds only: free-threaded (`t`) builds lay
   objects out differently and are rejected at build time. One build serves one
-  minor version. x86-64 AVX2 only (no runtime AVX-512 dispatch yet).
+  minor version. x86-64 AVX2 by default; `MCPU=x86-64-v4 ./build.sh` builds
+  an AVX-512 variant (k-mask string scanning) that only runs on such CPUs and
+  was slower on a Cascade Lake Xeon (512-bit frequency penalty), so there is
+  no runtime dispatch.
 - Keep `build/_mojson_support.py` alongside the built `mojson.*.so`; the build copies
   this stdlib-only helper automatically. The extension has no orjson runtime dependency.
 - The string tail reads up to 31 bytes past a string's end within the same memory page (safe, but

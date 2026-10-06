@@ -8,6 +8,8 @@ from std.collections import Array
 from std.memory import alloc, unsafe_stack_allocation
 from std.sys.intrinsics import likely, unlikely, prefetch, PrefetchOptions, llvm_intrinsic
 from std.sys import get_defined_int
+from std.sys.info import CompilationTarget
+from std.simd import pack_bits
 from std.bit import count_leading_zeros, count_trailing_zeros
 from std.memory import bitcast
 
@@ -262,10 +264,21 @@ def str_src(o: Int, mut sz: Int) -> Int:
     sz = t
     return src
 
+# One bit per byte needing an escape. With AVX-512BW the compares write a
+# k-mask directly (vpcmpub + kmov); on AVX2 they go through pmovmskb.
+comptime AVX512 = CompilationTarget.has_avx512f()
+
 @always_inline
 def esc_mask32(v: SIMD[DType.uint8, 32]) -> Int:
-    var m = needs_esc(v).select(SIMD[DType.uint8, 32](0xFF), SIMD[DType.uint8, 32](0))
-    return Int(UInt32(llvm_intrinsic["llvm.x86.avx2.pmovmskb", Int32](bitcast[DType.int8, 32](m))))
+    comptime if AVX512:
+        return Int(UInt32(pack_bits(needs_esc(v))))
+    else:
+        var m = needs_esc(v).select(SIMD[DType.uint8, 32](0xFF), SIMD[DType.uint8, 32](0))
+        return Int(UInt32(llvm_intrinsic["llvm.x86.avx2.pmovmskb", Int32](bitcast[DType.int8, 32](m))))
+
+@always_inline
+def esc_mask64(v: SIMD[DType.uint8, 64]) -> UInt64:
+    return UInt64(pack_bits(v.lt(32) | v.eq(34) | v.eq(92)))
 
 # Writes '"' + escaped bytes + '"' at dst+n0; caller reserved sz*6 + 66 bytes.
 # On a hit, jump straight to the escape with ctz (no per-byte rescans of the chunk).
@@ -276,13 +289,20 @@ def escape_at(dst: P8, n0: Int, src: Int, sz: Int) -> Int:
     (dst + n)[] = 34
     n += 1
     var i = 0
-    # 64 bytes per iteration: two loads/stores, one 64-bit escape mask, ctz jump on a hit
+    # 64 bytes per iteration: one 64-bit escape mask, ctz jump on a hit. With
+    # AVX-512 that is one zmm load/store and one k-mask; on AVX2 two of each.
     while i + 64 <= sz:
-        var v0 = (s + i).load[width=32]()
-        var v1 = (s + i + 32).load[width=32]()
-        (dst + n).store(v0)
-        (dst + n + 32).store(v1)
-        var m64 = UInt64(esc_mask32(v0)) | (UInt64(esc_mask32(v1)) << 32)
+        var m64: UInt64
+        comptime if AVX512:
+            var v = (s + i).load[width=64]()
+            (dst + n).store(v)
+            m64 = esc_mask64(v)
+        else:
+            var v0 = (s + i).load[width=32]()
+            var v1 = (s + i + 32).load[width=32]()
+            (dst + n).store(v0)
+            (dst + n + 32).store(v1)
+            m64 = UInt64(esc_mask32(v0)) | (UInt64(esc_mask32(v1)) << 32)
         if likely(m64 == 0):
             n += 64
             i += 64
