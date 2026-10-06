@@ -1,0 +1,165 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  FORCE_COLOR: "1"
+  # The Mojo compiler runs on its own interpreter, independent of the one the wheel targets.
+  MOJO_PYTHON: "3.13"
+
+jobs:
+  sdist:
+    name: Source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - name: Build the sdist
+        run: uv build --sdist
+      - name: Check the metadata
+        run: uvx twine check --strict dist/*
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  corpus:
+    name: Comparison corpus
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/cache@v6
+        id: cache
+        with:
+          path: build/jsonexamples
+          key: jsonexamples-${{ hashFiles('tools/fetch_corpus.py') }}
+      - name: Download the simdjson-data files
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: python3 tools/fetch_corpus.py
+      - uses: actions/upload-artifact@v7
+        with:
+          name: jsonexamples
+          path: build/jsonexamples
+          if-no-files-found: error
+
+  wheels:
+    name: Wheel (CPython ${{ matrix.python }})
+    needs: sdist
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13", "3.14", "3.15"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: sdist
+          path: dist
+      - name: Install the Mojo compiler
+        run: |
+          UV_PROJECT_ENVIRONMENT=.venv-mojo uv sync --locked --only-group mojo --python "$MOJO_PYTHON"
+          echo "$PWD/.venv-mojo/bin" >> "$GITHUB_PATH"
+          echo "MOJO_LIB_DIR=$(.venv-mojo/bin/python -c 'import modular; print(modular.__path__[0] + "/lib")')" >> "$GITHUB_ENV"
+          .venv-mojo/bin/mojo --version
+      - name: Build the wheel from the sdist
+        run: uv build --wheel --python "${{ matrix.python }}" --out-dir dist dist/mojson-*.tar.gz
+      - name: Bundle the Mojo runtime and set the manylinux tag
+        # --disable-isa-ext-check: the extension requires AVX2 (x86-64-v3) by design.
+        run: |
+          UV_PROJECT_ENVIRONMENT=.venv-tools uv sync --locked --only-group wheel
+          export PATH="$PWD/.venv-tools/bin:$PATH"
+          auditwheel repair --ldpaths "$MOJO_LIB_DIR" --disable-isa-ext-check --wheel-dir wheelhouse dist/*.whl
+          auditwheel show wheelhouse/*.whl
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheel-cp${{ matrix.python }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
+  test:
+    name: Test (CPython ${{ matrix.python }})
+    needs: [wheels, corpus]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13", "3.14", "3.15"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: wheel-cp${{ matrix.python }}
+          path: wheelhouse
+      - uses: actions/download-artifact@v8
+        with:
+          name: jsonexamples
+          path: build/jsonexamples
+      - name: Install the repaired wheel and the test dependencies
+        run: |
+          uv sync --locked --only-group test
+          uv pip install wheelhouse/*.whl
+      - name: Check that the installed wheel is what gets imported
+        run: |
+          .venv/bin/python - <<'PY'
+          import sys, sysconfig, mojson
+          assert mojson.__file__.startswith(sysconfig.get_paths()["purelib"]), mojson.__file__
+          assert mojson.dumps({"ok": [1, 2.5, None]}) == b'{"ok":[1,2.5,null]}'
+          print(sys.version, mojson.__file__)
+          PY
+      - name: Feature tests
+        run: .venv/bin/python tests/check_features.py
+      - name: Correctness tests (byte-identical to orjson)
+        run: .venv/bin/python tests/check_correctness.py build/jsonexamples
+      - name: Example
+        run: .venv/bin/python examples/usage.py
+
+  publish:
+    name: Publish to PyPI
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [sdist, test]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/mojson/
+    permissions:
+      id-token: write  # PyPI trusted publishing (OIDC); no API token needed
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      - name: Check that the tag matches the package version
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          test "v$version" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} does not match version $version"; exit 1; }
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: "{sdist,wheel-*}"
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        run: |
+          ls -l dist
+          uv publish dist/*
