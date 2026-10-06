@@ -1,4 +1,4 @@
-"""Feature compatibility, errors, and callback safety. Run with CPython 3.12."""
+"""Feature compatibility, errors, and callback safety. Run with CPython 3.11 - 3.15."""
 import dataclasses
 import datetime as dt
 import enum
@@ -189,6 +189,29 @@ class Features(unittest.TestCase):
         with self.assertRaises(TypeError):
             mojson.dumps(Point(1, 2))
         self.same(Point(1, 2), default=lambda p: {"x": p.x, "y": p.y})
+
+    def test_tuple_layouts(self):
+        # Tuple items moved in CPython 3.14 (cached hash); cover every traversal that reads them.
+        numeric = tuple(range(12)) + (0.5, -2.25, 1e300)
+        value = {"empty": (), "one": ("x",), "mixed": (1, "two", None, True, 2.5, [3], {"k": (4,)}),
+                 "numeric": numeric, "strings": tuple("abcdefghij"), "nested": ((), ((1,),), [(2, 3)])}
+        for option in (0, 1, 32, 33, 4, 5, 36, 37, 1024, 64):
+            with self.subTest(option=option):
+                self.same(value, option)
+        keyed = {1: (1, 2), "s": (3,), 2.5: ((4,), 5)}
+        for option in (4, 5, 36, 37):
+            with self.subTest(option=option):
+                self.same(keyed, option)
+        self.assertEqual(mojson.dumps_socket(value), mojson.dumps(value))
+        self.assertEqual(mojson.dumps_socket(keyed), mojson.dumps(keyed, option=4))
+        self.assertEqual(mojson.dumps_socket((1 << 70, "x")), b'[1180591620717411303424,"x"]')
+
+    def test_uuid_range(self):
+        # Full 128-bit range, including the sign bit position (PyLong_AsNativeBytes on 3.13+).
+        values = [uuid.UUID(int=0), uuid.UUID(int=1), uuid.UUID(int=1 << 127), uuid.UUID(int=(1 << 128) - 1)]
+        self.same(values)
+        self.same({value: index for index, value in enumerate(values)}, mojson.OPT_NON_STR_KEYS)
+        self.assertEqual(mojson.dumps(values[-1]), b'"ffffffff-ffff-ffff-ffff-ffffffffffff"')
 
     def test_default_and_passthrough(self):
         marker = object()
@@ -416,6 +439,7 @@ class Features(unittest.TestCase):
                 call()
         self.assertEqual(mojson.dumps_socket({"ok": True}), b'{"ok":true}')
 
+    @unittest.skipIf(sys.version_info < (3, 12), "CPython imports _pylong for enormous int(str) only from 3.12")
     def test_socket_enormous_integer_import_ownership(self):
         import builtins
         import gc

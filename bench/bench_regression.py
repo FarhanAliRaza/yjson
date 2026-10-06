@@ -9,7 +9,15 @@ import os
 import platform
 import statistics as st
 import sys
+import sysconfig
 import timeit
+
+
+def extension_path(directory):
+    """The build for this interpreter (build.sh names it mojson<EXT_SUFFIX>), else a plain mojson.so."""
+    directory = Path(directory)
+    tagged = directory / f"mojson{sysconfig.get_config_var('EXT_SUFFIX')}"
+    return tagged if tagged.exists() else directory / "mojson.so"
 
 
 def load(path):
@@ -21,8 +29,8 @@ def load(path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--baseline", type=Path, default=Path("build/baseline/mojson.so"))
-    parser.add_argument("--current", type=Path, default=Path("build/mojson.so"))
+    parser.add_argument("--baseline", type=Path, default=extension_path("build/baseline"))
+    parser.add_argument("--current", type=Path, default=extension_path("build"))
     parser.add_argument("--corpus", type=Path, default=Path("build/jsonexamples"))
     parser.add_argument("--output", type=Path, default=Path("build/regression.json"))
     parser.add_argument("--cpu", type=int, default=2)

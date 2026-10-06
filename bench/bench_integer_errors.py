@@ -9,7 +9,7 @@ import statistics
 import sys
 import timeit
 
-from bench_regression import load
+from bench_regression import extension_path, load
 
 
 def reject(dumps, value):
@@ -22,11 +22,11 @@ def reject(dumps, value):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--baseline", type=Path, default=Path("build/special-before/mojson.so"))
+    parser.add_argument("--baseline", type=Path, default=extension_path("build/special-before"))
     parser.add_argument("--output", type=Path, default=Path("build/integer-errors.json"))
     args = parser.parse_args()
     os.sched_setaffinity(0, {2})
-    current_path = Path("build/mojson.so")
+    current_path = extension_path("build")
     sys.path.insert(0, str(current_path.resolve().parent))
     before, current = load(args.baseline), load(current_path)
     import orjson

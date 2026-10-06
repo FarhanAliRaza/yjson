@@ -1,0 +1,18 @@
+correctness OK
+
+speedup vs orjson      mojson     orjson    msgspec      ujson  rapidjson       json simplejson
+apache_builds           1.00x      1.00x      0.43x      0.13x      0.14x      0.08x      0.05x
+canada                  1.04x      1.00x      0.71x      0.22x      0.07x      0.07x      0.05x
+citm_catalog            1.12x      1.00x      0.88x      0.23x      0.21x      0.15x      0.05x
+github_events           1.24x      1.00x      0.51x      0.15x      0.14x      0.10x      0.08x
+gsoc-2018               0.76x      1.00x      0.42x      0.07x      0.08x      0.05x      0.07x
+instruments             1.28x      1.00x      0.62x      0.21x      0.14x      0.12x      0.07x
+marine_ik               1.37x      1.00x      0.70x      0.34x      0.14x      0.14x      0.09x
+mesh                    1.44x      1.00x      0.81x      0.38x      0.12x      0.14x      0.11x
+mesh.pretty             1.19x      1.00x      0.66x      0.32x      0.10x      0.12x      0.09x
+numbers                 1.18x      1.00x      0.54x      0.26x      0.07x      0.08x      0.07x
+random                  1.21x      1.00x      0.61x      0.16x      0.15x      0.10x      0.06x
+twitter                 1.18x      1.00x      0.56x      0.17x      0.13x      0.12x      0.09x
+twitterescaped          1.20x      1.00x      0.54x      0.16x      0.13x      0.11x      0.09x
+update-center           1.03x      1.00x      0.42x      0.12x      0.13x      0.08x      0.06x
+GEOMEAN                 1.15x      1.00x      0.59x      0.19x      0.12x      0.10x      0.07x
