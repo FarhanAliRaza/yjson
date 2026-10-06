@@ -29,10 +29,10 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/FarhanAliRaza/mojson"
-Repository = "https://github.com/FarhanAliRaza/mojson"
-Issues = "https://github.com/FarhanAliRaza/mojson/issues"
-Changelog = "https://github.com/FarhanAliRaza/mojson/releases"
+Homepage = "https://github.com/FarhanAliRaza/yjson"
+Repository = "https://github.com/FarhanAliRaza/yjson"
+Issues = "https://github.com/FarhanAliRaza/yjson/issues"
+Changelog = "https://github.com/FarhanAliRaza/yjson/releases"
 
 # Development tooling, installed with `uv sync --group <name>` / `--only-group <name>`.
 # None of these are runtime dependencies of the wheel.
