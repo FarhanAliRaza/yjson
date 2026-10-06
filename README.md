@@ -167,11 +167,13 @@ python bench/bench_numpy.py
 ```
 
 `tests/suite/` is orjson 3.12.0's own test suite run against yjson (see
-`THIRD_PARTY_NOTICES.md`). It reports every difference as a failure, and runs
-each test in a forked child so a crash fails one test. Seven tests fail by
-design: five write NaN/Infinity (yjson writes them as Python's `json` does,
-orjson writes `null`), and two check the stdlib parser's error message and
-position for an empty document and an unterminated string:
+`THIRD_PARTY_NOTICES.md`). It runs each test in a forked child so a crash fails
+one test. Seven tests differ by design and are declared strict expected
+failures in `tests/suite/conftest.py`: five write NaN/Infinity (yjson writes
+them as Python's `json` does, orjson writes `null`), and two check the stdlib
+parser's error message and position for an empty document and an unterminated
+string. Any other difference, or one of those seven starting to pass, fails
+the run:
 
 ```bash
 pip install -r tests/suite/requirements.txt
@@ -226,7 +228,10 @@ x86-64-v3 (AVX2) by design.
 every push and pull request: it builds the sdist, builds one wheel per
 interpreter from that sdist, repairs it, installs it into a clean environment
 and runs `tests/check_features.py`, `tests/check_correctness.py` (with the
-simdjson corpus) and `examples/usage.py` against the installed wheel. Pushing a
+simdjson corpus), `examples/usage.py` and orjson's test suite (`tests/suite`)
+against the installed wheel. A separate informational job runs the benchmarks
+against orjson on CPython 3.13 and writes the tables to the run summary (shared
+runners are noisy, so it never fails the build). Pushing a
 tag `vX.Y.Z` whose version matches `pyproject.toml` additionally publishes the
 sdist and wheels to PyPI through [trusted publishing](https://docs.pypi.org/trusted-publishers/)
 from the `pypi` GitHub environment, so no API token is stored. To release:

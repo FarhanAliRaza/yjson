@@ -120,9 +120,10 @@ jobs:
           name: jsonexamples
           path: build/jsonexamples
       - name: Install the repaired wheel and the test dependencies
+        # tests/suite/requirements.txt: orjson's own suite (pytest, pytest-forked, pytz, faker, ...)
         run: |
           uv sync --locked --only-group test
-          uv pip install wheelhouse/*.whl
+          uv pip install wheelhouse/*.whl -r tests/suite/requirements.txt
       - name: Check that the installed wheel is what gets imported
         # env -i: the import must not depend on a python3 on PATH or on any environment variable.
         run: |
@@ -138,6 +139,55 @@ jobs:
         run: .venv/bin/python tests/check_correctness.py build/jsonexamples
       - name: Example
         run: .venv/bin/python examples/usage.py
+      - name: orjson's test suite
+        # The intended differences are strict expected failures (tests/suite/conftest.py).
+        run: .venv/bin/python -m pytest tests/suite -q -p no:cacheprovider
+
+  benchmarks:
+    name: Benchmarks (CPython 3.13, informational)
+    needs: [wheels, corpus]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: "3.13"
+      - uses: actions/download-artifact@v8
+        with:
+          name: wheel-cp3.13
+          path: wheelhouse
+      - uses: actions/download-artifact@v8
+        with:
+          name: jsonexamples
+          path: build/jsonexamples
+      - name: Install the repaired wheel and the benchmark dependencies
+        run: |
+          uv sync --locked --only-group test
+          uv pip install wheelhouse/*.whl
+      - name: Benchmarks against orjson
+        # Shared runners are noisy: these numbers are for the trend, not a gate.
+        run: |
+          {
+            echo '## yjson vs orjson (shared runner: indicative only)'
+            echo '### Corpus (paired, 10 alternating pairs per file)'
+            echo '```'
+            .venv/bin/python bench/bench_paired.py build/jsonexamples --pairs 10 --micro
+            echo '```'
+            echo '### Feature paths'
+            echo '```'
+            .venv/bin/python bench/bench_features.py
+            echo '```'
+            echo '### Per-item cost of datetime, UUID, dataclass, Enum, ...'
+            echo '```'
+            .venv/bin/python bench/bench_types.py
+            echo '```'
+            echo '### NumPy arrays'
+            echo '```'
+            .venv/bin/python bench/bench_numpy.py
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
   publish:
     name: Publish to PyPI
