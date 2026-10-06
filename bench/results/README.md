@@ -57,7 +57,7 @@ each other rather than with the table above.
 
 `regression-3.12` loads the build from before the version port (commit
 `0f0944d`) and the current build in one process on CPython 3.12: corpus
-geometric mean **1.170×** (current / original). The port itself changed nothing
+geometric mean **1.178×** (current / original). The port itself changed nothing
 (measured 1.002× before the performance work below, with identical 3.12 machine
 code in the hot paths); the gain comes from the encoder improvements. The
 encoder's absolute times are flat across interpreters: the hot paths differ only
@@ -66,27 +66,27 @@ on each interpreter.
 
 | Case | 3.11 | 3.12 | 3.13 | 3.14 | 3.15 |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| apache_builds | 1.22× | 1.28× | 1.20× | 1.27× | 1.29× |
-| canada | 1.07× | 1.14× | 1.08× | 1.05× | 1.10× |
-| citm_catalog | 1.19× | 1.22× | 1.23× | 1.27× | 1.27× |
-| github_events | 1.43× | 1.33× | 1.35× | 1.33× | 1.32× |
-| gsoc-2018 | 1.12× | 1.08× | 1.08× | 1.05× | 1.00× |
-| instruments | 1.71× | 1.41× | 1.42× | 1.50× | 1.45× |
-| marine_ik | 1.16× | 1.20× | 1.21× | 1.22× | 1.22× |
-| mesh | 1.15× | 1.21× | 1.24× | 1.25× | 1.29× |
-| mesh.pretty | 1.19× | 1.26× | 1.30× | 1.31× | 1.31× |
-| numbers | 1.28× | 1.42× | 1.49× | 1.50× | 1.51× |
-| random | 1.36× | 1.36× | 1.36× | 1.39× | 1.39× |
-| twitter | 1.37× | 1.33× | 1.32× | 1.35× | 1.33× |
-| twitterescaped | 1.37× | 1.28× | 1.36× | 1.35× | 1.34× |
-| update-center | 1.31× | 1.28× | 1.30× | 1.30× | 1.26× |
-| small dict | 1.28× | 1.01× | 1.24× | 1.17× | 1.19× |
-| empty dict | 1.15× | 1.05× | 1.17× | 1.03× | 1.19× |
-| int | 1.15× | 1.13× | 1.25× | 1.08× | 1.29× |
-| float | 1.26× | 1.23× | 1.30× | 1.08× | 1.24× |
-| short string | 1.26× | 1.17× | 1.29× | 1.17× | 1.30× |
-| mixed list | 1.10× | 1.00× | 1.20× | 1.11× | 1.18× |
-| corpus geomean | 1.27× | 1.27× | 1.27× | 1.29× | 1.28× |
+| apache_builds | 1.26× | 1.38× | 1.27× | 1.25× | 1.33× |
+| canada | 1.07× | 1.12× | 1.04× | 1.05× | 1.09× |
+| citm_catalog | 1.21× | 1.26× | 1.24× | 1.28× | 1.26× |
+| github_events | 1.44× | 1.32× | 1.38× | 1.34× | 1.35× |
+| gsoc-2018 | 1.09× | 1.15× | 1.13× | 1.14× | 1.08× |
+| instruments | 1.73× | 1.44× | 1.47× | 1.53× | 1.51× |
+| marine_ik | 1.16× | 1.20× | 1.21× | 1.24× | 1.24× |
+| mesh | 1.16× | 1.23× | 1.20× | 1.25× | 1.28× |
+| mesh.pretty | 1.21× | 1.28× | 1.25× | 1.29× | 1.32× |
+| numbers | 1.30× | 1.41× | 1.51× | 1.53× | 1.54× |
+| random | 1.37× | 1.40× | 1.39× | 1.43× | 1.41× |
+| twitter | 1.38× | 1.39× | 1.37× | 1.36× | 1.41× |
+| twitterescaped | 1.36× | 1.32× | 1.38× | 1.38× | 1.42× |
+| update-center | 1.31× | 1.36× | 1.34× | 1.33× | 1.25× |
+| small dict | 1.20× | 1.18× | 1.22× | 1.11× | 1.22× |
+| empty dict | 1.04× | 1.13× | 1.18× | 1.07× | 1.15× |
+| int | 1.17× | 1.18× | 1.28× | 1.13× | 1.22× |
+| float | 1.21× | 1.21× | 1.24× | 1.23× | 1.23× |
+| short string | 1.17× | 1.28× | 1.28× | 1.17× | 1.27× |
+| mixed list | 1.12× | 1.20× | 1.18× | 1.16× | 1.21× |
+| corpus geomean | 1.28× | 1.30× | 1.29× | 1.31× | 1.31× |
 
 To reproduce, build for each interpreter (see the README), then:
 
@@ -132,6 +132,12 @@ Findings and changes, in the order they were made:
 - **`OPT_INDENT_2` on the compact writers** as a compile-time variant instead
   of the generic walker: 0.69× → 1.51×. The generic walker now serves only
   `OPT_STRICT_INTEGER` and `OPT_PASSTHROUGH_SUBCLASS`.
+- **Containers first in the type dispatch.** The list and dict loops write
+  every scalar inline, so the generic dispatch is reached almost only for
+  nested containers; testing dict and list before str/int/float/None/bool
+  saves five compares per container. Corpus neutral (+0.6%, fewer
+  instructions), lists of empty containers 0.83× → 0.95–0.97×, single-key
+  nested dicts 0.78× → 0.89×, 3-key dicts 1.21× → 1.31×.
 
 Not changed, with reasons: the float formatter (already the zmij core, about
 300 instructions per 17-digit value; orjson now uses zmij as well), and long
@@ -145,7 +151,9 @@ Choosing the literal with masks and testing both singletons in one non-short-
 circuit expression brought that shape to 1.0×, but the type pointer it needs
 is either a loop-invariant register (which spills the list loop's hot state)
 or a load per element; both variants cost 3% on the corpus in paired runs
-with the roles swapped, so the compact loops keep the branch. Exponential
+with the roles swapped, and a third attempt that hoisted the pointer in the
+list loop only cost 1.5% and gave back the empty-container gain, so the
+compact loops keep the branch. Exponential
 back-off after a failed SIMD batch (for lists mixing ints with other types)
 was rejected the same way: one more live counter cost the integer array files
 8%.
@@ -168,7 +176,7 @@ remaining differences are in dispatch and per-element overhead rather than in
 a different algorithm.
 
 Corpus, 3.14, before the performance work → current (same process, 40 pairs):
-geometric mean **1.179×**. twitter 1.37×, twitterescaped 1.35×, instruments
+geometric mean **1.184×**. twitter 1.37×, twitterescaped 1.35×, instruments
 1.39×, random 1.32×, update-center 1.29×, github_events 1.29×, citm_catalog
 1.22×, apache_builds 1.22×, canada 1.10×, marine_ik 1.08×; the numeric array
 files (mesh, numbers) are unchanged within noise.
@@ -177,34 +185,34 @@ Shapes on 3.14, orjson time / mojson time (before → after):
 
 | Shape | Before | After |
 | --- | ---: | ---: |
-| float pairs x10k (canada) | 1.06× | 1.09× |
-| float pairs as tuples x10k | 1.09× | 1.11× |
-| floats x10k flat | 1.28× | 1.25× |
-| short floats x10k | 1.28× | 1.24× |
-| small ints x10k | 0.72× | 1.35× |
-| large ints x10k | 1.98× | 1.92× |
-| mixed scalars x10k | 0.89× | 0.84× |
-| ascii str 8 x2k | 1.17× | 1.08× |
-| ascii str 32 x2k | 1.26× | 1.12× |
-| ascii str 128 x2k | 1.21× | 1.10× |
-| ascii str 1024 x2k | 0.93× | 0.95× |
-| ascii str 128 escapes x2k | 0.96× | 0.96× |
-| unicode str 32 x2k | 1.14× | 1.00× |
-| dict 3 str keys x2k | 1.04× | 1.29× |
-| dict 20 str keys x500 | 1.06× | 1.63× |
-| dict 20 str->str x500 | 1.14× | 1.65× |
-| dict 100 int values x100 | 0.87× | 1.22× |
-| nested dict depth 6 x500 | 0.85× | 0.81× |
-| list of empty dicts x10k | 0.29× | 0.88× |
-| list of empty lists x10k | 0.27× | 0.84× |
-| bools and none x10k | 0.34× | 0.57× |
-| wide dict 10k keys | 0.86× | 1.17× |
-| wide dict 10k str values | 0.90× | 1.12× |
-| dict with float pair values x2k | 1.12× | 1.16× |
-| str keys sorted x500 | 0.48× | 1.04× |
-| nonstr keys unsorted x500 | 0.34× | 1.52× |
-| nonstr keys sorted x500 | 0.34× | 1.52× |
-| indent 2 dict 20 keys x500 | 0.69× | 1.51× |
+| float pairs x10k (canada) | 0.95× | 1.14× |
+| float pairs as tuples x10k | 1.03× | 1.12× |
+| floats x10k flat | 1.24× | 1.28× |
+| short floats x10k | 1.22× | 1.24× |
+| small ints x10k | 0.73× | 1.36× |
+| large ints x10k | 2.01× | 1.91× |
+| mixed scalars x10k | 0.87× | 0.84× |
+| ascii str 8 x2k | 1.15× | 1.11× |
+| ascii str 32 x2k | 1.26× | 1.15× |
+| ascii str 128 x2k | 1.21× | 1.15× |
+| ascii str 1024 x2k | 1.00× | 0.97× |
+| ascii str 128 escapes x2k | 0.95× | 0.95× |
+| unicode str 32 x2k | 1.10× | 0.99× |
+| dict 3 str keys x2k | 1.00× | 1.28× |
+| dict 20 str keys x500 | 1.04× | 1.58× |
+| dict 20 str->str x500 | 1.14× | 1.60× |
+| dict 100 int values x100 | 0.88× | 1.22× |
+| nested dict depth 6 x500 | 0.86× | 0.86× |
+| list of empty dicts x10k | 0.30× | 0.97× |
+| list of empty lists x10k | 0.26× | 0.99× |
+| bools and none x10k | 0.33× | 0.57× |
+| wide dict 10k keys | 0.87× | 1.18× |
+| wide dict 10k str values | 0.88× | 1.10× |
+| dict with float pair values x2k | 1.05× | 1.15× |
+| str keys sorted x500 | 0.48× | 0.99× |
+| nonstr keys unsorted x500 | 0.36× | 1.53× |
+| nonstr keys sorted x500 | 0.36× | 1.51× |
+| indent 2 dict 20 keys x500 | 0.67× | 1.58× |
 
 ### Algorithms from the literature, and whether they apply
 

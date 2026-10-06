@@ -1149,6 +1149,24 @@ def close_indent[o_: Origin[mut=True]](bp: Pointer[Buf, o_], depth: Int):
 def ser_value[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o_: Origin[mut=True], c_: Origin](bp: Pointer[Buf, o_], cp: Pointer[Ctx, c_], o: Int, depth: Int) -> Bool:
     ref ctx = cp[]
     var t = ob_type(o)
+    # Containers first: the list and dict loops write str/int/float/None/bool
+    # and empty containers themselves, so this dispatch is reached mostly for
+    # nested containers and uncommon types.
+    comptime if INDENT:
+        # The indented writers reserve 2*depth bytes per separator from the
+        # loops' fixed slack; very deep nesting uses the generic walker.
+        if unlikely(depth >= 60) and (t == ctx.t_dict or t == ctx.t_list or t == ctx.t_tuple):
+            return ser_configured[True, SORT, SOCKET](bp, cp, o, depth)
+    if t == ctx.t_dict:
+        comptime if NONSTR or SORT:
+            if dict_has_general_keys(o):
+                return ser_dict_records[NONSTR, SORT, SOCKET, INDENT](bp, cp, o, depth + 1)
+        comptime if SORT:
+            return ser_dict_records[NONSTR, True, SOCKET, INDENT](bp, cp, o, depth + 1)
+        else:
+            return ser_dict_items[NONSTR, False, SOCKET, False, INDENT](bp, cp, o, depth + 1, 0)
+    if t == ctx.t_list or t == ctx.t_tuple:
+        return ser_list[NONSTR, SORT, SOCKET, INDENT](bp, cp, o, depth + 1, t == ctx.t_list)
     if t == ctx.t_str:
         return write_str[SOCKET](bp, o)
     if t == ctx.t_int:
@@ -1169,21 +1187,6 @@ def ser_value[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o_: Origin[m
             lit4(bp, 102, 97, 108, 115)
             put_byte(bp, 101)
         return True
-    comptime if INDENT:
-        # The indented writers reserve 2*depth bytes per separator from the
-        # loops' fixed slack; very deep nesting uses the generic walker.
-        if unlikely(depth >= 60) and (t == ctx.t_dict or t == ctx.t_list or t == ctx.t_tuple):
-            return ser_configured[True, SORT, SOCKET](bp, cp, o, depth)
-    if t == ctx.t_dict:
-        comptime if NONSTR or SORT:
-            if dict_has_general_keys(o):
-                return ser_dict_records[NONSTR, SORT, SOCKET, INDENT](bp, cp, o, depth + 1)
-        comptime if SORT:
-            return ser_dict_records[NONSTR, True, SOCKET, INDENT](bp, cp, o, depth + 1)
-        else:
-            return ser_dict_items[NONSTR, False, SOCKET, False, INDENT](bp, cp, o, depth + 1, 0)
-    if t == ctx.t_list or t == ctx.t_tuple:
-        return ser_list[NONSTR, SORT, SOCKET, INDENT](bp, cp, o, depth + 1, t == ctx.t_list)
     comptime if not INDENT:
         if is_numpy_type(t):
             return ser_numpy[NONSTR, SORT, SOCKET](bp, cp, o, depth)
