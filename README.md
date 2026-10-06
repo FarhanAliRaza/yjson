@@ -104,11 +104,11 @@ speed and maximum nesting follow the stdlib backend, rather than orjson's parser
 
 `dumps_socket(obj, /, default=None)` is a separate native encoder for Reflex
 wire packets. It accepts arbitrary-size integers (subject to CPython's decimal
-digit limit), preserves NaN/Infinity and `None`, escapes lone surrogates, and
-protects strings that collide with Reflex's special-value markers. It returns
+digit limit), writes NaN/Infinity as bare tokens and escapes lone surrogates,
+matching the stdlib `json.dumps` wire with compact separators. It returns
 bytes and accepts no formatting options. Framework custom types use `default`.
-The integration in `bench/reflex_codec.py` replaces the socket boundary with
-this function, eliminating stdlib retries and repeated Python container walks.
+Reflex installs it as `reflex[yjson]`: its `format.json_dumps` calls this
+function for compact output, with no stdlib retries or Python container walks.
 Ordinary `dumps()` keeps its integer range and UTF-8 error behavior.
 
 ## Test and benchmark
@@ -127,7 +127,9 @@ python bench/bench_numpy.py
 
 Benchmark corpus: `jsonexamples/` from https://github.com/simdjson/simdjson-data.
 
-The [Reflex PR 6116 comparison](bench/REFLEX.md) documents a pinned framework
+The [Reflex PR 6116 comparison](https://github.com/FarhanAliRaza/yjson/blob/v0.1.1/bench/REFLEX.md)
+(as of v0.1.1; its integration scripts used the marker wire that `dumps_socket`
+no longer writes, and were removed) documents a pinned framework
 checkout, unchanged upstream codec tests, paired encode/event benchmarks, and
 real browser checks for both dump backends. Published measurements and validation
 are in [bench/results](bench/results/README.md), including the general 14-file

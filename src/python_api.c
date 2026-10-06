@@ -118,7 +118,40 @@ static void point_mojo_at_this_interpreter(void) {
     setenv("MOJO_PYTHON_LIBRARY", path, 0);
 }
 
+/* Starting the Mojo runtime sets MOJO_PYTHON_LIBRARY, PYTHONEXECUTABLE and
+   PYTHONPATH with setenv. Child processes inherit them, and a venv's python
+   started with PYTHONEXECUTABLE pointing at the base interpreter loses its
+   site-packages. The import snapshots them first and puts them back once the
+   runtime is up, on success and failure alike. */
+static const char *const runtime_environment[] = {"MOJO_PYTHON_LIBRARY", "PYTHONEXECUTABLE", "PYTHONPATH"};
+#define RUNTIME_ENVIRONMENT_SIZE (sizeof(runtime_environment) / sizeof(runtime_environment[0]))
+static char *saved_environment[RUNTIME_ENVIRONMENT_SIZE];
+static int environment_saved = 0;
+
+static void save_environment(void) {
+    for (size_t i = 0; i < RUNTIME_ENVIRONMENT_SIZE; i++) {
+        const char *value = getenv(runtime_environment[i]);
+        saved_environment[i] = value ? strdup(value) : NULL;
+    }
+    environment_saved = 1;
+}
+
+static void restore_environment(void) {
+    if (!environment_saved) return;
+    environment_saved = 0;
+    for (size_t i = 0; i < RUNTIME_ENVIRONMENT_SIZE; i++) {
+        if (saved_environment[i]) {
+            setenv(runtime_environment[i], saved_environment[i], 1);
+            free(saved_environment[i]);
+            saved_environment[i] = NULL;
+        } else {
+            unsetenv(runtime_environment[i]);
+        }
+    }
+}
+
 int mojson_check_runtime(void) {
+    save_environment();
     point_mojo_at_this_interpreter();
     if ((Py_Version >> 16) != (PY_VERSION_HEX >> 16)) {
         PyErr_Format(PyExc_ImportError, "mojson was built for CPython %d.%d, not %lu.%lu",
@@ -186,7 +219,7 @@ done:
     return ok;
 }
 
-PyObject *mojson_null(void) { return NULL; }
+PyObject *mojson_null(void) { restore_environment(); return NULL; }
 
 typedef struct {
     uintptr_t context;
@@ -206,7 +239,6 @@ typedef struct {
 
 static PyObject *dumps(PyObject *, PyObject *const *, Py_ssize_t, PyObject *);
 static PyObject *dumps_socket(PyObject *, PyObject *const *, Py_ssize_t, PyObject *);
-static PyObject *socket_finish(PyObject *);
 static PyMethodDef dumps_method = {
     "dumps", (PyCFunction)(void (*)(void))dumps, METH_FASTCALL | METH_KEYWORDS,
     "dumps(obj, /, default=None, option=None) -> bytes"
@@ -287,7 +319,7 @@ static inline __attribute__((always_inline)) PyObject *dumps_impl(PyObject *caps
     PyObject *result = (PyObject *)mojson_encode(state->context, (uintptr_t)args[0], (uintptr_t)&request);
     Py_XDECREF(request.keepalive);
     if (!result) wrap_error(0);
-    return socket && result ? socket_finish(result) : result;
+    return result;
 }
 
 static PyObject *dumps(PyObject *capsule, PyObject *const *args, Py_ssize_t nargs, PyObject *kwnames) {
@@ -358,59 +390,6 @@ uintptr_t mojson_surrogate_string(uintptr_t object) {
     dst[n++] = '"';
     if (_PyBytes_Resize(&out, n) < 0) return 0;
     return (uintptr_t)out;
-}
-
-/* Scan emitted bytes, never walk/re-serialize Python containers. The usual
-   payload returns the same bytes object. Only marker-bearing packets copy. */
-static PyObject *socket_finish(PyObject *out) {
-    const char *src = PyBytes_AS_STRING(out);
-    Py_ssize_t size = PyBytes_GET_SIZE(out);
-    int markers = 0;
-    for (Py_ssize_t i = 0; i + 9 <= size;) {
-        const char *p = memchr(src + i, '_', (size_t)(size - i - 8));
-        if (!p) break;
-        i = p - src;
-        if (memcmp(p, "__reflex_", 9) == 0) { markers = 1; break; }
-        i++;
-    }
-    if (!markers) return out;
-    if (size > (PY_SSIZE_T_MAX - 2) / 6) { Py_DECREF(out); return PyErr_NoMemory(); }
-    PyObject *rewritten = PyBytes_FromStringAndSize(NULL, size * 6 + 2);
-    if (!rewritten) { Py_DECREF(out); return NULL; }
-    char *dst = PyBytes_AS_STRING(rewritten);
-    Py_ssize_t n = 0, i = 0;
-    while (i < size) {
-        if (src[i] == '"') {
-            Py_ssize_t start = i++, text = i;
-            while (i < size && src[i] != '"') {
-                if (src[i] == '\\' && i + 1 < size) i++;
-                i++;
-            }
-            Py_ssize_t len = i - text;
-            if (i < size) i++;
-            Py_ssize_t after = i;
-            while (after < size && (src[after] == ' ' || src[after] == '\n' || src[after] == '\t' || src[after] == '\r')) after++;
-            int key = after < size && src[after] == ':';
-            int collision = !key && ((len == 14 && (memcmp(src + text, "__reflex_nan__", 14) == 0 || memcmp(src + text, "__reflex_inf__", 14) == 0))
-                || (len == 18 && memcmp(src + text, "__reflex_neg_inf__", 18) == 0)
-                || (len >= 14 && memcmp(src + text, "__reflex_esc__", 14) == 0));
-            if (collision) {
-                dst[n++] = '"'; memcpy(dst + n, "__reflex_esc__", 14); n += 14;
-                memcpy(dst + n, src + text, (size_t)(i - text)); n += i - text;
-            } else { memcpy(dst + n, src + start, (size_t)(i - start)); n += i - start; }
-        } else {
-            const char *sentinel = NULL;
-            Py_ssize_t consumed = 0;
-            if (size - i >= 3 && memcmp(src + i, "NaN", 3) == 0) { sentinel = "\"__reflex_nan__\""; consumed = 3; }
-            else if (size - i >= 8 && memcmp(src + i, "Infinity", 8) == 0) { sentinel = "\"__reflex_inf__\""; consumed = 8; }
-            else if (size - i >= 9 && memcmp(src + i, "-Infinity", 9) == 0) { sentinel = "\"__reflex_neg_inf__\""; consumed = 9; }
-            if (sentinel) { size_t len = strlen(sentinel); memcpy(dst + n, sentinel, len); n += (Py_ssize_t)len; i += consumed; }
-            else dst[n++] = src[i++];
-        }
-    }
-    Py_DECREF(out);
-    if (_PyBytes_Resize(&rewritten, n) < 0) return NULL;
-    return rewritten;
 }
 
 long mojson_options(uintptr_t request) { return ((Request *)request)->option; }
@@ -976,6 +955,7 @@ void mojson_error(int code) {
 }
 
 int mojson_install(uintptr_t module_ptr, uintptr_t context) {
+    restore_environment();
     PyObject *module = (PyObject *)module_ptr;
     PyDateTime_IMPORT;
     if (!PyDateTimeAPI) return -1;

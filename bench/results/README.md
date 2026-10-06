@@ -271,7 +271,7 @@ type dispatch). Sources are linked from the main README's credits where used.
 ## Reflex PR 6116, rerun on the current build
 
 [Reports](python-versions/): `socket-reflex-benchmark-3.12.*`, `reflex-options-3.12.*`.
-Same procedure as [REFLEX.md](../REFLEX.md) (the PR head `f2b00b4` checked out
+Same procedure as [REFLEX.md](https://github.com/FarhanAliRaza/yjson/blob/v0.1.1/bench/REFLEX.md) (the PR head `f2b00b4` checked out
 with git instead of a source archive, `uv sync --frozen --extra orjson` on
 CPython 3.12.3, orjson 3.12.0), in the cloud container used for the tables
 above, so absolute times are slower than the desktop run below and only the
@@ -345,7 +345,7 @@ flat, as expected.
 
 ## Reflex PR 6116
 
-[Integration and reproduction details](../REFLEX.md).
+[Integration and reproduction details](https://github.com/FarhanAliRaza/yjson/blob/v0.1.1/bench/REFLEX.md).
 The orjson baseline keeps the original PR socket codec; the mojson integration
 replaces its stdlib retry with native socket serialization. Socket gains include
 that framework change. Full event processing excludes network and rendering.

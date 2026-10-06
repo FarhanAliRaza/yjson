@@ -5,6 +5,7 @@ import enum
 import itertools
 import json
 import math
+import os
 from pathlib import Path
 import sys
 import unittest
@@ -389,17 +390,13 @@ class Features(unittest.TestCase):
         with self.assertRaises(TypeError):
             mojson.dumps(2**100)
 
-    def test_socket_marker_values_and_keys(self):
-        sentinels = ("__reflex_nan__", "__reflex_inf__", "__reflex_neg_inf__")
-        prefix = "__reflex_esc__"
-        for text in (*sentinels, prefix, prefix + "\\\"\n😀", prefix * 100):
-            value = {text: [text, {"converted": object()}], "float": math.nan}
-            expected = {text: [prefix + text, {"converted": prefix + text}], "float": sentinels[0]}
-            self.assertEqual(json.loads(mojson.dumps_socket(value, default=lambda obj: text)), expected)
-        for text in ("prefix__reflex_nan__", "__reflex_nan__ ", "__reflex_custom__", "nan", "null"):
-            self.assertEqual(json.loads(mojson.dumps_socket([text])), [text])
-        self.assertEqual(json.loads(mojson.dumps_socket({"n": math.nan, "s": "__reflex_custom__"})),
-                         {"n": sentinels[0], "s": "__reflex_custom__"})
+    def test_socket_matches_stdlib_wire(self):
+        # Strings pass through untouched and non-finite floats stay bare tokens, as json.dumps writes them.
+        for text in ("__reflex_nan__", "__reflex_inf__", "__reflex_esc__x", "nan", "null", "NaN"):
+            value = {text: [text, {"converted": object()}], "f": [math.nan, math.inf, -math.inf]}
+            expected = {text: [text, {"converted": text}], "f": [math.nan, math.inf, -math.inf]}
+            self.assertEqual(mojson.dumps_socket(value, default=lambda obj: text).decode(),
+                             json.dumps(expected, separators=(",", ":")))
 
     def test_socket_surrogates_and_growth(self):
         values = ["\ud800", "\udfff", "é😀\udcff\\\"\n", "\ud800\udfff",
@@ -438,6 +435,26 @@ class Features(unittest.TestCase):
             with self.assertRaises(TypeError):
                 call()
         self.assertEqual(mojson.dumps_socket({"ok": True}), b'{"ok":true}')
+
+    def test_import_leaves_child_environment_unchanged(self):
+        # The Mojo runtime setenv()s PYTHONPATH/PYTHONEXECUTABLE at startup; a venv
+        # python started with them inherited loses its site-packages.
+        import subprocess
+        script = (
+            "import json, os, subprocess, sys\n"
+            f"sys.path.insert(0, {str(Path(mojson.__file__).parent)!r})\n"
+            "before = dict(os.environ)\n"
+            "import mojson\n"
+            "child = subprocess.run([sys.executable, '-c', 'import json, os; print(json.dumps(dict(os.environ)))'],"
+            " capture_output=True, text=True, check=True)\n"
+            "print(json.dumps([before, json.loads(child.stdout), child.stderr]))\n"
+        )
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("MOJO_PYTHON_LIBRARY", "PYTHONEXECUTABLE", "PYTHONPATH")}
+        result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, env=env, check=True)
+        before, child, stderr = json.loads(result.stdout)
+        self.assertEqual(stderr, "")
+        self.assertEqual(child, before)
 
     @unittest.skipIf(sys.version_info < (3, 12), "CPython imports _pylong for enormous int(str) only from 3.12")
     def test_socket_enormous_integer_import_ownership(self):
