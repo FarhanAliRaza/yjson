@@ -7,6 +7,10 @@
 #pragma GCC diagnostic pop
 #undef Py_BUILD_CORE
 #include <datetime.h>
+#if PY_VERSION_HEX < 0x030C0000
+#include <structmember.h>  /* PyMemberDef and T_OBJECT_EX before 3.12 */
+#define Py_T_OBJECT_EX T_OBJECT_EX
+#endif
 #include <stddef.h>
 #include <stdint.h>
 #include <math.h>
@@ -32,6 +36,17 @@ YJSON_LAYOUT(YJSON_PY_MINOR, PY_MINOR_VERSION);
 YJSON_LAYOUT(YJSON_OB_TYPE, offsetof(PyObject, ob_type));
 YJSON_LAYOUT(YJSON_OB_SIZE, offsetof(PyVarObject, ob_size));
 YJSON_LAYOUT(YJSON_TP_NAME, offsetof(PyTypeObject, tp_name));
+YJSON_LAYOUT(YJSON_TP_FLAGS, offsetof(PyTypeObject, tp_flags));
+/* datetime objects, written directly by the Mojo writer when naive or UTC */
+YJSON_LAYOUT(YJSON_DT_HASTZ, offsetof(PyDateTime_DateTime, hastzinfo));
+YJSON_LAYOUT(YJSON_DT_DATA, offsetof(PyDateTime_DateTime, data));
+YJSON_LAYOUT(YJSON_DT_TZINFO, offsetof(PyDateTime_DateTime, tzinfo));
+YJSON_LAYOUT(YJSON_DATE_DATA, offsetof(PyDateTime_Date, data));
+YJSON_LAYOUT(YJSON_TIME_HASTZ, offsetof(PyDateTime_Time, hastzinfo));
+YJSON_LAYOUT(YJSON_TIME_DATA, offsetof(PyDateTime_Time, data));
+_Static_assert(_PyDateTime_DATETIME_DATASIZE == 10 && _PyDateTime_DATE_DATASIZE == 4 && _PyDateTime_TIME_DATASIZE == 6, "datetime data layout");
+_Static_assert(Py_TPFLAGS_LONG_SUBCLASS == (1UL << 24) && Py_TPFLAGS_LIST_SUBCLASS == (1UL << 25) && Py_TPFLAGS_UNICODE_SUBCLASS == (1UL << 28)
+    && Py_TPFLAGS_DICT_SUBCLASS == (1UL << 29), "type flag bits");
 YJSON_LAYOUT(YJSON_FLOAT_VALUE, offsetof(PyFloatObject, ob_fval));
 #if PY_VERSION_HEX >= 0x030C0000
 YJSON_LAYOUT(YJSON_LONG_TAGGED, 1);
@@ -221,12 +236,29 @@ done:
 
 PyObject *yjson_null(void) { restore_environment(); return NULL; }
 
+/* The way a tzinfo type answers for its offset (see tz_offset), remembered per type. */
+#define TZ_CACHE_SIZE 4
+enum { TZ_DATETIME_METHOD = 1, TZ_PYTZ_NORMALIZE, TZ_TZINFO_METHOD, TZ_UNSUPPORTED };
+typedef struct {
+    PyTypeObject *type;  /* strong reference: a freed type's address could be reused */
+    int kind;
+} TzCacheEntry;
+
 typedef struct {
     uintptr_t context;
     PyObject *convert, *key_string, *fragment_type, *dataclass_fields_type, *uuid_type;
     PyObject *dataclass_name, *field_kind_name, *field_sentinel;
     PyObject *enum_type;
+    PyObject *value_name, *slots_name, *utcoffset_name, *normalize_name, *convert_name, *dst_name;
+    PyObject *value_private_name, *stock_value_descr;  /* "_value_" and enum.Enum.value, for the direct read */
+    Py_ssize_t uuid_int_offset;  /* UUID.int slot, 0 when it is not a plain member slot */
+    TzCacheEntry tz_cache[TZ_CACHE_SIZE];
+    int tz_cache_next;
+    TzCacheEntry dc_cache[TZ_CACHE_SIZE];  /* dataclass types: DC_DICT or DC_FIELDS */
+    int dc_cache_next;
 } ModuleState;
+enum { DC_DICT = 1, DC_FIELDS = 2 };
+static ModuleState *module_state;  /* the one module instance (the Mojo context is also per process) */
 
 /* Per-call cache of dumps_socket(classify=...) answers, one per type seen. */
 #define PLAN_CACHE_SIZE 16
@@ -285,6 +317,11 @@ static void destroy_state(PyObject *capsule) {
     Py_XDECREF(state->field_kind_name);
     Py_XDECREF(state->field_sentinel);
     Py_XDECREF(state->enum_type);
+    Py_XDECREF(state->value_name); Py_XDECREF(state->slots_name); Py_XDECREF(state->utcoffset_name);
+    Py_XDECREF(state->normalize_name); Py_XDECREF(state->convert_name); Py_XDECREF(state->dst_name);
+    Py_XDECREF(state->value_private_name); Py_XDECREF(state->stock_value_descr);
+    for (int i = 0; i < TZ_CACHE_SIZE; i++) { Py_XDECREF(state->tz_cache[i].type); Py_XDECREF(state->dc_cache[i].type); }
+    if (module_state == state) module_state = NULL;
     PyMem_Free(state);
 }
 
@@ -519,38 +556,65 @@ static void two_digits(char *dst, int value) {
     dst[1] = (char)('0' + value % 10);
 }
 
-/* The UTC offset of an aware datetime, following orjson: pendulum timezones
+/* How a tzinfo answers for its offset, following orjson: pendulum timezones
    (they have convert()) answer through the datetime, pytz zones (normalize())
    are normalized first so a zone attached with tzinfo= gets its real offset
    rather than LMT, and anything with dst() (dateutil, zoneinfo, every tzinfo
-   subclass) answers utcoffset(dt). New reference, or NULL with an error set. */
-static PyObject *tz_offset(PyObject *obj, PyObject *tzinfo) {
-    if (Py_IS_TYPE(tzinfo, Py_TYPE(PyDateTimeAPI->TimeZone_UTC)) || PyObject_HasAttrString(tzinfo, "convert")) {
-        return PyObject_CallMethod(obj, "utcoffset", NULL);
-    }
-    if (PyObject_HasAttrString(tzinfo, "normalize")) {
-        PyObject *normalized = PyObject_CallMethod(tzinfo, "normalize", "O", obj);
+   subclass) answers utcoffset(dt). The answer is per type and remembered. */
+static int has_attribute(PyObject *obj, PyObject *name) {
+    PyObject *value = PyObject_GetAttr(obj, name);
+    if (value) { Py_DECREF(value); return 1; }
+    PyErr_Clear();
+    return 0;
+}
+
+static int tz_kind(ModuleState *state, PyObject *tzinfo) {
+    PyTypeObject *type = Py_TYPE(tzinfo);
+    for (int i = 0; i < TZ_CACHE_SIZE; i++)
+        if (state->tz_cache[i].type == type) return state->tz_cache[i].kind;
+    int kind = TZ_UNSUPPORTED;
+    if (type == Py_TYPE(PyDateTimeAPI->TimeZone_UTC) || has_attribute(tzinfo, state->convert_name)) kind = TZ_DATETIME_METHOD;
+    else if (has_attribute(tzinfo, state->normalize_name)) kind = TZ_PYTZ_NORMALIZE;
+    else if (has_attribute(tzinfo, state->dst_name)) kind = TZ_TZINFO_METHOD;
+    TzCacheEntry *entry = &state->tz_cache[state->tz_cache_next];
+    state->tz_cache_next = (state->tz_cache_next + 1) % TZ_CACHE_SIZE;
+    Py_XDECREF(entry->type);
+    entry->type = (PyTypeObject *)Py_NewRef(type);
+    entry->kind = kind;
+    return kind;
+}
+
+/* New reference to the offset (a timedelta or None), or NULL with an error set. */
+static PyObject *tz_offset(ModuleState *state, PyObject *obj, PyObject *tzinfo) {
+    switch (tz_kind(state, tzinfo)) {
+    case TZ_DATETIME_METHOD:
+        return PyObject_CallMethodNoArgs(obj, state->utcoffset_name);
+    case TZ_PYTZ_NORMALIZE: {
+        PyObject *normalized = PyObject_CallMethodOneArg(tzinfo, state->normalize_name, obj);
         if (!normalized) return NULL;
-        PyObject *offset = PyObject_CallMethod(normalized, "utcoffset", NULL);
+        PyObject *offset = PyObject_CallMethodNoArgs(normalized, state->utcoffset_name);
         Py_DECREF(normalized);
         return offset;
     }
-    if (PyObject_HasAttrString(tzinfo, "dst")) return PyObject_CallMethod(tzinfo, "utcoffset", "O", obj);
-    PyErr_SetString(PyExc_TypeError, "datetime's timezone library is not supported: use datetime.timezone.utc, pendulum, pytz, or dateutil");
-    return NULL;
+    case TZ_TZINFO_METHOD:
+        return PyObject_CallMethodOneArg(tzinfo, state->utcoffset_name, obj);
+    default:
+        PyErr_SetString(PyExc_TypeError, "datetime's timezone library is not supported: use datetime.timezone.utc, pendulum, pytz, or dateutil");
+        return NULL;
+    }
 }
 
-/* Exact stdlib types have no user callbacks; subclasses stay in the cold helper. */
-static PyObject *datetime_string(PyObject *obj, long option, int *handled, char separator) {
+/* ISO text of an exact datetime/date/time into `text` (at least 40 bytes),
+   without quotes. Returns the size, -1 with an error set, or 0 when obj is
+   none of the three exact types. */
+static int datetime_text(ModuleState *state, PyObject *obj, long option, char separator, char *text) {
     int is_datetime = PyDateTime_CheckExact(obj), is_time = PyTime_CheckExact(obj);
-    *handled = is_datetime || is_time || PyDate_CheckExact(obj);
-    if (!*handled) return NULL;
+    if (!is_datetime && !is_time && !PyDate_CheckExact(obj)) return 0;
     PyObject *tzinfo = is_datetime ? PyDateTime_DATE_GET_TZINFO(obj) : (is_time ? PyDateTime_TIME_GET_TZINFO(obj) : Py_None);
     if (is_time && tzinfo != Py_None) {
         PyErr_SetString(PyExc_TypeError, "datetime.time must not have tzinfo set");
-        return NULL;
+        return -1;
     }
-    char text[40];
     int size = 0;
     if (!is_time) {
         int year = PyDateTime_GET_YEAR(obj);
@@ -578,14 +642,14 @@ static PyObject *datetime_string(PyObject *obj, long option, int *handled, char 
         long seconds = 0;
         int offset_microseconds = 0, has_offset = 1;
         if (tzinfo != Py_None && tzinfo != PyDateTimeAPI->TimeZone_UTC) {
-            PyObject *offset = tz_offset(obj, tzinfo);
-            if (!offset) return NULL;
+            PyObject *offset = tz_offset(state, obj, tzinfo);
+            if (!offset) return -1;
             if (offset == Py_None) {
                 has_offset = (option & 2) != 0;  /* the zone declines: written as naive */
             } else if (!PyDelta_Check(offset)) {
                 Py_DECREF(offset);
                 PyErr_SetString(PyExc_TypeError, "tzinfo.utcoffset() must return a timedelta or None");
-                return NULL;
+                return -1;
             } else {
                 seconds = (long)PyDateTime_DELTA_GET_DAYS(offset) * 86400 + PyDateTime_DELTA_GET_SECONDS(offset);
                 offset_microseconds = PyDateTime_DELTA_GET_MICROSECONDS(offset);
@@ -602,7 +666,65 @@ static PyObject *datetime_string(PyObject *obj, long option, int *handled, char 
             two_digits(text + size + 3, minutes % 60); size += 5;
         }
     }
-    return PyUnicode_FromStringAndSize(text, size);
+    return size;
+}
+
+/* Exact stdlib types have no user callbacks; subclasses stay in the cold helper. */
+static PyObject *datetime_string(ModuleState *state, PyObject *obj, long option, int *handled, char separator) {
+    char text[48];
+    int size = datetime_text(state, obj, option, separator, text);
+    *handled = size != 0;
+    return size > 0 ? PyUnicode_FromStringAndSize(text, size) : NULL;
+}
+
+/* For the Mojo writer: an aware datetime (any tzinfo) as a quoted JSON string
+   at dst (48 bytes reserved). Returns the length, or -1 with an error set. */
+int yjson_tz_datetime_text(uintptr_t request, uintptr_t object, char *dst) {
+    Request *req = (Request *)request;
+    dst[0] = '"';
+    int size = datetime_text(req->state, (PyObject *)object, req->option, 'T', dst + 1);
+    if (size <= 0) {
+        if (size == 0) PyErr_SetString(PyExc_TypeError, "Unable to serialize object");
+        return -1;
+    }
+    dst[size + 1] = '"';
+    return size + 2;
+}
+
+/* Object addresses and layout facts the Mojo writer caches at import:
+   0 datetime type, 1 date type, 2 time type, 3 the datetime.timezone.utc
+   singleton, 4 uuid.UUID, 5 the byte offset of UUID.int (0 when unknown). */
+uintptr_t yjson_special_types(int which) {
+    ModuleState *state = module_state;
+    switch (which) {
+    case 0: return (uintptr_t)PyDateTimeAPI->DateTimeType;
+    case 1: return (uintptr_t)PyDateTimeAPI->DateType;
+    case 2: return (uintptr_t)PyDateTimeAPI->TimeType;
+    case 3: return (uintptr_t)PyDateTimeAPI->TimeZone_UTC;
+    case 4: return state ? (uintptr_t)state->uuid_type : 0;
+    case 5: return state ? (uintptr_t)state->uuid_int_offset : 0;
+    default: return 0;
+    }
+}
+
+/* UUID stores its value in the `int` slot; find the slot's offset so the
+   writer reads it without an attribute lookup. */
+static Py_ssize_t slot_offset(PyTypeObject *type, const char *name) {
+#if PY_VERSION_HEX >= 0x030C0000
+    PyObject *dict = PyType_GetDict(type);
+#else
+    PyObject *dict = Py_XNewRef(type->tp_dict);
+#endif
+    if (!dict) { PyErr_Clear(); return 0; }
+    PyObject *descr = PyDict_GetItemString(dict, name);  /* borrowed */
+    Py_ssize_t offset = 0;
+    if (descr && Py_IS_TYPE(descr, &PyMemberDescr_Type)) {
+        PyMemberDef *member = ((PyMemberDescrObject *)descr)->d_member;
+        if (member && member->type == Py_T_OBJECT_EX && member->offset > 0) offset = member->offset;
+    }
+    Py_DECREF(dict);
+    PyErr_Clear();
+    return offset;
 }
 
 static PyObject *uuid_string(PyObject *obj) {
@@ -635,6 +757,74 @@ static PyObject *uuid_string(PyObject *obj) {
         text[size++] = hex[bytes[i] >> 4]; text[size++] = hex[bytes[i] & 15];
     }
     return PyUnicode_FromStringAndSize(text, 36);
+}
+
+static PyObject *dataclass_fields(ModuleState *state, PyObject *obj, PyObject *schema);
+
+/* How a dataclass type is written, remembered per type (strong reference):
+   DC_DICT when instances have a __dict__ and the class declares no
+   __slots__ (orjson's fast path: the dict's order, attributes not starting
+   with "_"), DC_FIELDS otherwise, 0 when the type is not a dataclass. */
+static int dataclass_kind(ModuleState *state, PyTypeObject *type) {
+    for (int i = 0; i < TZ_CACHE_SIZE; i++)
+        if (state->dc_cache[i].type == type) return state->dc_cache[i].kind;
+    PyObject *schema = _PyType_Lookup(type, state->dataclass_name);
+    if (!schema || !PyDict_Check(schema)) return 0;
+    int kind = DC_FIELDS;
+    if (type->tp_dictoffset != 0) {
+#if PY_VERSION_HEX >= 0x030C0000
+        PyObject *type_dict = PyType_GetDict(type);
+#else
+        PyObject *type_dict = Py_XNewRef(type->tp_dict);
+#endif
+        int has_slots = type_dict ? PyDict_Contains(type_dict, state->slots_name) : 1;
+        Py_XDECREF(type_dict);
+        if (has_slots < 0) { PyErr_Clear(); has_slots = 1; }
+        if (!has_slots) kind = DC_DICT;
+    }
+    TzCacheEntry *entry = &state->dc_cache[state->dc_cache_next];
+    state->dc_cache_next = (state->dc_cache_next + 1) % TZ_CACHE_SIZE;
+    Py_XDECREF(entry->type);
+    entry->type = (PyTypeObject *)Py_NewRef(type);
+    entry->kind = kind;
+    return kind;
+}
+
+/* The dict to write for a dataclass instance. *is_fragment: 3 = the instance
+   dict itself, whose "_" keys the Mojo writer skips; 2 = a dict holding
+   exactly the attributes to write. */
+static PyObject *dataclass_dict(ModuleState *state, PyObject *obj, int kind, int filter, int *is_fragment) {
+    *is_fragment = 2;
+    if (kind == DC_DICT) {
+        PyObject *dict = PyObject_GenericGetDict(obj, NULL);
+        if (!dict) {
+            PyErr_Clear();
+        } else if (!filter) {
+            *is_fragment = 3;
+            return dict;
+        } else {
+            PyObject *result = _PyDict_NewPresized(PyDict_GET_SIZE(dict));
+            Py_ssize_t position = 0;
+            PyObject *key, *value;
+            while (result && PyDict_Next(dict, &position, &key, &value)) {
+                if (!PyUnicode_Check(key)) {
+                    Py_CLEAR(result);
+                    PyErr_SetString(PyExc_TypeError, "Dict key must be str");
+                    break;
+                }
+                if (PyUnicode_GET_LENGTH(key) && PyUnicode_READ_CHAR(key, 0) == '_') continue;
+                if (PyDict_SetItem(result, key, value) < 0) Py_CLEAR(result);
+            }
+            Py_DECREF(dict);
+            return result;
+        }
+    }
+    PyObject *schema = _PyType_Lookup(Py_TYPE(obj), state->dataclass_name);
+    if (!schema || !PyDict_Check(schema)) {
+        PyErr_Format(PyExc_TypeError, "Type is not JSON serializable: %s", Py_TYPE(obj)->tp_name);
+        return NULL;
+    }
+    return dataclass_fields(state, obj, schema);
 }
 
 static PyObject *dataclass_fields(ModuleState *state, PyObject *obj, PyObject *schema) {
@@ -977,9 +1167,18 @@ static uintptr_t convert_object(uintptr_t request_ptr, uintptr_t object, int *is
         return (uintptr_t)data;
     }
     *is_fragment = 0;
+    if (!(request->option & 2048) && !PyType_Check(obj)) {
+        int kind = dataclass_kind(request->state, Py_TYPE(obj));
+        if (kind) {
+            /* Reading the instance runs no Python code, but writing its values may: pin the containers. */
+            if (!retain_ancestors(request, ancestors_ptr, depth)) return 0;
+            /* The generic option traversal has no "_"-skipping dict writer: give it a filtered dict. */
+            return (uintptr_t)dataclass_dict(request->state, obj, kind, (request->option & (64 | 256)) != 0, is_fragment);
+        }
+    }
     if (!(request->option & 512)) {
         int handled;
-        PyObject *result = datetime_string(obj, request->option, &handled, 'T');
+        PyObject *result = datetime_string(request->state, obj, request->option, &handled, 'T');
         if (handled) return (uintptr_t)result;
     }
     if (!(request->option & 65536) && Py_IS_TYPE(obj, (PyTypeObject *)request->state->uuid_type)) return (uintptr_t)uuid_string(obj);
@@ -993,21 +1192,30 @@ static uintptr_t convert_object(uintptr_t request_ptr, uintptr_t object, int *is
         if (!result && PyErr_ExceptionMatches(PyExc_Exception)) wrap_error(1, obj);
         return (uintptr_t)result;
     }
-    if (!(request->option & 2048) && !PyType_Check(obj)) {
-        PyObject *schema = _PyType_Lookup(Py_TYPE(obj), request->state->dataclass_name);
-        if (schema && PyDict_Check(schema)) {
-            *is_fragment = 2;
-            return (uintptr_t)dataclass_fields(request->state, obj, schema);
-        }
-    }
-    if (PyObject_TypeCheck(obj, (PyTypeObject *)request->state->enum_type)) {
-        return (uintptr_t)PyObject_GetAttrString(obj, "value");
-    }
+    /* str/int/list/dict subclasses before Enum, as orjson orders them: an
+       IntEnum or StrEnum is written as its int or str value. */
     if (!(request->option & 256)) {
         if (PyUnicode_Check(obj)) return (uintptr_t)PyUnicode_FromObject(obj);
         if (PyLong_Check(obj)) return (uintptr_t)_PyLong_Copy((PyLongObject *)obj);
         if (PyList_Check(obj)) return (uintptr_t)PyList_GetSlice(obj, 0, PyList_GET_SIZE(obj));
         if (PyDict_Check(obj)) return (uintptr_t)PyDict_Copy(obj);
+    }
+    if (PyObject_TypeCheck(obj, (PyTypeObject *)request->state->enum_type)) {
+        ModuleState *state = request->state;
+        /* The stock Enum.value property returns the member's _value_; read it
+           without the Python-level descriptor call. An overridden value
+           property is honored through the normal lookup. */
+        if (state->stock_value_descr && Py_TYPE(obj)->tp_dictoffset != 0
+            && _PyType_Lookup(Py_TYPE(obj), state->value_name) == state->stock_value_descr) {
+            PyObject *dict = PyObject_GenericGetDict(obj, NULL);
+            if (dict) {
+                PyObject *value = PyDict_GetItemWithError(dict, state->value_private_name);  /* borrowed, owned by obj */
+                Py_DECREF(dict);
+                if (value) return (uintptr_t)Py_NewRef(value);
+            }
+            PyErr_Clear();
+        }
+        return (uintptr_t)PyObject_GetAttr(obj, state->value_name);
     }
     /* The Mojo writers take numeric scalars and C-contiguous arrays of the
        supported dtypes directly. datetime64 scalars are formatted here; an
@@ -1047,7 +1255,7 @@ static uintptr_t convert_object(uintptr_t request_ptr, uintptr_t object, int *is
                 && !(PyTime_CheckExact(obj) && PyDateTime_TIME_GET_TZINFO(obj) != Py_None)) {
                 /* str() of a naive date/datetime/time is isoformat(" "), written without a method call. */
                 int handled;
-                return (uintptr_t)datetime_string(obj, 0, &handled, ' ');
+                return (uintptr_t)datetime_string(request->state, obj, 0, &handled, ' ');
             }
             if (plan != Py_None) {
                 PyObject *result = PyObject_CallOneArg(plan, obj);
@@ -1116,7 +1324,7 @@ static PyObject *key_string(Request *request, PyObject *key) {
         return text;
     }
     int handled;
-    PyObject *text = datetime_string(key, request->option, &handled, 'T');
+    PyObject *text = datetime_string(request->state, key, request->option, &handled, 'T');
     if (handled) return text;
     if (Py_IS_TYPE(key, (PyTypeObject *)request->state->uuid_type)) return uuid_string(key);
     PyObject *option = PyLong_FromLong(request->option);
@@ -1409,6 +1617,26 @@ int yjson_install(uintptr_t module_ptr, uintptr_t context) {
         state->enum_type = PyObject_GetAttrString(enum_module, "Enum");
         Py_DECREF(enum_module);
     }
+    state->value_name = PyUnicode_InternFromString("value");
+    state->slots_name = PyUnicode_InternFromString("__slots__");
+    state->utcoffset_name = PyUnicode_InternFromString("utcoffset");
+    state->normalize_name = PyUnicode_InternFromString("normalize");
+    state->convert_name = PyUnicode_InternFromString("convert");
+    state->dst_name = PyUnicode_InternFromString("dst");
+    state->value_private_name = PyUnicode_InternFromString("_value_");
+    if (state->enum_type && PyType_Check(state->enum_type)) {
+#if PY_VERSION_HEX >= 0x030C0000
+        PyObject *enum_dict = PyType_GetDict((PyTypeObject *)state->enum_type);
+#else
+        PyObject *enum_dict = Py_XNewRef(((PyTypeObject *)state->enum_type)->tp_dict);
+#endif
+        if (enum_dict) {
+            state->stock_value_descr = Py_XNewRef(PyDict_GetItemString(enum_dict, "value"));
+            Py_DECREF(enum_dict);
+        }
+        PyErr_Clear();
+    }
+    if (state->uuid_type && PyType_Check(state->uuid_type)) state->uuid_int_offset = slot_offset((PyTypeObject *)state->uuid_type, "int");
     PyObject *capsule = PyCapsule_New(state, "yjson.state", destroy_state);
     if (!capsule) {
         Py_XDECREF(state->convert); Py_XDECREF(state->key_string); Py_XDECREF(state->fragment_type);
@@ -1416,10 +1644,16 @@ int yjson_install(uintptr_t module_ptr, uintptr_t context) {
         Py_XDECREF(state->uuid_type);
         Py_XDECREF(state->dataclass_name); Py_XDECREF(state->field_kind_name); Py_XDECREF(state->field_sentinel);
         Py_XDECREF(state->enum_type);
+        Py_XDECREF(state->value_name); Py_XDECREF(state->slots_name); Py_XDECREF(state->utcoffset_name);
+        Py_XDECREF(state->normalize_name); Py_XDECREF(state->convert_name); Py_XDECREF(state->dst_name);
+        Py_XDECREF(state->value_private_name); Py_XDECREF(state->stock_value_descr);
         PyMem_Free(state); Py_DECREF(support); return -1;
     }
     if (!state->convert || !state->key_string || !state->fragment_type || !state->dataclass_fields_type || !state->uuid_type
-        || !state->dataclass_name || !state->field_kind_name || !state->field_sentinel || !state->enum_type) goto fail;
+        || !state->dataclass_name || !state->field_kind_name || !state->field_sentinel || !state->enum_type
+        || !state->value_name || !state->slots_name || !state->utcoffset_name || !state->normalize_name || !state->convert_name
+        || !state->dst_name || !state->value_private_name) goto fail;
+    module_state = state;
     PyObject *module_name = PyUnicode_FromString("yjson"), *version = PyUnicode_FromString(YJSON_VERSION);
     if (!module_name || !version) { Py_XDECREF(module_name); Py_XDECREF(version); goto fail; }
     int status = PyObject_SetAttrString(module, "__version__", version);

@@ -6,6 +6,7 @@
 #define Py_BUILD_CORE 1
 #include <Python.h>
 #include "internal/pycore_dict.h"
+#include <datetime.h>
 #include <stddef.h>
 #include <stdio.h>
 
@@ -14,6 +15,7 @@ int main(void) {
     printf("YJSON_OB_TYPE=%zu\n", offsetof(PyObject, ob_type));
     printf("YJSON_OB_SIZE=%zu\n", offsetof(PyVarObject, ob_size));
     printf("YJSON_TP_NAME=%zu\n", offsetof(PyTypeObject, tp_name));
+    printf("YJSON_TP_FLAGS=%zu\n", offsetof(PyTypeObject, tp_flags));
     printf("YJSON_FLOAT_VALUE=%zu\n", offsetof(PyFloatObject, ob_fval));
 #if PY_VERSION_HEX >= 0x030C0000
     /* 3.12+: lv_tag = ndigits << 3 | sign */
@@ -41,5 +43,12 @@ int main(void) {
     printf("YJSON_STR_ASCII_DATA=%zu\n", sizeof(PyASCIIObject));
     printf("YJSON_STR_UTF8_LENGTH=%zu\n", offsetof(PyCompactUnicodeObject, utf8_length));
     printf("YJSON_STR_UTF8=%zu\n", offsetof(PyCompactUnicodeObject, utf8));
+    /* datetime objects: a tzinfo flag, packed big-endian fields, the tzinfo pointer */
+    printf("YJSON_DT_HASTZ=%zu\n", offsetof(PyDateTime_DateTime, hastzinfo));
+    printf("YJSON_DT_DATA=%zu\n", offsetof(PyDateTime_DateTime, data));
+    printf("YJSON_DT_TZINFO=%zu\n", offsetof(PyDateTime_DateTime, tzinfo));
+    printf("YJSON_DATE_DATA=%zu\n", offsetof(PyDateTime_Date, data));
+    printf("YJSON_TIME_HASTZ=%zu\n", offsetof(PyDateTime_Time, hastzinfo));
+    printf("YJSON_TIME_DATA=%zu\n", offsetof(PyDateTime_Time, data));
     return 0;
 }

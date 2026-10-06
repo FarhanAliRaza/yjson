@@ -10,7 +10,7 @@ from std.sys.intrinsics import likely, unlikely, prefetch, PrefetchOptions, llvm
 from std.sys import get_defined_int
 from std.sys.info import CompilationTarget
 from std.simd import pack_bits
-from std.bit import count_leading_zeros, count_trailing_zeros
+from std.bit import count_leading_zeros, count_trailing_zeros, byte_swap
 from std.memory import bitcast
 
 comptime P8 = Pointer[UInt8, MutUntrackedOrigin]
@@ -65,6 +65,20 @@ comptime DK_LOG2_INDEX_BYTES = get_defined_int["YJSON_DK_LOG2_INDEX_BYTES", 9]()
 comptime DK_KIND = get_defined_int["YJSON_DK_KIND", 10]()
 comptime DK_NENTRIES = get_defined_int["YJSON_DK_NENTRIES", 24]()
 comptime DK_INDICES = get_defined_int["YJSON_DK_INDICES", 32]()
+comptime TP_FLAGS = get_defined_int["YJSON_TP_FLAGS", 168]()
+# tp_flags bits (stable public API)
+comptime FLAG_LONG_SUBCLASS = 1 << 24
+comptime FLAG_LIST_SUBCLASS = 1 << 25
+comptime FLAG_UNICODE_SUBCLASS = 1 << 28
+comptime FLAG_DICT_SUBCLASS = 1 << 29
+# datetime objects (datetime.h): a has-tzinfo byte, big-endian packed fields,
+# and the tzinfo pointer, which exists only when the byte is set.
+comptime DT_HASTZ = get_defined_int["YJSON_DT_HASTZ", 24]()
+comptime DT_DATA = get_defined_int["YJSON_DT_DATA", 25]()
+comptime DT_TZINFO = get_defined_int["YJSON_DT_TZINFO", 40]()
+comptime DATE_DATA = get_defined_int["YJSON_DATE_DATA", 25]()
+comptime TIME_HASTZ = get_defined_int["YJSON_TIME_HASTZ", 24]()
+comptime TIME_DATA = get_defined_int["YJSON_TIME_DATA", 25]()
 
 @always_inline
 def rdb(addr: Int, off: Int) -> Int:
@@ -168,6 +182,14 @@ struct Ctx(ImplicitlyCopyable):
     var request: Int
     var ancestors: Int
     var option: Int
+    # exact datetime/date/time types, the datetime.timezone.utc singleton,
+    # uuid.UUID and the offset of its `int` slot (0: read it through C)
+    var t_datetime: Int
+    var t_date: Int
+    var t_time: Int
+    var utc_addr: Int
+    var t_uuid: Int
+    var uuid_int_off: Int
 
     def __init__(out self, ready: Bool):
         self.t_str = 0
@@ -183,6 +205,21 @@ struct Ctx(ImplicitlyCopyable):
         self.request = 0
         self.ancestors = 0
         self.option = 0
+        self.t_datetime = 0
+        self.t_date = 0
+        self.t_time = 0
+        self.utc_addr = 0
+        self.t_uuid = 0
+        self.uuid_int_off = 0
+
+    # After yjson_install: the C shim has imported the datetime C API and the uuid module.
+    def load_special(mut self):
+        self.t_datetime = external_call["yjson_special_types", Int](Int32(0))
+        self.t_date = external_call["yjson_special_types", Int](Int32(1))
+        self.t_time = external_call["yjson_special_types", Int](Int32(2))
+        self.utc_addr = external_call["yjson_special_types", Int](Int32(3))
+        self.t_uuid = external_call["yjson_special_types", Int](Int32(4))
+        self.uuid_int_off = external_call["yjson_special_types", Int](Int32(5))
 
     def load(mut self) raises:
         var bi = Python.import_module("builtins")
@@ -1192,6 +1229,159 @@ def write_float[o_: Origin[mut=True]](bp: Pointer[Buf, o_], o: Int):
     b.ensure(96)
     b.len += float_at(b.p + b.len, o)
 
+
+# ---------------- stdlib types written from their object layout ----------------
+@always_inline
+def hex16(v: UInt64) -> SIMD[DType.uint8, 16]:
+    # 16 lowercase hex digits of v, most significant first
+    var b = bitcast[DType.uint8, 8](SIMD[DType.uint64, 1](byte_swap(v)))
+    var nib = (b >> 4).interleave(b & 15)
+    return nib + 48 + nib.gt(9).select(SIMD[DType.uint8, 16](39), SIMD[DType.uint8, 16](0))
+
+# 2-digit fields of a packed datetime: "HH:MM:SS[.ffffff]" at p+n from d (hour, minute, second, us hi, mid, lo).
+@always_inline
+def time_fields_at(p: P8, n0: Int, d: P8, option: Int) -> Int:
+    var n = n0
+    put2(p, n, Int(d[0]))
+    (p + n + 2)[] = 58
+    put2(p, n + 3, Int(d[1]))
+    (p + n + 5)[] = 58
+    put2(p, n + 6, Int(d[2]))
+    n += 8
+    var us = (Int(d[3]) << 16) | (Int(d[4]) << 8) | Int(d[5])
+    if us != 0 and (option & 8) == 0:
+        (p + n)[] = 46
+        put2(p, n + 1, us // 10000)
+        put2(p, n + 3, (us // 100) % 100)
+        put2(p, n + 5, us % 100)
+        n += 7
+    return n
+
+@always_inline
+def date_fields_at(p: P8, n: Int, d: P8) -> Int:
+    var year = (Int(d[0]) << 8) | Int(d[1])
+    put2(p, n, year // 100)
+    put2(p, n + 2, year % 100)
+    (p + n + 4)[] = 45
+    put2(p, n + 5, Int(d[2]))
+    (p + n + 7)[] = 45
+    put2(p, n + 8, Int(d[3]))
+    return n + 10
+
+# Exact datetime/date/time, uuid.UUID, and (SUBCLASS) str/int/list/dict
+# subclasses, written like orjson writes them, with no Python call: the
+# fields are read from the objects. Returns 1 written, 0 not handled here
+# (the fallback takes it), -1 error. Aware datetimes with a zone other than
+# datetime.timezone.utc get their text from the C shim.
+@no_inline
+def ser_special[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, SUBCLASS: Bool, o_: Origin[mut=True], c_: Origin](bp: Pointer[Buf, o_], cp: Pointer[Ctx, c_], o: Int, depth: Int) -> Int:
+    ref ctx = cp[]
+    var t = ob_type(o)
+    var option = ctx.option
+    comptime if SUBCLASS and not SOCKET:
+        # list and dict subclasses share the base layout, so the base writers
+        # apply (orjson does the same); ser_value took int and str subclasses.
+        if (option & 256) == 0:
+            var flags = rdb(t, TP_FLAGS)
+            if (flags & FLAG_LIST_SUBCLASS) != 0:
+                return 1 if ser_list[NONSTR, SORT, SOCKET, INDENT](bp, cp, o, depth + 1, True) else -1
+            if (flags & FLAG_DICT_SUBCLASS) != 0:
+                var ok: Bool
+                comptime if NONSTR or SORT:
+                    if dict_has_general_keys(o):
+                        ok = ser_dict_records[NONSTR, SORT, SOCKET, INDENT](bp, cp, o, depth + 1)
+                        return 1 if ok else -1
+                comptime if SORT:
+                    ok = ser_dict_records[NONSTR, True, SOCKET, INDENT](bp, cp, o, depth + 1)
+                else:
+                    ok = ser_dict_items[NONSTR, False, SOCKET, False, INDENT](bp, cp, o, depth + 1, 0)
+                return 1 if ok else -1
+    if t == ctx.t_datetime:
+        if (option & 512) != 0:
+            return 0
+        var tz = 0
+        if P8(unsafe_from_address=o + DT_HASTZ)[] != 0:
+            tz = rdb(o, DT_TZINFO)
+        if tz != 0 and tz != ctx.utc_addr and tz != ctx.none_addr:
+            bp[].ensure(48)
+            var size = external_call["yjson_tz_datetime_text", Int32](ctx.request, o, Int(bp[].p + bp[].len))
+            if size < 0:
+                return -1
+            bp[].len += Int(size)
+            return 1
+        bp[].ensure(48)
+        var p = bp[].p + bp[].len
+        var d = P8(unsafe_from_address=o + DT_DATA)
+        p[] = 34
+        var n = date_fields_at(p, 1, d)
+        (p + n)[] = 84
+        n = time_fields_at(p, n + 1, d + 4, option)
+        if tz == ctx.utc_addr or (option & 2) != 0:
+            if (option & 128) != 0:
+                (p + n)[] = 90
+                n += 1
+            else:
+                store8(p, n, 0x30303A30302B)   # "+00:00"
+                n += 6
+        (p + n)[] = 34
+        bp[].len += n + 1
+        return 1
+    if t == ctx.t_date:
+        if (option & 512) != 0:
+            return 0
+        bp[].ensure(16)
+        var p = bp[].p + bp[].len
+        p[] = 34
+        var n = date_fields_at(p, 1, P8(unsafe_from_address=o + DATE_DATA))
+        (p + n)[] = 34
+        bp[].len += n + 1
+        return 1
+    if t == ctx.t_time:
+        if (option & 512) != 0 or P8(unsafe_from_address=o + TIME_HASTZ)[] != 0:
+            return 0   # aware times are an error, raised by the fallback
+        bp[].ensure(24)
+        var p = bp[].p + bp[].len
+        p[] = 34
+        var n = time_fields_at(p, 1, P8(unsafe_from_address=o + TIME_DATA), option)
+        (p + n)[] = 34
+        bp[].len += n + 1
+        return 1
+    comptime if not SOCKET:
+        if t == ctx.t_uuid and ctx.uuid_int_off != 0:
+            var v = rdb(o, ctx.uuid_int_off)
+            if v == 0 or ob_type(v) != ctx.t_int:
+                return 0
+            var tag = long_tag(v)
+            var nd = tag >> 3
+            if (tag & 3) == 2 or nd > 5:
+                return 0
+            var dg = long_digits(v)
+            var w = SIMD[DType.uint64, 8](0)
+            for i in range(nd):
+                w[i] = UInt64(dg[i])
+            if w[4] >= 256:
+                return 0
+            var lo = w[0] | (w[1] << 30) | (w[2] << 60)
+            var hi = (w[2] >> 4) | (w[3] << 26) | (w[4] << 56)
+            bp[].ensure(64)
+            var p = bp[].p + bp[].len
+            var H = hex16(hi)
+            var L = hex16(lo)
+            (p + 1).store(H)
+            store8(p, 10, bitcast[DType.uint64, 2](H)[1])
+            (p + 15).unsafe_bitcast[UInt32]()[] = bitcast[DType.uint32, 4](H)[3]
+            (p + 21).store(L)
+            (p + 20).unsafe_bitcast[UInt32]()[] = bitcast[DType.uint32, 4](L)[0]
+            p[] = 34
+            (p + 9)[] = 45
+            (p + 14)[] = 45
+            (p + 19)[] = 45
+            (p + 24)[] = 45
+            (p + 37)[] = 34
+            bp[].len += 38
+            return 1
+    return 0
+
 # ---------------- dispatch: scalars inline, recursion only for containers ----------------
 @always_inline
 def lit4[o_: Origin[mut=True]](bp: Pointer[Buf, o_], a: UInt8, b2: UInt8, c: UInt8, d: UInt8):
@@ -1312,6 +1502,18 @@ def ser_value[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o_: Origin[m
             lit4(bp, 102, 97, 108, 115)
             put_byte(bp, 101)
         return True
+    comptime if not SOCKET:
+        # int and str subclasses (IntEnum, StrEnum, ...) share the base layout:
+        # written here, as orjson writes them. dumps_socket keeps its own rules.
+        if (ctx.option & 256) == 0:
+            var flags = rdb(t, TP_FLAGS)
+            if (flags & FLAG_LONG_SUBCLASS) != 0:
+                return write_int[False](bp, o)
+            if (flags & FLAG_UNICODE_SUBCLASS) != 0:
+                return write_str[False](bp, o)
+    var special = ser_special[NONSTR, SORT, SOCKET, INDENT, True](bp, cp, o, depth)
+    if special != 0:
+        return special > 0
     if is_numpy_type(t):
         return ser_numpy[NONSTR, SORT, SOCKET, INDENT, False](bp, cp, o, depth)
     return ser_fallback[INDENT, SORT, False, NONSTR, SOCKET](bp, cp, o, depth)
@@ -2153,7 +2355,7 @@ def ser_dict_records[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o_: O
     return ok
 
 @no_inline
-def ser_dict_items[NONSTR: Bool, SORT: Bool, SOCKET: Bool, RECORDS: Bool, INDENT: Bool, o_: Origin[mut=True], c_: Origin](bp: Pointer[Buf, o_], cp: Pointer[Ctx, c_], o: Int, depth: Int, sorted_items: Int) -> Bool:
+def ser_dict_items[NONSTR: Bool, SORT: Bool, SOCKET: Bool, RECORDS: Bool, INDENT: Bool, o_: Origin[mut=True], c_: Origin, SKIP_PRIVATE: Bool = False](bp: Pointer[Buf, o_], cp: Pointer[Ctx, c_], o: Int, depth: Int, sorted_items: Int) -> Bool:
     if depth > 255:
         bp[].err = 3
         return False
@@ -2202,6 +2404,12 @@ def ser_dict_items[NONSTR: Bool, SORT: Bool, SOCKET: Bool, RECORDS: Bool, INDENT
                     bp[].len = len
                     bp[].err = 8 if NONSTR else 4
                     return False
+        comptime if SKIP_PRIVATE:
+            # dataclass instance dict: attributes starting with "_" are not written
+            var ksz0 = 0
+            var ksrc0 = str_src(k, ksz0)
+            if ksz0 > 0 and P8(unsafe_from_address=ksrc0)[] == 95:
+                continue
         comptime if RECORDS:
             # Key text comes from the record: utf8 bytes, or (negative length)
             # a complete JSON string written verbatim. Non-str keys may own
@@ -2435,6 +2643,9 @@ def ser_fallback[INDENT: Bool, SORT: Bool, CONFIG: Bool, NONSTR: Bool, SOCKET: B
             if fragment == 2:
                 # dataclass fields keep their declaration order (never sorted)
                 ok = ser_dict_items[NONSTR, SORT, SOCKET, False, INDENT](bp, cp, converted, depth + 1, 0)
+            elif fragment == 3:
+                # a dataclass instance's own dict: its order, minus "_" attributes
+                ok = ser_dict_items[NONSTR, SORT, SOCKET, False, INDENT, SKIP_PRIVATE=True](bp, cp, converted, depth + 1, 0)
             else:
                 ok = ser_value[NONSTR, SORT, SOCKET, INDENT](bp, cp, converted, depth)
         generation[] += 1
@@ -2553,6 +2764,9 @@ def ser_configured[INDENT: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=True],
         return True
     if tp == ctx.t_dict:
         return ser_configured_dict[INDENT, SORT, SOCKET](bp, cp, o, depth, False)
+    var special = ser_special[False, SORT, SOCKET, INDENT, False](bp, cp, o, depth)
+    if special != 0:
+        return special > 0
     if is_numpy_type(tp):
         return ser_numpy[False, SORT, SOCKET, INDENT, True](bp, cp, o, depth)
     return ser_fallback[INDENT, SORT, True, False, SOCKET](bp, cp, o, depth)
@@ -2752,6 +2966,7 @@ def PyInit_yjson() abi("C") -> PythonObject:
         ctx[].kc = Int(kc)
         if external_call["yjson_install", Int32](Int(mod._obj_ptr), Int(ctx)) != 0:
             return PythonObject(from_owned=external_call["yjson_null", PyObjectPtr]())
+        ctx[].load_special()
         return mod
     except e:
         var detail = String(e)

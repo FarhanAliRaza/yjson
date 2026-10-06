@@ -116,8 +116,11 @@ compiled writers as the compact default (indentation is a compile-time variant
 of those loops; sorting and non-str keys snapshot the dict as native records),
 so they stay close to orjson's speed for the same option. `OPT_STRICT_INTEGER`
 and `OPT_PASSTHROUGH_SUBCLASS` use a generic traversal that checks every value
-and is slower. Custom conversions and uncommon types cost additional work;
-measure their speed on your payload (`bench/bench_shapes.py`). `loads` uses Python's standard parser with UTF-8, nonfinite-number,
+and is slower. datetime, date, time, UUID, Enum and int/str subclasses are
+written from their object layouts without a Python call (dataclass instances
+from their `__dict__`), at or beyond orjson's speed per item
+(`bench/bench_types.py`); `default` callbacks and other custom conversions cost
+a Python call each. Measure on your payload (`bench/bench_shapes.py`). `loads` uses Python's standard parser with UTF-8, nonfinite-number,
 and surrogate checks. It accepts str/bytes/bytearray/contiguous memoryview and
 raises `JSONDecodeError` (a subclass of `json.JSONDecodeError`). Its parsing
 speed and maximum nesting follow the stdlib backend, rather than orjson's parser.
@@ -156,6 +159,7 @@ python tests/check_correctness.py path/to/jsonexamples     # corpus optional
 python tests/check_features.py                            # options, types, callbacks, decoding
 python bench/bench_paired.py path/to/jsonexamples          # yjson vs orjson, robust
 python bench/bench_features.py                            # enabled feature paths vs orjson
+python bench/bench_types.py                               # datetime, UUID, dataclass, Enum per item vs orjson
 python bench/bench_shapes.py --cpu 2                      # per payload shape vs orjson (where it wins or loses)
 python bench/bench_regression.py                          # requires a baseline build in build/baseline/
 python bench/bench_all_libraries.py path/to/jsonexamples   # + msgspec, ujson, rapidjson, json, simplejson

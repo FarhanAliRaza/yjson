@@ -285,17 +285,24 @@ class Features(unittest.TestCase):
                 return 1
             with self.assertRaises(TypeError):
                 yjson.dumps(root, default=remove_owner, option=option)
-            @dataclasses.dataclass
-            class Getter:
-                a: int = 1
-                b: int = 2
-                def __getattribute__(self, name):
-                    if name == "a":
-                        root.clear()
-                    return object.__getattribute__(self, name)
-            root = [Getter()]
-            with self.assertRaises(TypeError):
-                yjson.dumps(root, option=option)
+            # A dataclass with a __dict__ is read from that dict (as orjson reads it), so its
+            # getters never run; a slots dataclass goes through getattr, and a getter that
+            # removes the owner of the object being encoded is an error, not a crash.
+            for slots in (False, True):
+                @dataclasses.dataclass(slots=slots)
+                class Getter:
+                    a: int = 1
+                    b: int = 2
+                    def __getattribute__(self, name):
+                        if name == "a":
+                            root.clear()
+                        return object.__getattribute__(self, name)
+                root = [Getter()]
+                if slots or option & yjson.OPT_PASSTHROUGH_DATACLASS:
+                    with self.assertRaises(TypeError):
+                        yjson.dumps(root, option=option)
+                else:
+                    self.assertEqual(yjson.dumps(root, option=option), orjson.dumps([{"a": 1, "b": 2}], option=option))
 
     def test_callback_ancestor_storage(self):
         import gc
