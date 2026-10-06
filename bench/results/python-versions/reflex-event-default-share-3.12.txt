@@ -1,0 +1,6 @@
+warm increment: 1 packets, 1137 bytes, 19 default() calls
+  orjson  real packets     34.21 us   pre-converted plain data      4.07 us   -> JSON work is 12% of the encode call
+  mojson  real packets     34.94 us   pre-converted plain data      2.83 us   -> JSON work is 8% of the encode call
+table set_status: 3 packets, 129911 bytes, 1670 default() calls
+  orjson  real packets   3826.61 us   pre-converted plain data    328.08 us   -> JSON work is 9% of the encode call
+  mojson  real packets   3821.41 us   pre-converted plain data    123.97 us   -> JSON work is 3% of the encode call

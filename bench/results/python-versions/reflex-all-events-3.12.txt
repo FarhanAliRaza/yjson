@@ -1,0 +1,36 @@
+Python 3.12.3, orjson 3.12.0, Reflex build/reflex-pr6116/reflex/__init__.py, 40 alternating pairs
+socket encode / 5 rows      mojson       4.33      2.99 us  1.46x [1.43, 1.50]
+socket encode / 5 rows      stdlib       4.35     13.83 us  0.32x [0.31, 0.32]
+socket encode / 500 rows    mojson     184.88     57.54 us  3.16x [3.11, 3.27]
+socket encode / 500 rows    stdlib     180.86    786.43 us  0.23x [0.22, 0.23]
+socket None / 500 rows      mojson     932.73     56.86 us 16.13x [15.30, 16.86]
+socket None / 500 rows      stdlib     894.12    770.01 us  1.17x [1.15, 1.20]
+socket special values       mojson      27.19      3.27 us  8.37x [7.85, 8.65]
+socket special values       stdlib      27.81     21.98 us  1.25x [1.22, 1.36]
+artifact compact            mojson      93.36     74.21 us  1.25x [1.17, 1.30]
+artifact compact            stdlib      91.15    760.88 us  0.12x [0.11, 0.13]
+artifact indent             mojson     110.02     89.84 us  1.19x [1.14, 1.28]
+artifact indent             stdlib     101.89   2377.04 us  0.04x [0.04, 0.05]
+artifact sorted             mojson     113.35    111.75 us  1.01x [0.98, 1.06]
+artifact sorted             stdlib     109.83    992.94 us  0.11x [0.11, 0.12]
+wire 3 events / 5 rows      mojson     511.48    504.37 us  1.01x [0.98, 1.04]
+wire 3 events / 5 rows      stdlib     497.99    566.08 us  0.89x [0.88, 0.91]
+wire 3 events / 500 rows    mojson    3760.97   3362.94 us  1.11x [1.05, 1.15]
+wire 3 events / 500 rows    stdlib    3705.16   5607.44 us  0.66x [0.65, 0.67]
+event cold / 1 event        mojson     645.34    655.79 us  1.00x [0.97, 1.05]
+                            encode only: orjson     34.49 mojson     34.84 us, 5.3% of the orjson workload
+event warm / 1 event        mojson     443.49    463.64 us  0.97x [0.89, 1.01]
+                            encode only: orjson     34.11 mojson     34.85 us, 7.7% of the orjson workload
+burst same token / 10 events mojson    3642.34   3639.38 us  1.00x [0.95, 1.05]
+                            encode only: orjson    440.76 mojson    439.59 us, 12.1% of the orjson workload
+burst independent / 10 events mojson    3174.60   3182.64 us  1.00x [0.96, 1.02]
+                            encode only: orjson    344.17 mojson    350.15 us, 10.8% of the orjson workload
+burst same token / 100 events mojson   84618.21  83649.04 us  0.99x [0.42, 2.35]
+                            encode only: orjson  18254.28 mojson  18381.68 us, 21.6% of the orjson workload
+burst independent / 100 events mojson   32962.20  34190.52 us  0.99x [0.93, 1.06]
+                            encode only: orjson   3665.36 mojson   3761.97 us, 11.1% of the orjson workload
+counter batch / 4 events    mojson    1279.21   1283.42 us  1.00x [0.97, 1.03]
+                            encode only: orjson    137.94 mojson    138.90 us, 10.8% of the orjson workload
+table batch / 6 events      mojson   55446.68  55320.61 us  1.01x [0.97, 1.03]
+                            encode only: orjson   7946.44 mojson   7953.70 us, 14.3% of the orjson workload
+on_event router_data / 10 events (control) mojson     164.34    165.48 us  1.00x [0.97, 1.02]

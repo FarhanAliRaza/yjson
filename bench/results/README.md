@@ -300,6 +300,49 @@ rows of the report (0.04–1.25×) are the PR's own fallback codec, kept for
 reference. Options-only run, 500-row native payload: no flags 1.37×,
 passthrough 1.38×, socket flags 2.17× (was 2.22× on the desktop).
 
+## Reflex PR 6116, every event workload
+
+[Reports](python-versions/): `reflex-all-events-3.12.*`,
+`reflex-event-default-share-3.12.txt`. `bench_reflex.py --all-events` runs
+each workload of the PR's `tests/benchmarks/test_event_processing.py` through
+the real `BaseStateEventProcessor` and `StateManagerMemory`, with every
+emitted delta encoded by the app's `_sio_dumps` (orjson vs the mojson socket
+path), 40 alternating pairs of at least 25 ms on CPython 3.12.3. The
+fixture's `nested_elements` var is quadratic in the counter, so the counter
+is reset to its initial value after each run; the deltas then stay the size
+CodSpeed's single round sees (the unbounded version exhausted memory on the
+100-event burst). "Encode" is the time to encode that run's captured packets
+alone, under orjson, and its share of the orjson workload time.
+
+| Workload | orjson µs | mojson µs | Ratio [quartiles] | Encode µs | Encode share |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| event cold / 1 event | 645 | 656 | 1.00× [0.97–1.05] | 34 | 5% |
+| event warm / 1 event | 443 | 464 | 0.97× [0.89–1.01] | 34 | 8% |
+| burst same token / 10 events | 3642 | 3639 | 1.00× [0.95–1.05] | 441 | 12% |
+| burst independent / 10 events | 3175 | 3183 | 1.00× [0.96–1.02] | 344 | 11% |
+| burst same token / 100 events | 84618 | 83649 | 0.99× [0.42–2.35] | 18254 | 22% |
+| burst independent / 100 events | 32962 | 34191 | 0.99× [0.93–1.06] | 3665 | 11% |
+| counter batch / 4 events | 1279 | 1283 | 1.00× [0.97–1.03] | 138 | 11% |
+| table batch / 6 events | 55447 | 55321 | 1.01× [0.97–1.03] | 7946 | 14% |
+| on_event router_data / 10 events (control) | 164 | 165 | 1.00× [0.97–1.02] | | |
+
+Every event workload is at parity (0.97–1.01×), and the two codecs' encode-only
+times are equal too (34 µs each for the warm delta). The reason is in
+`reflex-event-default-share-3.12.txt`: these deltas are mostly
+`NestedElement` pydantic models and table row objects, which both codecs hand
+to Reflex's Python `default()` serializer. The warm delta (1.1 KB) makes 19
+`default()` calls and costs 34 µs to encode with either codec, but the same
+packet pre-converted to plain dicts costs 4.1 µs with orjson and 2.8 µs with
+mojson. The three table deltas (130 KB, 1,670 `default()` calls) cost 3.8 ms
+with either codec, 328 µs (orjson) and 124 µs (mojson) as plain data. JSON
+writing is therefore 3–12% of the encode call and encoding is 5–22% of the
+workload, so the codec can move these rows by about 1% at most, below the
+pair-to-pair noise. The 100-event same-token burst serializes 100 events
+through one state lock, which is why its quartiles are wide. The row that
+rewards the codec is the one with plain data, `wire 3 events / 500 rows`
+(1.11×, 500 row dicts per delta). The control row has no encoding and is
+flat, as expected.
+
 ## Reflex PR 6116
 
 [Integration and reproduction details](../REFLEX.md).
