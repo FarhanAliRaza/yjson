@@ -6,12 +6,15 @@ NaN / Infinity are written the way Python's `json` writes them
 
 ## Install
 
-Wheels are published to PyPI for CPython 3.11 - 3.15 on x86-64 Linux
+The package is published on PyPI as `yjson` (the name `mojson` is too close to an
+existing project); the module you import is still `mojson`. Wheels are built for
+CPython 3.11 - 3.15 on x86-64 Linux
 (`manylinux_2_35`, i.e. glibc 2.35+ such as Ubuntu 22.04 or newer) and need a CPU
 with AVX2. They bundle the Mojo runtime library, so nothing else is required:
 
 ```bash
-pip install mojson        # or: uv add mojson
+pip install yjson         # or: uv add yjson
+python -c 'import mojson; print(mojson.dumps({"ok": True}))'
 ```
 
 Building from the sdist needs the Mojo compiler on `PATH` (see below).
@@ -152,7 +155,7 @@ and `mojo` are pinned in `uv.lock`:
 UV_PROJECT_ENVIRONMENT=.venv-mojo uv sync --only-group mojo --python 3.13   # Mojo 1.1
 export PATH="$PWD/.venv-mojo/bin:$PATH"
 uv build --sdist
-uv build --wheel --python 3.13 --out-dir dist dist/mojson-*.tar.gz           # cp313 wheel
+uv build --wheel --python 3.13 --out-dir dist dist/yjson-*.tar.gz            # cp313 wheel
 uv sync --only-group wheel                                                   # auditwheel + patchelf into .venv
 PATH="$PWD/.venv/bin:$PATH" auditwheel repair \
     --ldpaths "$(.venv-mojo/bin/python -c 'import modular; print(modular.__path__[0] + "/lib")')" \
