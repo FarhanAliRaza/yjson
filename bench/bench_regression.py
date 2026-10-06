@@ -14,14 +14,14 @@ import timeit
 
 
 def extension_path(directory):
-    """The build for this interpreter (build.sh names it mojson<EXT_SUFFIX>), else a plain mojson.so."""
+    """The build for this interpreter (build.sh names it yjson<EXT_SUFFIX>), else a plain yjson.so."""
     directory = Path(directory)
-    tagged = directory / f"mojson{sysconfig.get_config_var('EXT_SUFFIX')}"
-    return tagged if tagged.exists() else directory / "mojson.so"
+    tagged = directory / f"yjson{sysconfig.get_config_var('EXT_SUFFIX')}"
+    return tagged if tagged.exists() else directory / "yjson.so"
 
 
 def load(path):
-    spec = importlib.util.spec_from_file_location("mojson", path.resolve())
+    spec = importlib.util.spec_from_file_location("yjson", path.resolve())
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

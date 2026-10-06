@@ -1,8 +1,8 @@
-"""Where does mojson win or lose against orjson? Paired timings per payload shape.
+"""Where does yjson win or lose against orjson? Paired timings per payload shape.
 
 Synthetic payloads isolate one code path each (short float lists, dict keys,
-string lengths, ...). Prints nanoseconds per call and the orjson/mojson ratio
-(>1 = mojson faster). Use --filter to run a subset.
+string lengths, ...). Prints nanoseconds per call and the orjson/yjson ratio
+(>1 = yjson faster). Use --filter to run a subset.
 
     python bench/bench_shapes.py --cpu 2 [--pairs 20] [--filter dict]
 """
@@ -17,9 +17,9 @@ import timeit
 
 _pre = argparse.ArgumentParser(add_help=False)
 _pre.add_argument("--build", default=str(Path(__file__).resolve().parents[1] / "build"),
-                  help="Directory holding the mojson build to measure (default: build/)")
+                  help="Directory holding the yjson build to measure (default: build/)")
 sys.path.insert(0, _pre.parse_known_args()[0].build)
-import mojson
+import yjson
 import orjson
 
 
@@ -57,8 +57,8 @@ def shapes():
 
 
 def measure(obj, pairs, batch_seconds, option=0):
-    assert mojson.dumps(obj, option=option) == orjson.dumps(obj, option=option)
-    timers = [timeit.Timer(lambda: orjson.dumps(obj, option=option)), timeit.Timer(lambda: mojson.dumps(obj, option=option))]
+    assert yjson.dumps(obj, option=option) == orjson.dumps(obj, option=option)
+    timers = [timeit.Timer(lambda: orjson.dumps(obj, option=option)), timeit.Timer(lambda: yjson.dumps(obj, option=option))]
     for timer in timers:
         timer.timeit(5)
     number = 1
@@ -71,9 +71,9 @@ def measure(obj, pairs, batch_seconds, option=0):
             times[index] = timers[index].timeit(number) / number
         samples.append(times)
     orjson_ns = st.median(t[0] for t in samples) * 1e9
-    mojson_ns = st.median(t[1] for t in samples) * 1e9
+    yjson_ns = st.median(t[1] for t in samples) * 1e9
     ratios = [t[0] / t[1] for t in samples]
-    return orjson_ns, mojson_ns, st.median(ratios), st.quantiles(ratios, n=4)
+    return orjson_ns, yjson_ns, st.median(ratios), st.quantiles(ratios, n=4)
 
 
 def main():
@@ -82,35 +82,35 @@ def main():
     parser.add_argument("--batch-ms", type=float, default=10)
     parser.add_argument("--cpu", type=int)
     parser.add_argument("--filter", default="")
-    parser.add_argument("--build", help="Directory holding the mojson build to measure (default: build/)")
+    parser.add_argument("--build", help="Directory holding the yjson build to measure (default: build/)")
     parser.add_argument("--output", type=Path, help="Save the table as JSON")
     args = parser.parse_args()
     if args.cpu is not None:
         os.sched_setaffinity(0, {args.cpu})
-    print(f"CPython {sys.version.split()[0]}, orjson {orjson.__version__}, {mojson.__file__}")
-    print(f"{'shape':32} {'orjson us':>10} {'mojson us':>10} {'ratio':>7}  [p25 - p75]", flush=True)
+    print(f"CPython {sys.version.split()[0]}, orjson {orjson.__version__}, {yjson.__file__}")
+    print(f"{'shape':32} {'orjson us':>10} {'yjson us':>10} {'ratio':>7}  [p25 - p75]", flush=True)
     rows = []
     for name, obj in shapes():
         if args.filter not in name:
             continue
         option = 0
         if name.startswith("nonstr"):
-            option = mojson.OPT_NON_STR_KEYS | (mojson.OPT_SORT_KEYS if "sorted" in name else 0)
+            option = yjson.OPT_NON_STR_KEYS | (yjson.OPT_SORT_KEYS if "sorted" in name else 0)
         elif name.startswith("str keys sorted"):
-            option = mojson.OPT_SORT_KEYS
+            option = yjson.OPT_SORT_KEYS
         elif name.startswith("indent"):
-            option = mojson.OPT_INDENT_2
+            option = yjson.OPT_INDENT_2
         gc.collect()
-        orjson_ns, mojson_ns, ratio, quartiles = measure(obj, args.pairs, args.batch_ms / 1000, option)
-        print(f"{name:32} {orjson_ns / 1000:10.2f} {mojson_ns / 1000:10.2f} {ratio:6.2f}x  [{quartiles[0]:.2f} - {quartiles[2]:.2f}]", flush=True)
-        rows.append({"name": name, "option": option, "orjson_us": orjson_ns / 1000, "mojson_us": mojson_ns / 1000,
+        orjson_ns, yjson_ns, ratio, quartiles = measure(obj, args.pairs, args.batch_ms / 1000, option)
+        print(f"{name:32} {orjson_ns / 1000:10.2f} {yjson_ns / 1000:10.2f} {ratio:6.2f}x  [{quartiles[0]:.2f} - {quartiles[2]:.2f}]", flush=True)
+        rows.append({"name": name, "option": option, "orjson_us": orjson_ns / 1000, "yjson_us": yjson_ns / 1000,
                      "ratio": ratio, "p25": quartiles[0], "p75": quartiles[2]})
     if args.output:
         import json
         import platform
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps({"python": platform.python_version(), "orjson": orjson.__version__,
-                                           "mojson_path": mojson.__file__, "pairs": args.pairs, "batch_ms": args.batch_ms,
+                                           "yjson_path": yjson.__file__, "pairs": args.pairs, "batch_ms": args.batch_ms,
                                            "results": rows}, indent=2) + "\n")
 
 

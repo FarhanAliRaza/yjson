@@ -15,63 +15,63 @@
 #include <limits.h>
 
 #if PY_VERSION_HEX < 0x030B0000 || PY_VERSION_HEX >= 0x03100000
-#error "mojson supports CPython 3.11 through 3.15"
+#error "yjson supports CPython 3.11 through 3.15"
 #endif
 #ifdef Py_GIL_DISABLED
-#error "mojson reads the default (GIL) object layouts; free-threaded builds are not supported"
+#error "yjson reads the default (GIL) object layouts; free-threaded builds are not supported"
 #endif
-#ifndef MOJSON_TUPLE_ITEMS
+#ifndef YJSON_TUPLE_ITEMS
 #error "build with ./build.sh, which passes the probed object layout to both compilers"
 #endif
 
 /* The Mojo loops read these object fields directly. build.sh probes them from
    the target headers (src/layout_probe.c) and passes the same values to both
    compilers; this re-check catches a mismatch between the two. */
-#define MOJSON_LAYOUT(name, expr) _Static_assert((expr) == (name), #name " does not match the Python headers")
-MOJSON_LAYOUT(MOJSON_PY_MINOR, PY_MINOR_VERSION);
-MOJSON_LAYOUT(MOJSON_OB_TYPE, offsetof(PyObject, ob_type));
-MOJSON_LAYOUT(MOJSON_OB_SIZE, offsetof(PyVarObject, ob_size));
-MOJSON_LAYOUT(MOJSON_TP_NAME, offsetof(PyTypeObject, tp_name));
-MOJSON_LAYOUT(MOJSON_FLOAT_VALUE, offsetof(PyFloatObject, ob_fval));
+#define YJSON_LAYOUT(name, expr) _Static_assert((expr) == (name), #name " does not match the Python headers")
+YJSON_LAYOUT(YJSON_PY_MINOR, PY_MINOR_VERSION);
+YJSON_LAYOUT(YJSON_OB_TYPE, offsetof(PyObject, ob_type));
+YJSON_LAYOUT(YJSON_OB_SIZE, offsetof(PyVarObject, ob_size));
+YJSON_LAYOUT(YJSON_TP_NAME, offsetof(PyTypeObject, tp_name));
+YJSON_LAYOUT(YJSON_FLOAT_VALUE, offsetof(PyFloatObject, ob_fval));
 #if PY_VERSION_HEX >= 0x030C0000
-MOJSON_LAYOUT(MOJSON_LONG_TAGGED, 1);
-MOJSON_LAYOUT(MOJSON_LONG_TAG, offsetof(PyLongObject, long_value.lv_tag));
-MOJSON_LAYOUT(MOJSON_LONG_DIGITS, offsetof(PyLongObject, long_value.ob_digit));
+YJSON_LAYOUT(YJSON_LONG_TAGGED, 1);
+YJSON_LAYOUT(YJSON_LONG_TAG, offsetof(PyLongObject, long_value.lv_tag));
+YJSON_LAYOUT(YJSON_LONG_DIGITS, offsetof(PyLongObject, long_value.ob_digit));
 /* Compact integers: lv_tag = ndigits << 3 | sign (0 positive, 1 zero, 2 negative). */
-_Static_assert(_PyLong_NON_SIZE_BITS == 3 && _PyLong_SIGN_MASK == 3, "mojson requires the 3.12 lv_tag encoding");
+_Static_assert(_PyLong_NON_SIZE_BITS == 3 && _PyLong_SIGN_MASK == 3, "yjson requires the 3.12 lv_tag encoding");
 #else
-MOJSON_LAYOUT(MOJSON_LONG_TAGGED, 0);
-MOJSON_LAYOUT(MOJSON_LONG_TAG, offsetof(PyVarObject, ob_size));
-MOJSON_LAYOUT(MOJSON_LONG_DIGITS, offsetof(PyLongObject, ob_digit));
+YJSON_LAYOUT(YJSON_LONG_TAGGED, 0);
+YJSON_LAYOUT(YJSON_LONG_TAG, offsetof(PyVarObject, ob_size));
+YJSON_LAYOUT(YJSON_LONG_DIGITS, offsetof(PyLongObject, ob_digit));
 #endif
-MOJSON_LAYOUT(MOJSON_LIST_ITEMS, offsetof(PyListObject, ob_item));
-MOJSON_LAYOUT(MOJSON_TUPLE_ITEMS, offsetof(PyTupleObject, ob_item));
-MOJSON_LAYOUT(MOJSON_BYTES_DATA, offsetof(PyBytesObject, ob_sval));
-MOJSON_LAYOUT(MOJSON_DICT_USED, offsetof(PyDictObject, ma_used));
-MOJSON_LAYOUT(MOJSON_DICT_KEYS, offsetof(PyDictObject, ma_keys));
-MOJSON_LAYOUT(MOJSON_DICT_VALUES, offsetof(PyDictObject, ma_values));
+YJSON_LAYOUT(YJSON_LIST_ITEMS, offsetof(PyListObject, ob_item));
+YJSON_LAYOUT(YJSON_TUPLE_ITEMS, offsetof(PyTupleObject, ob_item));
+YJSON_LAYOUT(YJSON_BYTES_DATA, offsetof(PyBytesObject, ob_sval));
+YJSON_LAYOUT(YJSON_DICT_USED, offsetof(PyDictObject, ma_used));
+YJSON_LAYOUT(YJSON_DICT_KEYS, offsetof(PyDictObject, ma_keys));
+YJSON_LAYOUT(YJSON_DICT_VALUES, offsetof(PyDictObject, ma_values));
 /* Key table walked directly by the dict serializer (internal/pycore_dict.h). */
-MOJSON_LAYOUT(MOJSON_DK_LOG2_INDEX_BYTES, offsetof(PyDictKeysObject, dk_log2_index_bytes));
-MOJSON_LAYOUT(MOJSON_DK_KIND, offsetof(PyDictKeysObject, dk_kind));
-MOJSON_LAYOUT(MOJSON_DK_NENTRIES, offsetof(PyDictKeysObject, dk_nentries));
-MOJSON_LAYOUT(MOJSON_DK_INDICES, offsetof(PyDictKeysObject, dk_indices));
+YJSON_LAYOUT(YJSON_DK_LOG2_INDEX_BYTES, offsetof(PyDictKeysObject, dk_log2_index_bytes));
+YJSON_LAYOUT(YJSON_DK_KIND, offsetof(PyDictKeysObject, dk_kind));
+YJSON_LAYOUT(YJSON_DK_NENTRIES, offsetof(PyDictKeysObject, dk_nentries));
+YJSON_LAYOUT(YJSON_DK_INDICES, offsetof(PyDictKeysObject, dk_indices));
 _Static_assert(DICT_KEYS_GENERAL == 0 && sizeof(PyDictUnicodeEntry) == 16 && offsetof(PyDictUnicodeEntry, me_value) == 8
     && sizeof(PyDictKeyEntry) == 24 && offsetof(PyDictKeyEntry, me_key) == 8 && offsetof(PyDictKeyEntry, me_value) == 16, "dict entry layout");
 _Static_assert(sizeof(((PyDictKeysObject *)0)->dk_log2_index_bytes) == 1 && sizeof(((PyDictKeysObject *)0)->dk_kind) == 1, "dict key table header");
-MOJSON_LAYOUT(MOJSON_STR_LENGTH, offsetof(PyASCIIObject, length));
-MOJSON_LAYOUT(MOJSON_STR_STATE, offsetof(PyASCIIObject, state));
-MOJSON_LAYOUT(MOJSON_STR_ASCII_DATA, sizeof(PyASCIIObject));
-MOJSON_LAYOUT(MOJSON_STR_UTF8_LENGTH, offsetof(PyCompactUnicodeObject, utf8_length));
-MOJSON_LAYOUT(MOJSON_STR_UTF8, offsetof(PyCompactUnicodeObject, utf8));
-_Static_assert(PyLong_SHIFT == 30, "mojson requires 30-bit CPython integer digits");
-_Static_assert(sizeof(digit) == 4, "mojson requires 32-bit integer digits");
+YJSON_LAYOUT(YJSON_STR_LENGTH, offsetof(PyASCIIObject, length));
+YJSON_LAYOUT(YJSON_STR_STATE, offsetof(PyASCIIObject, state));
+YJSON_LAYOUT(YJSON_STR_ASCII_DATA, sizeof(PyASCIIObject));
+YJSON_LAYOUT(YJSON_STR_UTF8_LENGTH, offsetof(PyCompactUnicodeObject, utf8_length));
+YJSON_LAYOUT(YJSON_STR_UTF8, offsetof(PyCompactUnicodeObject, utf8));
+_Static_assert(PyLong_SHIFT == 30, "yjson requires 30-bit CPython integer digits");
+_Static_assert(sizeof(digit) == 4, "yjson requires 32-bit integer digits");
 /* Py_buffer fields read by the NumPy fast path. */
 _Static_assert(offsetof(Py_buffer, len) == 16 && offsetof(Py_buffer, itemsize) == 24 && offsetof(Py_buffer, ndim) == 36
     && offsetof(Py_buffer, format) == 40 && offsetof(Py_buffer, shape) == 48 && offsetof(Py_buffer, strides) == 56
     && sizeof(Py_buffer) <= 128, "Py_buffer layout");
 
 /* All Python ownership and keyword parsing lives here, outside the Mojo loops. */
-extern uintptr_t mojson_encode(uintptr_t context, uintptr_t object, uintptr_t request);
+extern uintptr_t yjson_encode(uintptr_t context, uintptr_t object, uintptr_t request);
 
 #if PY_VERSION_HEX < 0x030C0000
 static PyObject *PyErr_GetRaisedException(void) {
@@ -85,7 +85,7 @@ static PyObject *PyErr_GetRaisedException(void) {
 #endif
 
 static int runtime_failure(const char *what) {
-    PyErr_Format(PyExc_ImportError, "mojson was built for CPython %d.%d; this interpreter's %s layout differs",
+    PyErr_Format(PyExc_ImportError, "yjson was built for CPython %d.%d; this interpreter's %s layout differs",
                  PY_MAJOR_VERSION, PY_MINOR_VERSION, what);
     return 0;
 }
@@ -150,16 +150,16 @@ static void restore_environment(void) {
     }
 }
 
-int mojson_check_runtime(void) {
+int yjson_check_runtime(void) {
     save_environment();
     point_mojo_at_this_interpreter();
     if ((Py_Version >> 16) != (PY_VERSION_HEX >> 16)) {
-        PyErr_Format(PyExc_ImportError, "mojson was built for CPython %d.%d, not %lu.%lu",
+        PyErr_Format(PyExc_ImportError, "yjson was built for CPython %d.%d, not %lu.%lu",
                      PY_MAJOR_VERSION, PY_MINOR_VERSION, Py_Version >> 24, (Py_Version >> 16) & 0xFF);
         return 0;
     }
     int ok = 0;
-    PyObject *ascii = PyUnicode_FromString("mojson"), *wide = PyUnicode_FromString("mojs\xc3\xb6n");
+    PyObject *ascii = PyUnicode_FromString("yjson"), *wide = PyUnicode_FromString("yjs\xc3\xb6n");
     PyObject *negative = PyLong_FromLong(-5), *zero = PyLong_FromLong(0), *wide_int = PyLong_FromLongLong(1LL << 40);
     PyObject *real = PyFloat_FromDouble(1.5), *list = NULL, *tuple = NULL, *bytes = PyBytes_FromString("xyz");
     PyObject *text_keys = PyDict_New(), *general_keys = PyDict_New();
@@ -170,46 +170,46 @@ int mojson_check_runtime(void) {
     PyList_SET_ITEM(list, 0, Py_NewRef(real));
     PyTuple_SET_ITEM(tuple, 0, Py_NewRef(real));
     if (PyDict_SetItem(text_keys, ascii, zero) < 0 || PyDict_SetItem(general_keys, zero, zero) < 0) goto done;
-    if (WORD(ascii, MOJSON_OB_TYPE) != (uintptr_t)&PyUnicode_Type || *(const char **)((char *)&PyUnicode_Type + MOJSON_TP_NAME) != PyUnicode_Type.tp_name) {
+    if (WORD(ascii, YJSON_OB_TYPE) != (uintptr_t)&PyUnicode_Type || *(const char **)((char *)&PyUnicode_Type + YJSON_TP_NAME) != PyUnicode_Type.tp_name) {
         runtime_failure("object header"); goto done;
     }
-    uint32_t state = *(uint32_t *)((char *)ascii + MOJSON_STR_STATE);
-    if ((state & 0x60) != 0x60 || (Py_ssize_t)WORD(ascii, MOJSON_STR_LENGTH) != 6
-        || (char *)ascii + MOJSON_STR_ASCII_DATA != (char *)PyUnicode_DATA(ascii) || memcmp((char *)ascii + MOJSON_STR_ASCII_DATA, "mojson", 7) != 0) {
+    uint32_t state = *(uint32_t *)((char *)ascii + YJSON_STR_STATE);
+    if ((state & 0x60) != 0x60 || (Py_ssize_t)WORD(ascii, YJSON_STR_LENGTH) != 5
+        || (char *)ascii + YJSON_STR_ASCII_DATA != (char *)PyUnicode_DATA(ascii) || memcmp((char *)ascii + YJSON_STR_ASCII_DATA, "yjson", 6) != 0) {
         runtime_failure("str"); goto done;
     }
     Py_ssize_t utf8_length = 0;
     const char *utf8 = PyUnicode_AsUTF8AndSize(wide, &utf8_length);
-    state = *(uint32_t *)((char *)wide + MOJSON_STR_STATE);
-    if (!utf8 || (state & 0x60) != 0x20 || (Py_ssize_t)WORD(wide, MOJSON_STR_UTF8_LENGTH) != utf8_length || (const char *)WORD(wide, MOJSON_STR_UTF8) != utf8) {
+    state = *(uint32_t *)((char *)wide + YJSON_STR_STATE);
+    if (!utf8 || (state & 0x60) != 0x20 || (Py_ssize_t)WORD(wide, YJSON_STR_UTF8_LENGTH) != utf8_length || (const char *)WORD(wide, YJSON_STR_UTF8) != utf8) {
         runtime_failure("compact str utf8 cache"); goto done;
     }
-#if MOJSON_LONG_TAGGED
-    uintptr_t tag = WORD(negative, MOJSON_LONG_TAG);
-    int int_ok = (tag & 3) == 2 && (tag >> 3) == 1 && (WORD(zero, MOJSON_LONG_TAG) & 3) == 1 && (WORD(wide_int, MOJSON_LONG_TAG) >> 3) == 2;
+#if YJSON_LONG_TAGGED
+    uintptr_t tag = WORD(negative, YJSON_LONG_TAG);
+    int int_ok = (tag & 3) == 2 && (tag >> 3) == 1 && (WORD(zero, YJSON_LONG_TAG) & 3) == 1 && (WORD(wide_int, YJSON_LONG_TAG) >> 3) == 2;
 #else
-    int int_ok = (Py_ssize_t)WORD(negative, MOJSON_LONG_TAG) == -1 && (Py_ssize_t)WORD(zero, MOJSON_LONG_TAG) == 0
-        && (Py_ssize_t)WORD(wide_int, MOJSON_LONG_TAG) == 2 && *(uint32_t *)((char *)zero + MOJSON_LONG_DIGITS) == 0;
+    int int_ok = (Py_ssize_t)WORD(negative, YJSON_LONG_TAG) == -1 && (Py_ssize_t)WORD(zero, YJSON_LONG_TAG) == 0
+        && (Py_ssize_t)WORD(wide_int, YJSON_LONG_TAG) == 2 && *(uint32_t *)((char *)zero + YJSON_LONG_DIGITS) == 0;
 #endif
-    if (!int_ok || *(uint32_t *)((char *)negative + MOJSON_LONG_DIGITS) != 5
-        || ((uint64_t)((uint32_t *)((char *)wide_int + MOJSON_LONG_DIGITS))[1] << 30) != (1ULL << 40)) {
+    if (!int_ok || *(uint32_t *)((char *)negative + YJSON_LONG_DIGITS) != 5
+        || ((uint64_t)((uint32_t *)((char *)wide_int + YJSON_LONG_DIGITS))[1] << 30) != (1ULL << 40)) {
         runtime_failure("int"); goto done;
     }
     double value;
-    memcpy(&value, (char *)real + MOJSON_FLOAT_VALUE, sizeof value);
+    memcpy(&value, (char *)real + YJSON_FLOAT_VALUE, sizeof value);
     if (value != 1.5) { runtime_failure("float"); goto done; }
-    if ((Py_ssize_t)WORD(list, MOJSON_OB_SIZE) != 1 || ((PyObject **)WORD(list, MOJSON_LIST_ITEMS))[0] != real) {
+    if ((Py_ssize_t)WORD(list, YJSON_OB_SIZE) != 1 || ((PyObject **)WORD(list, YJSON_LIST_ITEMS))[0] != real) {
         runtime_failure("list"); goto done;
     }
-    if ((Py_ssize_t)WORD(tuple, MOJSON_OB_SIZE) != 1 || (PyObject *)WORD(tuple, MOJSON_TUPLE_ITEMS) != real) {
+    if ((Py_ssize_t)WORD(tuple, YJSON_OB_SIZE) != 1 || (PyObject *)WORD(tuple, YJSON_TUPLE_ITEMS) != real) {
         runtime_failure("tuple"); goto done;
     }
-    if ((Py_ssize_t)WORD(bytes, MOJSON_OB_SIZE) != 3 || memcmp((char *)bytes + MOJSON_BYTES_DATA, "xyz", 4) != 0) {
+    if ((Py_ssize_t)WORD(bytes, YJSON_OB_SIZE) != 3 || memcmp((char *)bytes + YJSON_BYTES_DATA, "xyz", 4) != 0) {
         runtime_failure("bytes"); goto done;
     }
     /* dk_kind: DICT_KEYS_GENERAL (0) only when a key is not str. */
-    if ((Py_ssize_t)WORD(text_keys, MOJSON_DICT_USED) != 1 || ((unsigned char *)WORD(text_keys, MOJSON_DICT_KEYS))[10] == 0
-        || ((unsigned char *)WORD(general_keys, MOJSON_DICT_KEYS))[10] != 0) {
+    if ((Py_ssize_t)WORD(text_keys, YJSON_DICT_USED) != 1 || ((unsigned char *)WORD(text_keys, YJSON_DICT_KEYS))[10] == 0
+        || ((unsigned char *)WORD(general_keys, YJSON_DICT_KEYS))[10] != 0) {
         runtime_failure("dict"); goto done;
     }
     ok = 1;
@@ -219,7 +219,7 @@ done:
     return ok;
 }
 
-PyObject *mojson_null(void) { restore_environment(); return NULL; }
+PyObject *yjson_null(void) { restore_environment(); return NULL; }
 
 typedef struct {
     uintptr_t context;
@@ -249,7 +249,7 @@ static PyMethodDef socket_method = {
 };
 
 static void destroy_state(PyObject *capsule) {
-    ModuleState *state = PyCapsule_GetPointer(capsule, "mojson.state");
+    ModuleState *state = PyCapsule_GetPointer(capsule, "yjson.state");
     if (!state) { PyErr_Clear(); return; }
     Py_XDECREF(state->convert);
     Py_XDECREF(state->key_string);
@@ -288,7 +288,7 @@ static inline __attribute__((always_inline)) PyObject *dumps_impl(PyObject *caps
         PyErr_SetString(PyExc_TypeError, "dumps() requires one object and at most three positional arguments");
         return NULL;
     }
-    ModuleState *state = PyCapsule_GetPointer(capsule, "mojson.state");
+    ModuleState *state = PyCapsule_GetPointer(capsule, "yjson.state");
     if (!state) return NULL;
     PyObject *default_fn = nargs >= 2 ? args[1] : Py_None;
     PyObject *option_obj = nargs >= 3 ? args[2] : Py_None;
@@ -316,7 +316,7 @@ static inline __attribute__((always_inline)) PyObject *dumps_impl(PyObject *caps
     }
     if (socket) option |= 65536 | 4 | 512 | 2048;
     Request request = {state, capsule, default_fn, option, 0, 0, NULL};
-    PyObject *result = (PyObject *)mojson_encode(state->context, (uintptr_t)args[0], (uintptr_t)&request);
+    PyObject *result = (PyObject *)yjson_encode(state->context, (uintptr_t)args[0], (uintptr_t)&request);
     Py_XDECREF(request.keepalive);
     if (!result) wrap_error(0);
     return result;
@@ -344,7 +344,7 @@ static PyObject *dumps_socket(PyObject *capsule, PyObject *const *args, Py_ssize
 
 /* Decimal conversion only for the cold, arbitrary-size integer path. CPython's
    formatter handles digit limits and switches algorithms for very large values. */
-uintptr_t mojson_big_integer(uintptr_t object) {
+uintptr_t yjson_big_integer(uintptr_t object) {
     PyObject *obj = (PyObject *)object;
     Py_INCREF(obj);
     PyObject *result = PyLong_Type.tp_str(obj);
@@ -353,7 +353,7 @@ uintptr_t mojson_big_integer(uintptr_t object) {
 }
 
 /* Preserve lone surrogates as JSON escapes, without invoking a JSON encoder. */
-uintptr_t mojson_surrogate_string(uintptr_t object) {
+uintptr_t yjson_surrogate_string(uintptr_t object) {
     if (!PyErr_ExceptionMatches(PyExc_UnicodeEncodeError)) return 0;
     PyErr_Clear();
     PyObject *obj = (PyObject *)object;
@@ -392,9 +392,9 @@ uintptr_t mojson_surrogate_string(uintptr_t object) {
     return (uintptr_t)out;
 }
 
-long mojson_options(uintptr_t request) { return ((Request *)request)->option; }
+long yjson_options(uintptr_t request) { return ((Request *)request)->option; }
 
-int mojson_enter_fallback(uintptr_t request_ptr) {
+int yjson_enter_fallback(uintptr_t request_ptr) {
     Request *request = (Request *)request_ptr;
     if (request->conversions >= 254) {
         PyErr_SetString(PyExc_TypeError, "default serializer recursion limit exceeded");
@@ -404,7 +404,7 @@ int mojson_enter_fallback(uintptr_t request_ptr) {
     return 1;
 }
 
-void mojson_leave_fallback(uintptr_t request) { ((Request *)request)->conversions--; }
+void yjson_leave_fallback(uintptr_t request) { ((Request *)request)->conversions--; }
 
 static int retain_ancestors(Request *request, uintptr_t ancestors_ptr, long depth) {
     PyObject **ancestors = (PyObject **)ancestors_ptr;
@@ -446,7 +446,7 @@ static int retain_ancestors(Request *request, uintptr_t ancestors_ptr, long dept
     return 1;
 }
 
-int mojson_pin_ancestors(uintptr_t request, uintptr_t ancestors, long depth) {
+int yjson_pin_ancestors(uintptr_t request, uintptr_t ancestors, long depth) {
     return retain_ancestors((Request *)request, ancestors, depth);
 }
 
@@ -652,7 +652,7 @@ static uintptr_t convert_object(uintptr_t request_ptr, uintptr_t object, int *is
     return (uintptr_t)result;
 }
 
-uintptr_t mojson_convert(uintptr_t request, uintptr_t object, int *kind, uintptr_t ancestors, long depth) {
+uintptr_t yjson_convert(uintptr_t request, uintptr_t object, int *kind, uintptr_t ancestors, long depth) {
     /* Attribute getters may remove the last container reference to this object. */
     Py_INCREF((PyObject *)object);
     uintptr_t result = convert_object(request, object, kind, ancestors, depth);
@@ -685,7 +685,7 @@ static PyObject *key_string(Request *request, PyObject *key) {
         }
         if (!isfinite(PyFloat_AS_DOUBLE(key))) return PyUnicode_FromString("null");
         Request scalar = {request->state, request->capsule, Py_None, 0, 0, 0, NULL};
-        PyObject *bytes = (PyObject *)mojson_encode(request->state->context, (uintptr_t)key, (uintptr_t)&scalar);
+        PyObject *bytes = (PyObject *)yjson_encode(request->state->context, (uintptr_t)key, (uintptr_t)&scalar);
         if (!bytes) return NULL;
         PyObject *text = PyUnicode_DecodeUTF8(PyBytes_AS_STRING(bytes), PyBytes_GET_SIZE(bytes), "strict");
         Py_DECREF(bytes);
@@ -778,7 +778,7 @@ static void release_records(DictRecord *items, Py_ssize_t filled, char *arena, u
 }
 
 /* `count` is the dict size the records were built for; the arena follows the records. */
-void mojson_release_records(uintptr_t items_ptr, long count, uintptr_t storage) {
+void yjson_release_records(uintptr_t items_ptr, long count, uintptr_t storage) {
     DictRecord *items = (DictRecord *)items_ptr;
     release_records(items, count, (char *)items[count].utf8, storage);
 }
@@ -838,7 +838,7 @@ static int nonstr_key_record(Request *request, PyObject *key, DictRecord *record
             return 1;
         }
         Request scalar = {request->state, request->capsule, Py_None, 0, 0, 0, NULL};
-        PyObject *bytes = (PyObject *)mojson_encode(request->state->context, (uintptr_t)key, (uintptr_t)&scalar);
+        PyObject *bytes = (PyObject *)yjson_encode(request->state->context, (uintptr_t)key, (uintptr_t)&scalar);
         if (!bytes) return 0;
         *record = (DictRecord){bytes, NULL, PyBytes_AS_STRING(bytes), PyBytes_GET_SIZE(bytes)};
         return 1;
@@ -864,7 +864,7 @@ static int str_key_record(Request *request, PyObject *key, DictRecord *record) {
         if (!utf8) {
             if (!(request->option & 65536)) return 0;
             /* socket mode preserves lone surrogates as escapes: a complete JSON string */
-            PyObject *escaped = (PyObject *)mojson_surrogate_string((uintptr_t)key);
+            PyObject *escaped = (PyObject *)yjson_surrogate_string((uintptr_t)key);
             if (!escaped) return 0;
             *record = (DictRecord){escaped, NULL, PyBytes_AS_STRING(escaped), -PyBytes_GET_SIZE(escaped)};
             return 1;
@@ -874,7 +874,7 @@ static int str_key_record(Request *request, PyObject *key, DictRecord *record) {
     return 1;
 }
 
-uintptr_t mojson_dict_records(uintptr_t request_ptr, uintptr_t object, int sort, int nonstr, uintptr_t storage, long capacity,
+uintptr_t yjson_dict_records(uintptr_t request_ptr, uintptr_t object, int sort, int nonstr, uintptr_t storage, long capacity,
                               uintptr_t ancestors, long depth) {
     Request *request = (Request *)request_ptr;
     PyDictObject *dict = (PyDictObject *)object;
@@ -926,7 +926,7 @@ uintptr_t mojson_dict_records(uintptr_t request_ptr, uintptr_t object, int sort,
     return (uintptr_t)items;
 }
 
-int mojson_strict_integer(uintptr_t obj) {
+int yjson_strict_integer(uintptr_t obj) {
     int overflow = 0;
     long long value = PyLong_AsLongLongAndOverflow((PyObject *)obj, &overflow);
     if (overflow || value < -9007199254740991LL || value > 9007199254740991LL) {
@@ -936,15 +936,15 @@ int mojson_strict_integer(uintptr_t obj) {
     return !PyErr_Occurred();
 }
 
-void mojson_import_error(uintptr_t detail, Py_ssize_t length) {
+void yjson_import_error(uintptr_t detail, Py_ssize_t length) {
     if (PyErr_Occurred()) return;
     PyObject *text = PyUnicode_DecodeUTF8((const char *)detail, length, "replace");
     if (!text) return;
-    PyErr_Format(PyExc_ImportError, "mojson could not initialize its Mojo runtime: %U", text);
+    PyErr_Format(PyExc_ImportError, "yjson could not initialize its Mojo runtime: %U", text);
     Py_DECREF(text);
 }
 
-void mojson_error(int code) {
+void yjson_error(int code) {
     if (PyErr_Occurred()) return;
     const char *message = "Integer exceeds 64-bit range or invalid UTF-8 string";
     if (code == 3) message = "Recursion limit exceeded";
@@ -954,12 +954,12 @@ void mojson_error(int code) {
     PyErr_SetString(PyExc_TypeError, message);
 }
 
-int mojson_install(uintptr_t module_ptr, uintptr_t context) {
+int yjson_install(uintptr_t module_ptr, uintptr_t context) {
     restore_environment();
     PyObject *module = (PyObject *)module_ptr;
     PyDateTime_IMPORT;
     if (!PyDateTimeAPI) return -1;
-    PyObject *support = PyImport_ImportModule("_mojson_support");
+    PyObject *support = PyImport_ImportModule("_yjson_support");
     if (!support) return -1;
     ModuleState *state = PyMem_Calloc(1, sizeof(ModuleState));
     if (!state) { Py_DECREF(support); PyErr_NoMemory(); return -1; }
@@ -985,7 +985,7 @@ int mojson_install(uintptr_t module_ptr, uintptr_t context) {
         state->enum_type = PyObject_GetAttrString(enum_module, "Enum");
         Py_DECREF(enum_module);
     }
-    PyObject *capsule = PyCapsule_New(state, "mojson.state", destroy_state);
+    PyObject *capsule = PyCapsule_New(state, "yjson.state", destroy_state);
     if (!capsule) {
         Py_XDECREF(state->convert); Py_XDECREF(state->key_string); Py_XDECREF(state->fragment_type);
         Py_XDECREF(state->dataclass_fields_type);

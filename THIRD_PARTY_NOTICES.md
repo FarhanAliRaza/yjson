@@ -5,7 +5,7 @@ These notices apply to the derived portions identified below.
 ## Żmij
 
 The floating-point core, digit conversion and power-of-ten table in
-`src/mojson.mojo` and `tools/` are ported from
+`src/yjson.mojo` and `tools/` are ported from
 [Żmij](https://github.com/vitaut/zmij).
 [Upstream license](https://github.com/vitaut/zmij/blob/main/LICENSE):
 
@@ -35,7 +35,7 @@ SOFTWARE.
 
 ## itoap
 
-The integer writer in `src/mojson.mojo` is ported from
+The integer writer in `src/yjson.mojo` is ported from
 [itoap](https://github.com/Kogia-sima/itoap), version 1.0.1.
 The notice below is preserved from that crate.
 

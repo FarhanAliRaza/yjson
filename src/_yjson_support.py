@@ -1,4 +1,4 @@
-"""Cold type conversion and strict stdlib-backed decoding for mojson."""
+"""Cold type conversion and strict stdlib-backed decoding for yjson."""
 import dataclasses
 import datetime
 import enum

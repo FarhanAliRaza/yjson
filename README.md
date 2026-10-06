@@ -1,4 +1,4 @@
-# mojson
+# yjson
 
 A JSON serializer for CPython written in Mojo, with an orjson-style API.
 NaN / Infinity are written the way Python's `json` writes them
@@ -6,15 +6,15 @@ NaN / Infinity are written the way Python's `json` writes them
 
 ## Install
 
-The package is published on PyPI as `yjson` (the name `mojson` is too close to an
-existing project); the module you import is still `mojson`. Wheels are built for
+The package is published on PyPI as `yjson` and imported as `yjson` (releases
+before 0.2.0 installed the module as `mojson`). Wheels are built for
 CPython 3.11 - 3.15 on x86-64 Linux
 (`manylinux_2_35`, i.e. glibc 2.35+ such as Ubuntu 22.04 or newer) and need a CPU
 with AVX2. They bundle the Mojo runtime library, so nothing else is required:
 
 ```bash
 pip install yjson         # or: uv add yjson
-python -c 'import mojson; print(mojson.dumps({"ok": True}))'
+python -c 'import yjson; print(yjson.dumps({"ok": True}))'
 ```
 
 Building from the sdist needs the Mojo compiler on `PATH` (see below).
@@ -27,8 +27,8 @@ targets one interpreter at a time: it uses `.venv-bench/bin/python` if present,
 otherwise `python3`; override with `PYTHON=...`.
 
 ```bash
-./build.sh                               # -> build/mojson.cpython-312-x86_64-linux-gnu.so
-PYTHON=python3.14 ./build.sh             # -> build/mojson.cpython-314-x86_64-linux-gnu.so
+./build.sh                               # -> build/yjson.cpython-312-x86_64-linux-gnu.so
+PYTHON=python3.14 ./build.sh             # -> build/yjson.cpython-314-x86_64-linux-gnu.so
 export PYTHONPATH="$PWD/build${PYTHONPATH:+:$PYTHONPATH}"
 ```
 
@@ -47,10 +47,10 @@ items by adding a cached tuple hash.
 ## Use
 
 ```python
-import mojson
-mojson.dumps({"a": [1, 2.5, None], "b": float("nan")})   # b'{"a":[1,2.5,null],"b":NaN}'
-mojson.dumps(obj).decode()                                # if you need a str
-mojson.loads(b'{"a": 1}')                                # -> {"a": 1}
+import yjson
+yjson.dumps({"a": [1, 2.5, None], "b": float("nan")})   # b'{"a":[1,2.5,null],"b":NaN}'
+yjson.dumps(obj).decode()                                # if you need a str
+yjson.loads(b'{"a": 1}')                                # -> {"a": 1}
 ```
 
 See `examples/usage.py` (NumPy, NaN, files, errors).
@@ -65,16 +65,16 @@ exceptions raised by a default callback are attached as `__cause__`.
 ```python
 import datetime
 import decimal
-import mojson
+import yjson
 
 data = {"created": datetime.datetime(2024, 1, 2), "amount": decimal.Decimal("12.50")}
-out = mojson.dumps(
+out = yjson.dumps(
     data,
     default=str,
-    option=mojson.OPT_NAIVE_UTC | mojson.OPT_UTC_Z | mojson.OPT_INDENT_2,
+    option=yjson.OPT_NAIVE_UTC | yjson.OPT_UTC_Z | yjson.OPT_INDENT_2,
 )
-mojson.dumps({2: "b", 1: "a"}, option=mojson.OPT_NON_STR_KEYS | mojson.OPT_SORT_KEYS)
-mojson.dumps({"cached": mojson.Fragment(b'{"a":1}')})
+yjson.dumps({2: "b", 1: "a"}, option=yjson.OPT_NON_STR_KEYS | yjson.OPT_SORT_KEYS)
+yjson.dumps({"cached": yjson.Fragment(b'{"a":1}')})
 ```
 
 Options use the same bit values as [orjson](https://github.com/ijl/orjson#option):
@@ -117,7 +117,7 @@ Ordinary `dumps()` keeps its integer range and UTF-8 error behavior.
 pip install orjson numpy
 python tests/check_correctness.py path/to/jsonexamples     # corpus optional
 python tests/check_features.py                            # options, types, callbacks, decoding
-python bench/bench_paired.py path/to/jsonexamples          # mojson vs orjson, robust
+python bench/bench_paired.py path/to/jsonexamples          # yjson vs orjson, robust
 python bench/bench_features.py                            # enabled feature paths vs orjson
 python bench/bench_shapes.py --cpu 2                      # per payload shape vs orjson (where it wins or loses)
 python bench/bench_regression.py                          # requires a baseline build in build/baseline/
@@ -142,7 +142,7 @@ measures every workload of the PR's event benchmark: all at parity, because
 those deltas spend 88–97% of their encode time in Reflex's Python `default()`
 serializer for pydantic models, which neither codec can skip.
 The orjson baseline retains the PR's original
-codec; mojson replaces its socket retry logic with native serialization.
+codec; yjson replaces its socket retry logic with native serialization.
 Earlier option and indentation results remain in `build/fix-options.json`
 and `build/indent-reflex-benchmark.json`.
 
@@ -165,7 +165,7 @@ PATH="$PWD/.venv/bin:$PATH" auditwheel repair \
 ```
 
 `auditwheel repair` copies `libKGENCompilerRTShared.so` and its dependencies
-into `mojson.libs/` and sets the `manylinux_2_35` tag (the floor set by the Mojo
+into `yjson.libs/` and sets the `manylinux_2_35` tag (the floor set by the Mojo
 runtime). `--disable-isa-ext-check` is required because the extension targets
 x86-64-v3 (AVX2) by design.
 
@@ -208,12 +208,12 @@ done
 Choose an available logical CPU for `--cpu`, or omit it. The paired benchmark
 checks output equality, warms both serializers, calibrates a common batch size
 to at least 10 ms, and alternates order across 40 pairs. It reports median time
-per call, the median `orjson time / mojson time` ratio, and ratio quartiles.
-Ratios above 1 mean mojson is faster. The optional JSON report includes every
+per call, the median `orjson time / yjson time` ratio, and ratio quartiles.
+Ratios above 1 mean yjson is faster. The optional JSON report includes every
 sample and environment metadata. The corpus downloader records the source
 revision and SHA-256 hashes in `build/jsonexamples/manifest.json.txt`.
 
-## What's inside (src/mojson.mojo)
+## What's inside (src/yjson.mojo)
 
 - Direct reads of CPython object layouts (type pointer, list/tuple items, compact ints, float bits, str data)
   for 3.11 - 3.15, with the offsets supplied by the build and verified at import,
@@ -251,7 +251,7 @@ revision and SHA-256 hashes in `build/jsonexamples/manifest.json.txt`.
   an AVX-512 variant (k-mask string scanning) that only runs on such CPUs and
   was slower on a Cascade Lake Xeon (512-bit frequency penalty), so there is
   no runtime dispatch.
-- Keep `build/_mojson_support.py` alongside the built `mojson.*.so`; the build copies
+- Keep `build/_yjson_support.py` alongside the built `yjson.*.so`; the build copies
   this stdlib-only helper automatically. The extension has no orjson runtime dependency.
 - The string tail reads up to 31 bytes past a string's end within the same memory page (safe, but
   AddressSanitizer/valgrind will flag it).

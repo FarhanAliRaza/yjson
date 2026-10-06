@@ -13,7 +13,7 @@ import uuid
 from typing import ClassVar
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build"))
-import mojson
+import yjson
 import orjson
 
 
@@ -54,7 +54,7 @@ class Mapping(dict):
 
 class Features(unittest.TestCase):
     def same(self, value, option=0, default=None):
-        self.assertEqual(mojson.dumps(value, default=default, option=option),
+        self.assertEqual(yjson.dumps(value, default=default, option=option),
                          orjson.dumps(value, default=default, option=option))
 
     def test_types_and_combinations(self):
@@ -64,8 +64,8 @@ class Features(unittest.TestCase):
                        dt.datetime(2024, 1, 2, tzinfo=dt.timezone.utc),
                        uuid.UUID(int=12), Color.RED, Code.OK,
                        Text("é"), Integer(12), Items([1, 2]), Mapping(a=3)], "a": {}}
-        flags = [mojson.OPT_INDENT_2, mojson.OPT_SORT_KEYS, mojson.OPT_NAIVE_UTC,
-                 mojson.OPT_UTC_Z, mojson.OPT_OMIT_MICROSECONDS, mojson.OPT_APPEND_NEWLINE]
+        flags = [yjson.OPT_INDENT_2, yjson.OPT_SORT_KEYS, yjson.OPT_NAIVE_UTC,
+                 yjson.OPT_UTC_Z, yjson.OPT_OMIT_MICROSECONDS, yjson.OPT_APPEND_NEWLINE]
         for switches in itertools.product((False, True), repeat=len(flags)):
             option = sum(flag for flag, enabled in zip(flags, switches) if enabled)
             with self.subTest(option=option):
@@ -78,7 +78,7 @@ class Features(unittest.TestCase):
         for option in (4, 5, 36, 37, 4 | 64):
             with self.subTest(option=option):
                 self.same(value, option)
-        self.assertEqual(mojson.dumps({Text("subclass"): 1}), b'{"subclass":1}')
+        self.assertEqual(yjson.dumps({Text("subclass"): 1}), b'{"subclass":1}')
 
     def test_nonstr_container_dispatch(self):
         # General-key tables remain general after deleting their non-string key.
@@ -105,7 +105,7 @@ class Features(unittest.TestCase):
                     self.same(value, option)
         for key in ("\ud800", "x\udfff"):
             with self.assertRaises(TypeError):
-                mojson.dumps({key: 1}, option=32)
+                yjson.dumps({key: 1}, option=32)
 
     def test_sorted_entry_ownership(self):
         marker = object()
@@ -115,18 +115,18 @@ class Features(unittest.TestCase):
             references = sys.getrefcount(marker)
             for _ in range(20):
                 with self.assertRaises(TypeError):
-                    mojson.dumps(value, option=32)
+                    yjson.dumps(value, option=32)
                 self.same(value, 32, lambda obj: "replacement")
             self.assertEqual(sys.getrefcount(marker), references)
             expected = orjson.dumps(dict.fromkeys(keys, "replacement"), option=32)
             def clear_source(obj):
                 value.clear()
                 return "replacement"
-            self.assertEqual(mojson.dumps(value, option=32, default=clear_source), expected)
+            self.assertEqual(yjson.dumps(value, option=32, default=clear_source), expected)
         value = {**dict.fromkeys((f"a{i}" for i in range(65)), marker), "\ud800": marker}
         references = sys.getrefcount(marker)
         with self.assertRaises(TypeError):
-            mojson.dumps(value, option=32)
+            yjson.dumps(value, option=32)
         self.assertEqual(sys.getrefcount(marker), references)
 
     def test_integer_limits(self):
@@ -134,13 +134,13 @@ class Features(unittest.TestCase):
             self.same(number)
             self.same([number] * 12)
         for number in (-(1 << 63) - 1, 1 << 64):
-            with self.assertRaises(mojson.JSONEncodeError):
-                mojson.dumps(number)
+            with self.assertRaises(yjson.JSONEncodeError):
+                yjson.dumps(number)
         for number in (-(1 << 53) + 1, (1 << 53) - 1):
-            self.same({"n": [number]}, mojson.OPT_STRICT_INTEGER)
+            self.same({"n": [number]}, yjson.OPT_STRICT_INTEGER)
         for number in (-(1 << 53), 1 << 53, (1 << 64) - 1):
             with self.assertRaises(TypeError):
-                mojson.dumps({"n": [number]}, option=mojson.OPT_STRICT_INTEGER)
+                yjson.dumps({"n": [number]}, option=yjson.OPT_STRICT_INTEGER)
 
     def test_integer_digit_boundaries(self):
         import random
@@ -158,9 +158,9 @@ class Features(unittest.TestCase):
             else:
                 for option in (0, 1, 4, 32, 2564):
                     with self.assertRaises(TypeError):
-                        mojson.dumps({"value": value}, option=option)
+                        yjson.dumps({"value": value}, option=option)
                 # Encoder state remains valid after an early range failure.
-                self.assertEqual(mojson.dumps({"ok": True}), b'{"ok":true}')
+                self.assertEqual(yjson.dumps({"ok": True}), b'{"ok":true}')
 
     def test_datetime_boundaries(self):
         from zoneinfo import ZoneInfo
@@ -188,7 +188,7 @@ class Features(unittest.TestCase):
         from collections import namedtuple
         Point = namedtuple("Point", "x y")
         with self.assertRaises(TypeError):
-            mojson.dumps(Point(1, 2))
+            yjson.dumps(Point(1, 2))
         self.same(Point(1, 2), default=lambda p: {"x": p.x, "y": p.y})
 
     def test_tuple_layouts(self):
@@ -203,48 +203,48 @@ class Features(unittest.TestCase):
         for option in (4, 5, 36, 37):
             with self.subTest(option=option):
                 self.same(keyed, option)
-        self.assertEqual(mojson.dumps_socket(value), mojson.dumps(value))
-        self.assertEqual(mojson.dumps_socket(keyed), mojson.dumps(keyed, option=4))
-        self.assertEqual(mojson.dumps_socket((1 << 70, "x")), b'[1180591620717411303424,"x"]')
+        self.assertEqual(yjson.dumps_socket(value), yjson.dumps(value))
+        self.assertEqual(yjson.dumps_socket(keyed), yjson.dumps(keyed, option=4))
+        self.assertEqual(yjson.dumps_socket((1 << 70, "x")), b'[1180591620717411303424,"x"]')
 
     def test_uuid_range(self):
         # Full 128-bit range, including the sign bit position (PyLong_AsNativeBytes on 3.13+).
         values = [uuid.UUID(int=0), uuid.UUID(int=1), uuid.UUID(int=1 << 127), uuid.UUID(int=(1 << 128) - 1)]
         self.same(values)
-        self.same({value: index for index, value in enumerate(values)}, mojson.OPT_NON_STR_KEYS)
-        self.assertEqual(mojson.dumps(values[-1]), b'"ffffffff-ffff-ffff-ffff-ffffffffffff"')
+        self.same({value: index for index, value in enumerate(values)}, yjson.OPT_NON_STR_KEYS)
+        self.assertEqual(yjson.dumps(values[-1]), b'"ffffffff-ffff-ffff-ffff-ffffffffffff"')
 
     def test_default_and_passthrough(self):
         marker = object()
         self.same({"a": [marker]}, default=lambda o: {"value": 42})
-        self.same(Record(1, dt.datetime(2024, 1, 1)), mojson.OPT_PASSTHROUGH_DATACLASS, lambda o: "record")
-        self.same(dt.datetime.now(), mojson.OPT_PASSTHROUGH_DATETIME, lambda o: "datetime")
-        self.same(Text("secret"), mojson.OPT_PASSTHROUGH_SUBCLASS, lambda o: "redacted")
-        self.same(Items([1]), mojson.OPT_PASSTHROUGH_SUBCLASS, lambda o: "items")
-        self.same(Code.OK, mojson.OPT_PASSTHROUGH_SUBCLASS)
+        self.same(Record(1, dt.datetime(2024, 1, 1)), yjson.OPT_PASSTHROUGH_DATACLASS, lambda o: "record")
+        self.same(dt.datetime.now(), yjson.OPT_PASSTHROUGH_DATETIME, lambda o: "datetime")
+        self.same(Text("secret"), yjson.OPT_PASSTHROUGH_SUBCLASS, lambda o: "redacted")
+        self.same(Items([1]), yjson.OPT_PASSTHROUGH_SUBCLASS, lambda o: "items")
+        self.same(Code.OK, yjson.OPT_PASSTHROUGH_SUBCLASS)
         for option in (0, 1, 32, 256):
             with self.assertRaises(TypeError):
-                mojson.dumps(marker, default=lambda o: o, option=option)
+                yjson.dumps(marker, default=lambda o: o, option=option)
         error = ValueError("callback failed")
         def fail(obj):
             raise error
         with self.assertRaises(TypeError) as caught:
-            mojson.dumps(marker, default=fail)
+            yjson.dumps(marker, default=fail)
         self.assertIs(caught.exception.__cause__, error)
-        self.assertEqual(mojson.dumps(1, default=42), b"1")
+        self.assertEqual(yjson.dumps(1, default=42), b"1")
 
     def test_reentrant_and_temporary_keys(self):
         markers = [object() for _ in range(100)]
         def convert(obj):
-            mojson.dumps({"a": {"b": "a different output"}})
+            yjson.dumps({"a": {"b": "a different output"}})
             return {("temporary_%d" % markers.index(obj)): "result"}
         expected = json.dumps([convert(obj) for obj in markers], separators=(",", ":")).encode()
-        self.assertEqual(mojson.dumps(markers, default=convert), expected)
-        self.assertEqual(mojson.dumps({"a": markers, "after": {"a": "tail"}}, default=convert),
+        self.assertEqual(yjson.dumps(markers, default=convert), expected)
+        self.assertEqual(yjson.dumps({"a": markers, "after": {"a": "tail"}}, default=convert),
                          b'{"a":' + expected + b',"after":{"a":"tail"}}')
         def nested(obj):
-            return json.loads(mojson.dumps(obj, default=lambda child: "inner"))
-        self.assertEqual(mojson.dumps(markers[0], default=nested), b'"inner"')
+            return json.loads(yjson.dumps(obj, default=lambda child: "inner"))
+        self.assertEqual(yjson.dumps(markers[0], default=nested), b'"inner"')
         for option in (1, 5, 33, 37):
             self.same({"a": markers, "after": {"a": "tail"}}, option, convert)
 
@@ -269,14 +269,14 @@ class Features(unittest.TestCase):
                 value.clear()
                 return 1
             with self.assertRaises(TypeError):
-                mojson.dumps(value, default=clear_list, option=option)
+                yjson.dumps(value, default=clear_list, option=option)
             # Same-length mutation can reallocate a list's backing storage.
             value = [marker, 2]
             def replace_list(obj):
                 value.extend(range(1000))
                 del value[2:]
                 return 1
-            self.assertEqual(mojson.dumps(value, default=replace_list, option=option),
+            self.assertEqual(yjson.dumps(value, default=replace_list, option=option),
                              orjson.dumps([1, 2], option=option))
             # A callback can remove the last owner of the dict currently being encoded.
             root = [{"x": marker, "after": 2}]
@@ -284,7 +284,7 @@ class Features(unittest.TestCase):
                 root.clear()
                 return 1
             with self.assertRaises(TypeError):
-                mojson.dumps(root, default=remove_owner, option=option)
+                yjson.dumps(root, default=remove_owner, option=option)
             @dataclasses.dataclass
             class Getter:
                 a: int = 1
@@ -295,7 +295,7 @@ class Features(unittest.TestCase):
                     return object.__getattribute__(self, name)
             root = [Getter()]
             with self.assertRaises(TypeError):
-                mojson.dumps(root, option=option)
+                yjson.dumps(root, option=option)
 
     def test_callback_ancestor_storage(self):
         import gc
@@ -319,7 +319,7 @@ class Features(unittest.TestCase):
                     gc.collect()
                 return "converted"
             with self.assertRaises(TypeError):
-                mojson.dumps(root, default=clear_on_second, option=option)
+                yjson.dumps(root, default=clear_on_second, option=option)
             root = [marker, nested]
             counts = [sys.getrefcount(value) for value in (root, nested, marker)]
 
@@ -339,42 +339,42 @@ class Features(unittest.TestCase):
 
     def test_fragment(self):
         for option in (0, 1, 32, 1024, 1 | 32 | 1024):
-            self.assertEqual(mojson.dumps({"a": mojson.Fragment(b'{"x":  1}')}, option=option),
+            self.assertEqual(yjson.dumps({"a": yjson.Fragment(b'{"x":  1}')}, option=option),
                              orjson.dumps({"a": orjson.Fragment(b'{"x":  1}')}, option=option))
-        self.assertEqual(mojson.dumps(mojson.Fragment("true")), b"true")
+        self.assertEqual(yjson.dumps(yjson.Fragment("true")), b"true")
         with self.assertRaises(TypeError):
-            mojson.Fragment(42)
-        damaged = mojson.Fragment(b"true")
+            yjson.Fragment(42)
+        damaged = yjson.Fragment(b"true")
         damaged._data = 42
         with self.assertRaises(TypeError):
-            mojson.dumps(damaged)
+            yjson.dumps(damaged)
 
     def test_errors_and_recovery(self):
-        self.assertIs(mojson.JSONEncodeError, TypeError)
+        self.assertIs(yjson.JSONEncodeError, TypeError)
         for value in (object(), {1: 2}, "\ud800", {"\udfff": 1}, dt.time(tzinfo=dt.timezone.utc)):
             with self.assertRaises(TypeError):
-                mojson.dumps(value)
-            self.assertEqual(mojson.dumps({"ok": True}), b'{"ok":true}')
+                yjson.dumps(value)
+            self.assertEqual(yjson.dumps({"ok": True}), b'{"ok":true}')
         recursive = []; recursive.append(recursive)
         for option in (0, 1, 32):
             with self.assertRaises(TypeError):
-                mojson.dumps(recursive, option=option)
+                yjson.dumps(recursive, option=option)
         for option in (-1, 4096, True, "1", 1 << 100):
             with self.assertRaises(TypeError):
-                mojson.dumps(1, option=option)
-        for call in (lambda: mojson.dumps(), lambda: mojson.dumps(1, None, 0, 2),
-                     lambda: mojson.dumps(obj=1), lambda: mojson.dumps(1, nope=2),
-                     lambda: mojson.dumps(1, None, default=None)):
+                yjson.dumps(1, option=option)
+        for call in (lambda: yjson.dumps(), lambda: yjson.dumps(1, None, 0, 2),
+                     lambda: yjson.dumps(obj=1), lambda: yjson.dumps(1, nope=2),
+                     lambda: yjson.dumps(1, None, default=None)):
             with self.assertRaises(TypeError):
                 call()
-        self.assertEqual(mojson.dumps(1, None, None), b"1")
+        self.assertEqual(yjson.dumps(1, None, None), b"1")
 
     def test_numpy_options(self):
         import numpy as np
         for array in (np.array([[1, 2], [3, 4]]), np.array([0.1, 2.5]), np.array([], dtype=np.float64)):
             for option in (1, 32, 1 | 32, 64):
-                self.same({"array": array}, option | mojson.OPT_SERIALIZE_NUMPY)
-        self.assertEqual(mojson.dumps([math.nan, math.inf, -math.inf]), b"[NaN,Infinity,-Infinity]")
+                self.same({"array": array}, option | yjson.OPT_SERIALIZE_NUMPY)
+        self.assertEqual(yjson.dumps([math.nan, math.inf, -math.inf]), b"[NaN,Infinity,-Infinity]")
 
     def test_socket_big_integers(self):
         import random
@@ -384,18 +384,18 @@ class Features(unittest.TestCase):
         values += [rng.getrandbits(rng.randrange(65, 4096)) * rng.choice((-1, 1)) for _ in range(200)]
         for value in values:
             for obj in (value, [1, value, None], {"n": Integer(value)}, {value: "key"}):
-                self.assertEqual(json.loads(mojson.dumps_socket(obj)), json.loads(json.dumps(obj)))
-        self.assertEqual(mojson.dumps_socket([None, math.nan, math.inf, -math.inf]),
+                self.assertEqual(json.loads(yjson.dumps_socket(obj)), json.loads(json.dumps(obj)))
+        self.assertEqual(yjson.dumps_socket([None, math.nan, math.inf, -math.inf]),
                          b"[null,NaN,Infinity,-Infinity]")
         with self.assertRaises(TypeError):
-            mojson.dumps(2**100)
+            yjson.dumps(2**100)
 
     def test_socket_matches_stdlib_wire(self):
         # Strings pass through untouched and non-finite floats stay bare tokens, as json.dumps writes them.
         for text in ("__reflex_nan__", "__reflex_inf__", "__reflex_esc__x", "nan", "null", "NaN"):
             value = {text: [text, {"converted": object()}], "f": [math.nan, math.inf, -math.inf]}
             expected = {text: [text, {"converted": text}], "f": [math.nan, math.inf, -math.inf]}
-            self.assertEqual(mojson.dumps_socket(value, default=lambda obj: text).decode(),
+            self.assertEqual(yjson.dumps_socket(value, default=lambda obj: text).decode(),
                              json.dumps(expected, separators=(",", ":")))
 
     def test_socket_surrogates_and_growth(self):
@@ -403,14 +403,14 @@ class Features(unittest.TestCase):
                   "x" * 4063 + "\ud800", "\ud800" * 65536]
         for text in values:
             for obj in (text, [0] * 10 + [text], {text: text}, {1: text}):
-                out = mojson.dumps_socket(obj)
+                out = yjson.dumps_socket(obj)
                 out.decode("utf-8")
                 self.assertEqual(json.loads(out), json.loads(json.dumps(obj)))
-        self.assertEqual(json.loads(mojson.dumps_socket({"s": "__reflex_nan__\ud800"})),
+        self.assertEqual(json.loads(yjson.dumps_socket({"s": "__reflex_nan__\ud800"})),
                          {"s": "__reflex_nan__\ud800"})
         for text in values[:4]:
             with self.assertRaises(TypeError):
-                mojson.dumps(text)
+                yjson.dumps(text)
 
     def test_socket_callback_ownership_and_errors(self):
         import gc
@@ -418,7 +418,7 @@ class Features(unittest.TestCase):
         marker = object()
         root = [marker, {"value": marker}]
         with patch("json.dumps", side_effect=AssertionError("stdlib encoder used")):
-            self.assertEqual(mojson.dumps_socket(root, default=lambda obj: {"big": 2**100}),
+            self.assertEqual(yjson.dumps_socket(root, default=lambda obj: {"big": 2**100}),
                              b'[{"big":1267650600228229401496703205376},{"value":{"big":1267650600228229401496703205376}}]')
         calls = 0
         def clear(obj):
@@ -429,12 +429,12 @@ class Features(unittest.TestCase):
                 gc.collect()
             return "__reflex_nan__"
         with self.assertRaises(TypeError):
-            mojson.dumps_socket(root, default=clear)
-        for call in (lambda: mojson.dumps_socket(object()), lambda: mojson.dumps_socket(1, option=1),
-                     lambda: mojson.dumps_socket(1, None, 0), lambda: mojson.dumps_socket()):
+            yjson.dumps_socket(root, default=clear)
+        for call in (lambda: yjson.dumps_socket(object()), lambda: yjson.dumps_socket(1, option=1),
+                     lambda: yjson.dumps_socket(1, None, 0), lambda: yjson.dumps_socket()):
             with self.assertRaises(TypeError):
                 call()
-        self.assertEqual(mojson.dumps_socket({"ok": True}), b'{"ok":true}')
+        self.assertEqual(yjson.dumps_socket({"ok": True}), b'{"ok":true}')
 
     def test_import_leaves_child_environment_unchanged(self):
         # The Mojo runtime setenv()s PYTHONPATH/PYTHONEXECUTABLE at startup; a venv
@@ -442,9 +442,9 @@ class Features(unittest.TestCase):
         import subprocess
         script = (
             "import json, os, subprocess, sys\n"
-            f"sys.path.insert(0, {str(Path(mojson.__file__).parent)!r})\n"
+            f"sys.path.insert(0, {str(Path(yjson.__file__).parent)!r})\n"
             "before = dict(os.environ)\n"
-            "import mojson\n"
+            "import yjson\n"
             "child = subprocess.run([sys.executable, '-c', 'import json, os; print(json.dumps(dict(os.environ)))'],"
             " capture_output=True, text=True, check=True)\n"
             "print(json.dumps([before, json.loads(child.stdout), child.stderr]))\n"
@@ -477,9 +477,9 @@ class Features(unittest.TestCase):
             sys.set_int_max_str_digits(0)
             with patch("builtins.__import__", side_effect=intercept):
                 with self.assertRaises(TypeError):
-                    mojson.dumps_socket(root)
+                    yjson.dumps_socket(root)
             self.assertTrue(called)
-            self.assertEqual(mojson.dumps_socket(2**100), str(2**100).encode())
+            self.assertEqual(yjson.dumps_socket(2**100), str(2**100).encode())
         finally:
             sys.set_int_max_str_digits(limit)
             if previous_module is not None:
@@ -488,14 +488,14 @@ class Features(unittest.TestCase):
     def test_loads(self):
         text = '{"é": [1, 0.1, null, true, "😀"], "big": 18446744073709551616}'
         for value in (text, text.encode(), bytearray(text.encode()), memoryview(text.encode())):
-            self.assertEqual(mojson.loads(value), orjson.loads(value))
+            self.assertEqual(yjson.loads(value), orjson.loads(value))
         for value in (b"\xff", '"\ud800"', '"\\ud800"', b"NaN", b"Infinity", b"1e400", b"{} trailing",
                       b"{", b"\xef\xbb\xbf{}", b"[1,]", memoryview(b"abcd")[::2], 42):
-            with self.subTest(value=value), self.assertRaises(mojson.JSONDecodeError):
-                mojson.loads(value)
+            with self.subTest(value=value), self.assertRaises(yjson.JSONDecodeError):
+                yjson.loads(value)
         try:
-            mojson.loads('{"a":}')
-        except mojson.JSONDecodeError as error:
+            yjson.loads('{"a":}')
+        except yjson.JSONDecodeError as error:
             self.assertEqual((error.pos, error.lineno, error.colno), (5, 1, 6))
 
 

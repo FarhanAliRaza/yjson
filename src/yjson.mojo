@@ -35,36 +35,36 @@ def rdi(addr: Int, off: Int) -> Int:
 # re-checks the same values with _Static_assert and against live objects at
 # import. The defaults are the CPython 3.12 layout (3.11 has a longer str
 # header and stores the int sign/size in ob_size; 3.14 moved tuple items).
-comptime PY_MINOR = get_defined_int["MOJSON_PY_MINOR", 12]()
-comptime LONG_TAGGED = get_defined_int["MOJSON_LONG_TAGGED", 1]() != 0
-comptime OB_TYPE = get_defined_int["MOJSON_OB_TYPE", 8]()
-comptime OB_SIZE = get_defined_int["MOJSON_OB_SIZE", 16]()
-comptime TP_NAME = get_defined_int["MOJSON_TP_NAME", 24]()
-comptime FLOAT_VALUE = get_defined_int["MOJSON_FLOAT_VALUE", 16]()
-comptime LONG_TAG = get_defined_int["MOJSON_LONG_TAG", 16]()
-comptime LONG_DIGITS = get_defined_int["MOJSON_LONG_DIGITS", 24]()
-comptime LIST_ITEMS = get_defined_int["MOJSON_LIST_ITEMS", 24]()
-comptime TUPLE_ITEMS = get_defined_int["MOJSON_TUPLE_ITEMS", 24]()
-comptime BYTES_DATA = get_defined_int["MOJSON_BYTES_DATA", 32]()
-comptime DICT_USED = get_defined_int["MOJSON_DICT_USED", 16]()
-comptime DICT_KEYS = get_defined_int["MOJSON_DICT_KEYS", 32]()
-comptime STR_LENGTH = get_defined_int["MOJSON_STR_LENGTH", 16]()
-comptime STR_STATE = get_defined_int["MOJSON_STR_STATE", 32]()
-comptime STR_ASCII_DATA = get_defined_int["MOJSON_STR_ASCII_DATA", 40]()
-comptime STR_UTF8_LENGTH = get_defined_int["MOJSON_STR_UTF8_LENGTH", 40]()
-comptime STR_UTF8 = get_defined_int["MOJSON_STR_UTF8", 48]()
+comptime PY_MINOR = get_defined_int["YJSON_PY_MINOR", 12]()
+comptime LONG_TAGGED = get_defined_int["YJSON_LONG_TAGGED", 1]() != 0
+comptime OB_TYPE = get_defined_int["YJSON_OB_TYPE", 8]()
+comptime OB_SIZE = get_defined_int["YJSON_OB_SIZE", 16]()
+comptime TP_NAME = get_defined_int["YJSON_TP_NAME", 24]()
+comptime FLOAT_VALUE = get_defined_int["YJSON_FLOAT_VALUE", 16]()
+comptime LONG_TAG = get_defined_int["YJSON_LONG_TAG", 16]()
+comptime LONG_DIGITS = get_defined_int["YJSON_LONG_DIGITS", 24]()
+comptime LIST_ITEMS = get_defined_int["YJSON_LIST_ITEMS", 24]()
+comptime TUPLE_ITEMS = get_defined_int["YJSON_TUPLE_ITEMS", 24]()
+comptime BYTES_DATA = get_defined_int["YJSON_BYTES_DATA", 32]()
+comptime DICT_USED = get_defined_int["YJSON_DICT_USED", 16]()
+comptime DICT_KEYS = get_defined_int["YJSON_DICT_KEYS", 32]()
+comptime STR_LENGTH = get_defined_int["YJSON_STR_LENGTH", 16]()
+comptime STR_STATE = get_defined_int["YJSON_STR_STATE", 32]()
+comptime STR_ASCII_DATA = get_defined_int["YJSON_STR_ASCII_DATA", 40]()
+comptime STR_UTF8_LENGTH = get_defined_int["YJSON_STR_UTF8_LENGTH", 40]()
+comptime STR_UTF8 = get_defined_int["YJSON_STR_UTF8", 48]()
 # str.state bits (identical on 3.11-3.15; verified at import against live objects)
 comptime STR_COMPACT: UInt32 = 0x20
 comptime STR_ASCII: UInt32 = 0x40
 # PyDictKeysObject (identical on 3.11-3.15; asserted by the C shim): the entry
 # array follows the index table, as PyDictUnicodeEntry {key, value} for
 # unicode-keyed tables or PyDictKeyEntry {hash, key, value} for general ones.
-comptime DIRECT_DICT = get_defined_int["MOJSON_DIRECT_DICT", 1]() != 0
-comptime DICT_VALUES = get_defined_int["MOJSON_DICT_VALUES", 40]()
-comptime DK_LOG2_INDEX_BYTES = get_defined_int["MOJSON_DK_LOG2_INDEX_BYTES", 9]()
-comptime DK_KIND = get_defined_int["MOJSON_DK_KIND", 10]()
-comptime DK_NENTRIES = get_defined_int["MOJSON_DK_NENTRIES", 24]()
-comptime DK_INDICES = get_defined_int["MOJSON_DK_INDICES", 32]()
+comptime DIRECT_DICT = get_defined_int["YJSON_DIRECT_DICT", 1]() != 0
+comptime DICT_VALUES = get_defined_int["YJSON_DICT_VALUES", 40]()
+comptime DK_LOG2_INDEX_BYTES = get_defined_int["YJSON_DK_LOG2_INDEX_BYTES", 9]()
+comptime DK_KIND = get_defined_int["YJSON_DK_KIND", 10]()
+comptime DK_NENTRIES = get_defined_int["YJSON_DK_NENTRIES", 24]()
+comptime DK_INDICES = get_defined_int["YJSON_DK_INDICES", 32]()
 
 @always_inline
 def rdb(addr: Int, off: Int) -> Int:
@@ -583,7 +583,7 @@ def int_fast(dst: P8, n: Int, o: Int) -> Int:
 
 @inline(.never)
 def write_surrogate_string[o_: Origin[mut=True]](bp: Pointer[Buf, o_], o: Int) -> Bool:
-    var encoded = external_call["mojson_surrogate_string", Int](o)
+    var encoded = external_call["yjson_surrogate_string", Int](o)
     if encoded == 0:
         return False
     var size = ob_size(encoded)
@@ -595,7 +595,7 @@ def write_surrogate_string[o_: Origin[mut=True]](bp: Pointer[Buf, o_], o: Int) -
 
 @inline(.never)
 def write_big_integer[o_: Origin[mut=True]](bp: Pointer[Buf, o_], o: Int) -> Bool:
-    var text = external_call["mojson_big_integer", Int](o)
+    var text = external_call["yjson_big_integer", Int](o)
     if text == 0:
         return False
     var size = 0
@@ -611,7 +611,7 @@ def write_socket_integer[o_: Origin[mut=True], c_: Origin](bp: Pointer[Buf, o_],
     # CPython can import _pylong for enormous integers when its digit limit is
     # disabled. Such imports can run arbitrary callbacks and release parents.
     if unlikely((long_tag(o) >> 3) > 6000):
-        if external_call["mojson_pin_ancestors", Int32](cp[].request, cp[].ancestors, depth) == 0:
+        if external_call["yjson_pin_ancestors", Int32](cp[].request, cp[].ancestors, depth) == 0:
             return False
     return write_int[True](bp, o)
 
@@ -1783,12 +1783,12 @@ def ser_dict_records[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o_: O
     Pointer[Int, MutUntrackedOrigin](unsafe_from_address=cp[].ancestors)[unsafe_offset=depth] = o
     var storage = unsafe_stack_allocation[128, Int]()
     var nonstr = NONSTR and dict_has_general_keys(o)
-    var items = external_call["mojson_dict_records", Int](cp[].request, o, Int32(1 if SORT else 0), Int32(1 if nonstr else 0), Int(storage), 31, cp[].ancestors, depth)
+    var items = external_call["yjson_dict_records", Int](cp[].request, o, Int32(1 if SORT else 0), Int32(1 if nonstr else 0), Int(storage), 31, cp[].ancestors, depth)
     if items == 0:
         return False
     var count = ob_size(o)
     var ok = ser_dict_items[NONSTR, SORT, SOCKET, True, INDENT](bp, cp, o, depth, items)
-    external_call["mojson_release_records", NoneType](items, count, Int(storage))
+    external_call["yjson_release_records", NoneType](items, count, Int(storage))
     return ok
 
 @no_inline
@@ -2047,12 +2047,12 @@ def ser_fallback[INDENT: Bool, SORT: Bool, CONFIG: Bool, NONSTR: Bool, SOCKET: B
     if depth > 254:
         bp[].err = 3
         return False
-    if external_call["mojson_enter_fallback", Int32](cp[].request) == 0:
+    if external_call["yjson_enter_fallback", Int32](cp[].request) == 0:
         return False
     var fragment = Int32(0)
-    var converted = external_call["mojson_convert", Int](cp[].request, o, Int(Pointer(to=fragment)), cp[].ancestors, depth)
+    var converted = external_call["yjson_convert", Int](cp[].request, o, Int(Pointer(to=fragment)), cp[].ancestors, depth)
     if converted == 0:
-        external_call["mojson_leave_fallback", NoneType](cp[].request)
+        external_call["yjson_leave_fallback", NoneType](cp[].request)
         return False
     var ok: Bool
     if fragment == 1:
@@ -2078,7 +2078,7 @@ def ser_fallback[INDENT: Bool, SORT: Bool, CONFIG: Bool, NONSTR: Bool, SOCKET: B
                 ok = ser_value[NONSTR, SORT, SOCKET, INDENT](bp, cp, converted, depth)
         generation[] += 1
     external_call["Py_DecRef", NoneType](converted)
-    external_call["mojson_leave_fallback", NoneType](cp[].request)
+    external_call["yjson_leave_fallback", NoneType](cp[].request)
     return ok
 
 # Optional ',' then '\n' and 2*depth spaces, in one reservation and (up to
@@ -2129,7 +2129,7 @@ def ser_configured_child[INDENT: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=
             return True
         if tp == cp[].t_int:
             if (cp[].option & 64) != 0:
-                if external_call["mojson_strict_integer", Int32](o) == 0:
+                if external_call["yjson_strict_integer", Int32](o) == 0:
                     return False
             comptime if SOCKET:
                 return write_socket_integer(bp, cp, o, depth)
@@ -2156,7 +2156,7 @@ def ser_configured[INDENT: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=True],
         return write_str[SOCKET](bp, o)
     if tp == ctx.t_int:
         if (ctx.option & 64) != 0:
-            if external_call["mojson_strict_integer", Int32](o) == 0:
+            if external_call["yjson_strict_integer", Int32](o) == 0:
                 return False
         comptime if SOCKET:
             return write_socket_integer(bp, cp, o, depth)
@@ -2202,7 +2202,7 @@ def ser_configured_dict[INDENT: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=T
     if (skip_sort or not SORT) and not nonstr:
         return ser_configured_dict_direct[INDENT, SORT, SOCKET](bp, cp, o, depth)
     var storage = unsafe_stack_allocation[128, Int]()
-    var items = external_call["mojson_dict_records", Int](cp[].request, o, Int32(0 if skip_sort or not SORT else 1), Int32(1 if nonstr else 0), Int(storage), 31, cp[].ancestors, depth + 1)
+    var items = external_call["yjson_dict_records", Int](cp[].request, o, Int32(0 if skip_sort or not SORT else 1), Int32(1 if nonstr else 0), Int(storage), 31, cp[].ancestors, depth + 1)
     if items == 0:
         return False
     var count = ob_size(o)
@@ -2226,7 +2226,7 @@ def ser_configured_dict[INDENT: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=T
         if not ser_configured_child[INDENT, SORT, SOCKET](bp, cp, rdb(record, 8), depth + 1):
             ok = False
             break
-    external_call["mojson_release_records", NoneType](items, count, Int(storage))
+    external_call["yjson_release_records", NoneType](items, count, Int(storage))
     if not ok:
         return False
     comptime if INDENT:
@@ -2309,7 +2309,7 @@ def write_cached_key[o_: Origin[mut=True], c_: Origin](bp: Pointer[Buf, o_], cp:
 
 # ---------------- Python entry point: the module's Ctx caches the type pointers ----------------
 @export
-def mojson_encode(context: Int, obj: Int, request: Int) abi("C") -> Int:
+def yjson_encode(context: Int, obj: Int, request: Int) abi("C") -> Int:
     var ctx = Pointer[Ctx, MutUntrackedOrigin](unsafe_from_address=context)[]
     ctx.request = request
     var ancestors = unsafe_stack_allocation[257, Int]()
@@ -2318,7 +2318,7 @@ def mojson_encode(context: Int, obj: Int, request: Int) abi("C") -> Int:
     var generation = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=ctx.kc)
     generation[] += 1
     var buffer = Buf(256)
-    var option = external_call["mojson_options", Int](request)
+    var option = external_call["yjson_options", Int](request)
     ctx.option = option
     var ok: Bool
     if (option & (1 | 4 | 32 | 64 | 256 | 65536)) == 0:
@@ -2360,7 +2360,7 @@ def mojson_encode(context: Int, obj: Int, request: Int) abi("C") -> Int:
     generation[] += 1
     if not ok:
         external_call["Py_DecRef", NoneType](buffer.obj)
-        external_call["mojson_error", NoneType](Int32(buffer.err))
+        external_call["yjson_error", NoneType](Int32(buffer.err))
         return 0
     if (option & 1024) != 0:
         put_byte(Pointer(to=buffer), 10)
@@ -2370,11 +2370,11 @@ def mojson_encode(context: Int, obj: Int, request: Int) abi("C") -> Int:
     return result
 
 @export
-def PyInit_mojson() abi("C") -> PythonObject:
+def PyInit_yjson() abi("C") -> PythonObject:
     try:
-        if external_call["mojson_check_runtime", Int32]() == 0:
-            return PythonObject(from_owned=external_call["mojson_null", PyObjectPtr]())
-        var builder = PythonModuleBuilder("mojson")
+        if external_call["yjson_check_runtime", Int32]() == 0:
+            return PythonObject(from_owned=external_call["yjson_null", PyObjectPtr]())
+        var builder = PythonModuleBuilder("yjson")
         var mod = builder.finalize()
         # The context and key cache live for the whole process: the module is
         # never unloaded, and no Python type is registered (Mojo allows one
@@ -2387,10 +2387,10 @@ def PyInit_mojson() abi("C") -> PythonObject:
         for z in range(1 + 512 * 3):
             (kc + z)[] = 0
         ctx[].kc = Int(kc)
-        if external_call["mojson_install", Int32](Int(mod._obj_ptr), Int(ctx)) != 0:
-            return PythonObject(from_owned=external_call["mojson_null", PyObjectPtr]())
+        if external_call["yjson_install", Int32](Int(mod._obj_ptr), Int(ctx)) != 0:
+            return PythonObject(from_owned=external_call["yjson_null", PyObjectPtr]())
         return mod
     except e:
         var detail = String(e)
-        external_call["mojson_import_error", NoneType](Int(detail.unsafe_ptr()), detail.byte_length())
-        return PythonObject(from_owned=external_call["mojson_null", PyObjectPtr]())
+        external_call["yjson_import_error", NoneType](Int(detail.unsafe_ptr()), detail.byte_length())
+        return PythonObject(from_owned=external_call["yjson_null", PyObjectPtr]())

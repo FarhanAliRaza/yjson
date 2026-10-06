@@ -1,4 +1,4 @@
-"""Paired, alternating mojson/orjson measurements with calibrated batches.
+"""Paired, alternating yjson/orjson measurements with calibrated batches.
 
     python bench/bench_paired.py path/to/jsonexamples --output build/paired.json
 """
@@ -14,15 +14,15 @@ import sys
 import timeit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build"))
-import mojson
+import yjson
 import orjson
 
 
 def measure(name, obj, pairs, batch_seconds):
     expected = orjson.dumps(obj)
-    if mojson.dumps(obj) != expected:
+    if yjson.dumps(obj) != expected:
         raise ValueError(f"Output mismatch: {name}")
-    timers = [timeit.Timer(lambda: orjson.dumps(obj)), timeit.Timer(lambda: mojson.dumps(obj))]
+    timers = [timeit.Timer(lambda: orjson.dumps(obj)), timeit.Timer(lambda: yjson.dumps(obj))]
     for timer in timers:
         timer.timeit(10)
     number = 1
@@ -36,12 +36,12 @@ def measure(name, obj, pairs, batch_seconds):
         times = [0.0, 0.0]
         for index in ((0, 1) if pair % 2 == 0 else (1, 0)):
             times[index] = timers[index].timeit(number) / number
-        samples.append({"orjson_seconds": times[0], "mojson_seconds": times[1], "ratio": times[0] / times[1]})
+        samples.append({"orjson_seconds": times[0], "yjson_seconds": times[1], "ratio": times[0] / times[1]})
     ratios = [sample["ratio"] for sample in samples]
     quartiles = st.quantiles(ratios, n=4)
     return {"name": name, "bytes": len(expected), "iterations_per_batch": number,
             "orjson_us": st.median(s["orjson_seconds"] for s in samples) * 1e6,
-            "mojson_us": st.median(s["mojson_seconds"] for s in samples) * 1e6,
+            "yjson_us": st.median(s["yjson_seconds"] for s in samples) * 1e6,
             "ratio": st.median(ratios), "p25": quartiles[0], "p75": quartiles[2], "samples": samples}
 
 
@@ -67,18 +67,18 @@ def main():
                       ("empty dict", {}), ("int", 123456789), ("float", 0.1),
                       ("short string", "hello world"), ("mixed list", [1, 2.5, None, "x", True])])
     print(f"CPython {platform.python_version()}, orjson {orjson.__version__}, {args.pairs} pairs, >= {args.batch_ms:g} ms/batch", flush=True)
-    print(f"{'file':20} {'orjson us':>11} {'mojson us':>11} {'ratio':>8}   [p25 - p75]", flush=True)
+    print(f"{'file':20} {'orjson us':>11} {'yjson us':>11} {'ratio':>8}   [p25 - p75]", flush=True)
     results = []
     for name, obj in cases:
         gc.collect()
         result = measure(name, obj, args.pairs, args.batch_ms / 1000)
         results.append(result)
-        print(f"{name:20} {result['orjson_us']:11.3f} {result['mojson_us']:11.3f} {result['ratio']:7.2f}x   [{result['p25']:.2f} - {result['p75']:.2f}]", flush=True)
+        print(f"{name:20} {result['orjson_us']:11.3f} {result['yjson_us']:11.3f} {result['ratio']:7.2f}x   [{result['p25']:.2f} - {result['p75']:.2f}]", flush=True)
     geomean = st.geometric_mean(result["ratio"] for result in results[:corpus_count])
-    print(f"CORPUS GEOMEAN: {geomean:.3f}x (>1 = mojson faster)", flush=True)
+    print(f"CORPUS GEOMEAN: {geomean:.3f}x (>1 = yjson faster)", flush=True)
     if args.output:
         report = {"python": platform.python_version(), "platform": platform.platform(),
-                  "orjson": orjson.__version__, "mojson_path": mojson.__file__,
+                  "orjson": orjson.__version__, "yjson_path": yjson.__file__,
                   "affinity": sorted(os.sched_getaffinity(0)), "pairs": args.pairs,
                   "batch_ms": args.batch_ms, "corpus": str(args.corpus.resolve()),
                   "corpus_geomean": geomean, "results": results}

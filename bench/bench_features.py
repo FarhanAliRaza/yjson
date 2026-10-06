@@ -11,7 +11,7 @@ import timeit
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build"))
-import mojson
+import yjson
 import orjson
 
 
@@ -37,11 +37,11 @@ def main():
              ("dataclass", [Record(i, "Ada") for i in range(100)], 0, None),
              ("Enum", [Choice.A] * 100, 0, None), ("default callback", markers, 0, lambda o: "custom")]
     results = []
-    print(f"{'feature (100 items)':22} {'orjson us':>10} {'mojson us':>10} {'ratio':>8}", flush=True)
+    print(f"{'feature (100 items)':22} {'orjson us':>10} {'yjson us':>10} {'ratio':>8}", flush=True)
     for name, value, option, default in cases:
-        assert mojson.dumps(value, option=option, default=default) == orjson.dumps(value, option=option, default=default), name
+        assert yjson.dumps(value, option=option, default=default) == orjson.dumps(value, option=option, default=default), name
         timers = [timeit.Timer(lambda: orjson.dumps(value, option=option, default=default)),
-                  timeit.Timer(lambda: mojson.dumps(value, option=option, default=default))]
+                  timeit.Timer(lambda: yjson.dumps(value, option=option, default=default))]
         for timer in timers:
             timer.timeit(10)
         number = 1
@@ -52,11 +52,11 @@ def main():
             times = [0, 0]
             for index in ((0, 1) if pair % 2 == 0 else (1, 0)):
                 times[index] = timers[index].timeit(number) / number
-            samples.append({"orjson": times[0], "mojson": times[1], "ratio": times[0] / times[1]})
-        a, b = [st.median(s[key] for s in samples) * 1e6 for key in ("orjson", "mojson")]
+            samples.append({"orjson": times[0], "yjson": times[1], "ratio": times[0] / times[1]})
+        a, b = [st.median(s[key] for s in samples) * 1e6 for key in ("orjson", "yjson")]
         ratio = st.median(s["ratio"] for s in samples)
         print(f"{name:22} {a:10.3f} {b:10.3f} {ratio:7.3f}x", flush=True)
-        results.append({"name": name, "orjson_us": a, "mojson_us": b, "ratio": ratio, "samples": samples})
+        results.append({"name": name, "orjson_us": a, "yjson_us": b, "ratio": ratio, "samples": samples})
     Path("build/features-benchmark.json").write_text(json.dumps(results, indent=2) + "\n")
 
 

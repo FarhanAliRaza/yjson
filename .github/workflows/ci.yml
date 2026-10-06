@@ -127,10 +127,10 @@ jobs:
         # env -i: the import must not depend on a python3 on PATH or on any environment variable.
         run: |
           env -i HOME="$HOME" .venv/bin/python - <<'PY'
-          import sys, sysconfig, mojson
-          assert mojson.__file__.startswith(sysconfig.get_paths()["purelib"]), mojson.__file__
-          assert mojson.dumps({"ok": [1, 2.5, None]}) == b'{"ok":[1,2.5,null]}'
-          print(sys.version, mojson.__file__)
+          import sys, sysconfig, yjson
+          assert yjson.__file__.startswith(sysconfig.get_paths()["purelib"]), yjson.__file__
+          assert yjson.dumps({"ok": [1, 2.5, None]}) == b'{"ok":[1,2.5,null]}'
+          print(sys.version, yjson.__file__)
           PY
       - name: Feature tests
         run: .venv/bin/python tests/check_features.py

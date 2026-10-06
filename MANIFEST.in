@@ -1,6 +1,6 @@
 include build.sh
 include THIRD_PARTY_NOTICES.md
-include src/mojson.pyi
+include src/yjson.pyi
 recursive-include src *.mojo *.c *.py *.pyi
 recursive-include tests *.py
 recursive-include examples *.py

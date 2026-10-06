@@ -1,13 +1,13 @@
-"""mojson vs orjson, msgspec, ujson, python-rapidjson, json, simplejson (correctness first, then speed).
+"""yjson vs orjson, msgspec, ujson, python-rapidjson, json, simplejson (correctness first, then speed).
     pip install orjson msgspec ujson python-rapidjson simplejson
     python bench/bench_all_libraries.py path/to/jsonexamples
 Note: results depend on which library ran just before (allocator/cache state); order is rotated each round,
-but prefer bench_paired.py for mojson-vs-orjson numbers."""
+but prefer bench_paired.py for yjson-vs-orjson numbers."""
 import json, math, os, sys, timeit
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "build"))
-import mojson, orjson, msgspec, ujson, rapidjson, simplejson
+import yjson, orjson, msgspec, ujson, rapidjson, simplejson
 enc = msgspec.json.Encoder()
-libs = {"mojson": mojson.dumps, "orjson": orjson.dumps, "msgspec": enc.encode,
+libs = {"yjson": yjson.dumps, "orjson": orjson.dumps, "msgspec": enc.encode,
         "ujson": lambda o: ujson.dumps(o, ensure_ascii=False, escape_forward_slashes=False),
         "rapidjson": lambda o: rapidjson.dumps(o, ensure_ascii=False),
         "json": lambda o: json.dumps(o, ensure_ascii=False, separators=(",", ":")),
@@ -16,7 +16,7 @@ d = sys.argv[1]
 files = sorted(f[:-5] for f in os.listdir(d) if f.endswith(".json"))
 data = {f: json.load(open(os.path.join(d, f + ".json"), encoding="utf-8")) for f in files}
 for f, obj in data.items():
-    assert mojson.dumps(obj) == orjson.dumps(obj), f
+    assert yjson.dumps(obj) == orjson.dumps(obj), f
     for n, fn in libs.items(): assert json.loads(fn(obj)) == obj, (n, f)
 print("correctness OK\n")
 res = {}

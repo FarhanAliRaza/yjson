@@ -1,7 +1,7 @@
 """Build glue for pyproject.toml: compiles the Mojo extension through build.sh.
 
 Everything declarative lives in pyproject.toml. This file only teaches setuptools
-how to produce the `mojson` extension module, which is compiled by Mojo rather
+how to produce the `yjson` extension module, which is compiled by Mojo rather
 than by a C compiler. Requires `mojo` on PATH (`uv sync --only-group mojo`).
 """
 
@@ -17,7 +17,7 @@ from setuptools.command.build_ext import build_ext
 
 ROOT = Path(__file__).resolve().parent
 SOURCES = [
-    "src/mojson.mojo",
+    "src/yjson.mojo",
     "src/python_api.c",
     "src/layout_probe.c",
 ]
@@ -44,10 +44,10 @@ class MojoBuildExt(build_ext):
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(built, target)
         # The stub sits next to the extension module so type checkers find it.
-        shutil.copy2(ROOT / "src" / "mojson.pyi", target.parent / "mojson.pyi")
+        shutil.copy2(ROOT / "src" / "yjson.pyi", target.parent / "yjson.pyi")
 
 
 setup(
-    ext_modules=[Extension("mojson", sources=SOURCES, depends=["build.sh"])],
+    ext_modules=[Extension("yjson", sources=SOURCES, depends=["build.sh"])],
     cmdclass={"build_ext": MojoBuildExt},
 )
