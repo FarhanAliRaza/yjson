@@ -190,6 +190,7 @@ struct Ctx(ImplicitlyCopyable):
     var utc_addr: Int
     var t_uuid: Int
     var uuid_int_off: Int
+    var conv_off: Int   # offset of the default-nesting counter in the C request
 
     def __init__(out self, ready: Bool):
         self.t_str = 0
@@ -211,6 +212,7 @@ struct Ctx(ImplicitlyCopyable):
         self.utc_addr = 0
         self.t_uuid = 0
         self.uuid_int_off = 0
+        self.conv_off = 0
 
     # After yjson_install: the C shim has imported the datetime C API and the uuid module.
     def load_special(mut self):
@@ -220,6 +222,7 @@ struct Ctx(ImplicitlyCopyable):
         self.utc_addr = external_call["yjson_special_types", Int](Int32(3))
         self.t_uuid = external_call["yjson_special_types", Int](Int32(4))
         self.uuid_int_off = external_call["yjson_special_types", Int](Int32(5))
+        self.conv_off = external_call["yjson_special_types", Int](Int32(6))
 
     def load(mut self) raises:
         var bi = Python.import_module("builtins")
@@ -2616,12 +2619,15 @@ def ser_fallback[INDENT: Bool, SORT: Bool, CONFIG: Bool, NONSTR: Bool, SOCKET: B
     if depth > 254:
         bp[].err = 3
         return False
-    if external_call["yjson_enter_fallback", Int32](cp[].request) == 0:
-        return False
+    # default may nest 255 deep; the count lives in the C request (it raises the error)
+    var conversions = Pointer[Int32, MutUntrackedOrigin](unsafe_from_address=cp[].request + cp[].conv_off)
+    if unlikely(conversions[] >= 255):
+        return external_call["yjson_enter_fallback", Int32](cp[].request) != 0
+    conversions[] += 1
     var fragment = Int32(0)
     var converted = external_call["yjson_convert", Int](cp[].request, o, Int(Pointer(to=fragment)), cp[].ancestors, depth)
     if converted == 0:
-        external_call["yjson_leave_fallback", NoneType](cp[].request)
+        conversions[] -= 1
         return False
     var ok: Bool
     if fragment == 1:
@@ -2650,7 +2656,7 @@ def ser_fallback[INDENT: Bool, SORT: Bool, CONFIG: Bool, NONSTR: Bool, SOCKET: B
                 ok = ser_value[NONSTR, SORT, SOCKET, INDENT](bp, cp, converted, depth)
         generation[] += 1
     external_call["Py_DecRef", NoneType](converted)
-    external_call["yjson_leave_fallback", NoneType](cp[].request)
+    conversions[] -= 1
     return ok
 
 # Optional ',' then '\n' and 2*depth spaces, in one reservation and (up to

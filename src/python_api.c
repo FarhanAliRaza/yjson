@@ -256,7 +256,38 @@ typedef struct {
     int tz_cache_next;
     TzCacheEntry dc_cache[TZ_CACHE_SIZE];  /* dataclass types: DC_DICT or DC_FIELDS */
     int dc_cache_next;
+    /* Per type, under a given set of passthrough options: PLAIN_CALLBACK
+       (no built-in conversion: classify/default), PLAIN_ENUM_VALUE (stock
+       Enum: the member's _value_) or PLAIN_ENUM_PROPERTY (its value property). */
+    struct { PyTypeObject *type; long options; int kind; } plain_cache[8];
+    int plain_cache_next;
 } ModuleState;
+#define PLAIN_CACHE_SIZE 8
+#define PLAIN_OPTIONS (256 | 512 | 2048 | 65536)
+enum { PLAIN_CALLBACK = 1, PLAIN_ENUM_VALUE, PLAIN_ENUM_PROPERTY };
+
+static void remember_type(ModuleState *state, PyTypeObject *type, long options, int kind) {
+    for (int i = 0; i < PLAIN_CACHE_SIZE; i++)
+        if (state->plain_cache[i].type == type && state->plain_cache[i].options == options) return;
+    int slot = state->plain_cache_next;
+    state->plain_cache_next = (slot + 1) % PLAIN_CACHE_SIZE;
+    Py_XDECREF(state->plain_cache[slot].type);
+    state->plain_cache[slot].type = (PyTypeObject *)Py_NewRef(type);
+    state->plain_cache[slot].options = options;
+    state->plain_cache[slot].kind = kind;
+}
+
+/* The value of a stock Enum member: _value_ from its dict, else the property. */
+static PyObject *enum_member_value(ModuleState *state, PyObject *obj) {
+    PyObject *dict = PyObject_GenericGetDict(obj, NULL);
+    if (dict) {
+        PyObject *value = PyDict_GetItemWithError(dict, state->value_private_name);  /* borrowed, owned by obj */
+        Py_DECREF(dict);
+        if (value) return Py_NewRef(value);
+    }
+    PyErr_Clear();
+    return PyObject_GetAttr(obj, state->value_name);
+}
 enum { DC_DICT = 1, DC_FIELDS = 2 };
 static ModuleState *module_state;  /* the one module instance (the Mojo context is also per process) */
 
@@ -321,6 +352,7 @@ static void destroy_state(PyObject *capsule) {
     Py_XDECREF(state->normalize_name); Py_XDECREF(state->convert_name); Py_XDECREF(state->dst_name);
     Py_XDECREF(state->value_private_name); Py_XDECREF(state->stock_value_descr);
     for (int i = 0; i < TZ_CACHE_SIZE; i++) { Py_XDECREF(state->tz_cache[i].type); Py_XDECREF(state->dc_cache[i].type); }
+    for (int i = 0; i < PLAIN_CACHE_SIZE; i++) Py_XDECREF(state->plain_cache[i].type);
     if (module_state == state) module_state = NULL;
     PyMem_Free(state);
 }
@@ -703,6 +735,7 @@ uintptr_t yjson_special_types(int which) {
     case 3: return (uintptr_t)PyDateTimeAPI->TimeZone_UTC;
     case 4: return state ? (uintptr_t)state->uuid_type : 0;
     case 5: return state ? (uintptr_t)state->uuid_int_offset : 0;
+    case 6: return offsetof(Request, conversions);  /* the writer keeps the default-nesting count itself */
     default: return 0;
     }
 }
@@ -1167,6 +1200,18 @@ static uintptr_t convert_object(uintptr_t request_ptr, uintptr_t object, int *is
         return (uintptr_t)data;
     }
     *is_fragment = 0;
+    ModuleState *state = request->state;
+    PyTypeObject *type = Py_TYPE(obj);
+    long plain_options = request->option & PLAIN_OPTIONS;
+    for (int i = 0; i < PLAIN_CACHE_SIZE; i++) {
+        if (state->plain_cache[i].type == type && state->plain_cache[i].options == plain_options) {
+            if (!retain_ancestors(request, ancestors_ptr, depth)) return 0;
+            int kind = state->plain_cache[i].kind;
+            if (kind == PLAIN_ENUM_VALUE) return (uintptr_t)enum_member_value(state, obj);
+            if (kind == PLAIN_ENUM_PROPERTY) return (uintptr_t)PyObject_GetAttr(obj, state->value_name);
+            goto callback;
+        }
+    }
     if (!(request->option & 2048) && !PyType_Check(obj)) {
         int kind = dataclass_kind(request->state, Py_TYPE(obj));
         if (kind) {
@@ -1201,21 +1246,13 @@ static uintptr_t convert_object(uintptr_t request_ptr, uintptr_t object, int *is
         if (PyDict_Check(obj)) return (uintptr_t)PyDict_Copy(obj);
     }
     if (PyObject_TypeCheck(obj, (PyTypeObject *)request->state->enum_type)) {
-        ModuleState *state = request->state;
-        /* The stock Enum.value property returns the member's _value_; read it
+        /* The stock Enum.value property returns the member's _value_: read it
            without the Python-level descriptor call. An overridden value
-           property is honored through the normal lookup. */
-        if (state->stock_value_descr && Py_TYPE(obj)->tp_dictoffset != 0
-            && _PyType_Lookup(Py_TYPE(obj), state->value_name) == state->stock_value_descr) {
-            PyObject *dict = PyObject_GenericGetDict(obj, NULL);
-            if (dict) {
-                PyObject *value = PyDict_GetItemWithError(dict, state->value_private_name);  /* borrowed, owned by obj */
-                Py_DECREF(dict);
-                if (value) return (uintptr_t)Py_NewRef(value);
-            }
-            PyErr_Clear();
-        }
-        return (uintptr_t)PyObject_GetAttr(obj, state->value_name);
+           property is honored through the normal lookup. Per type, remembered. */
+        int stock = state->stock_value_descr && type->tp_dictoffset != 0
+            && _PyType_Lookup(type, state->value_name) == state->stock_value_descr;
+        remember_type(state, type, plain_options, stock ? PLAIN_ENUM_VALUE : PLAIN_ENUM_PROPERTY);
+        return (uintptr_t)(stock ? enum_member_value(state, obj) : PyObject_GetAttr(obj, state->value_name));
     }
     /* The Mojo writers take numeric scalars and C-contiguous arrays of the
        supported dtypes directly. datetime64 scalars are formatted here; an
@@ -1238,10 +1275,12 @@ static uintptr_t convert_object(uintptr_t request_ptr, uintptr_t object, int *is
             }
         }
     }
-    int special_datetime = !(request->option & 512) && (PyDate_Check(obj) || PyTime_Check(obj));
-    PyObject *schema = !(request->option & 2048) && !PyType_Check(obj)
-        ? _PyType_Lookup(Py_TYPE(obj), request->state->dataclass_name) : NULL;
-    if (!special_datetime && !schema) {
+    /* datetime subclasses (pendulum, arrow) are formatted by the Python helper; dataclasses returned above. */
+    if (!(!(request->option & 512) && (PyDate_Check(obj) || PyTime_Check(obj)))) {
+        /* Nothing built in applies to this type under these options: remember
+           that. numpy arrays decide per instance (contiguity, dtype), so not them. */
+        if (!(type_name[0] == 'n' && strncmp(type_name, "numpy.", 6) == 0)) remember_type(state, type, plain_options, PLAIN_CALLBACK);
+    callback:
         if (request->classify) {
             PyObject *plan = socket_plan(request, Py_TYPE(obj));
             if (!plan) return 0;
