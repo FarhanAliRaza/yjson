@@ -83,7 +83,7 @@ jobs:
           echo "MOJO_LIB_DIR=$(.venv-mojo/bin/python -c 'import modular; print(modular.__path__[0] + "/lib")')" >> "$GITHUB_ENV"
           .venv-mojo/bin/mojo --version
       - name: Build the wheel from the sdist
-        run: uv build --wheel --python "${{ matrix.python }}" --out-dir dist dist/mojson-*.tar.gz
+        run: uv build --wheel --python "${{ matrix.python }}" --out-dir dist dist/yjson-*.tar.gz
       - name: Bundle the Mojo runtime and set the manylinux tag
         # --disable-isa-ext-check: the extension requires AVX2 (x86-64-v3) by design.
         run: |
@@ -146,7 +146,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/project/mojson/
+      url: https://pypi.org/project/yjson/
     permissions:
       id-token: write  # PyPI trusted publishing (OIDC); no API token needed
     steps:
