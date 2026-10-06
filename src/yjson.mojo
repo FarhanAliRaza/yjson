@@ -1980,11 +1980,14 @@ def int_batch(p: P8, len0: Int, items: Int, i: Int, cnt: Int, t_int: Int) -> Int
         objs[j] = oj
         ok = ok and ob_type(oj) == t_int
     if ok:
+        var lane_tags = SIMD[DType.int, NL](0)
         comptime for j in range(NL):
-            tags |= long_tag(Int(objs[j]))
-        # all compact and non-negative: ndigits <= 1 (bit 3), sign 0/1 (bit 0);
-        # bit 2 is the small-int immortality flag on 3.14+
-        if (tags & ~13) == 0:
+            lane_tags[j] = long_tag(Int(objs[j]))
+            tags |= lane_tags[j]
+        # all compact: ndigits <= 1 (bit 3), sign bits 0-1 (0 positive, 1 zero,
+        # 2 negative); bit 2 is the small-int immortality flag on 3.14+. The
+        # sign is written without a branch, so random signs do not mispredict.
+        if (tags & ~15) == 0:
             if i + 2 * NL <= cnt:
                 comptime for j in range(NL):
                     prefetch[PrefetchOptions().for_read().high_locality()](Pointer[Int, MutUntrackedOrigin](unsafe_from_address=rdi(items, i + NL + j)))
@@ -1994,10 +1997,22 @@ def int_batch(p: P8, len0: Int, items: Int, i: Int, cnt: Int, t_int: Int) -> Int
             if m.lt(U4(100000000)).reduce_and():
                 var nd = ndigits_v(m)
                 var w = eight_digits_x4(m) >> ((U4(8) - nd) * 8)
+                if (tags & 2) == 0:
+                    # no negative in this group: nothing between the comma and the digits
+                    comptime for j in range(NL):
+                        if i + j > 0:
+                            (p + len)[] = 44
+                            len += 1
+                        store8(p, len, w[j])
+                        len += Int(nd[j])
+                    return len
+                var negative = (lane_tags >> 1) & 1
                 comptime for j in range(NL):
                     if i + j > 0:
                         (p + len)[] = 44
                         len += 1
+                    (p + len)[] = 45
+                    len += Int(negative[j])
                     store8(p, len, w[j])
                     len += Int(nd[j])
                 return len
