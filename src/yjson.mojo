@@ -2018,6 +2018,80 @@ def int_batch(p: P8, len0: Int, items: Int, i: Int, cnt: Int, t_int: Int) -> Int
                 return len
     return -1
 
+# M floats (1-4) of a short leaf list, written as one group: the shortest-
+# digit conversions first (independent work the CPU overlaps), then the
+# layouts, as the flat-list batch does. Lanes outside the 16-17 digit case use
+# the generic layout from the same digits; NaN/Infinity/zero take the scalar
+# writer. A comma precedes every lane whose index (j0 + j) is not 0.
+@always_inline
+def float_lanes_at[M: Int](p: P8, len0: Int, inner: Int, j0: Int) -> Int:
+    var len = len0
+    var bits = SIMD[DType.uint64, 4](0)
+    var ig = SIMD[DType.uint64, 4](0)
+    var kk = SIMD[DType.int, 4](0)
+    var last = SIMD[DType.uint64, 4](0)
+    var regular = True
+    comptime for j in range(M):
+        var b = float_bits(rdi(inner, j0 + j))
+        bits[j] = b
+        regular = regular and ((b >> 52) & 0x7FF) != 0x7FF and (b << 1) != 0
+    if likely(regular):
+        comptime for j in range(M):
+            var k = 0
+            var l: UInt64 = 0
+            ig[j] = to_decimal2(bits[j] & 0x7FFFFFFFFFFFFFFF, k, l)
+            kk[j] = k
+            last[j] = l
+        comptime for j in range(M):
+            if j0 + j > 0:
+                (p + len)[] = 44
+                len += 1
+            (p + len)[] = 45
+            var sign = Int(bits[j] >> 63)
+            var g = ig[j]
+            if likely(g >= 100000000000000 and g < 10000000000000000):
+                var he = g >= 1000000000000000
+                var x = g if he else g * 10 + last[j]
+                var hh = x // 100000000
+                var tz = 0
+                var D = to_digits16(hh, x - hh * 100000000, tz)
+                len += float_layout3(p + len, sign, Int(kk[j]), 16 + Int(he), D, tz, (48 + last[j]) if he else UInt64(48))
+            else:
+                len += float_at(p + len, rdi(inner, j0 + j))
+        return len
+    comptime for j in range(M):
+        if j0 + j > 0:
+            (p + len)[] = 44
+            len += 1
+        len += float_at(p + len, rdi(inner, j0 + j))
+    return len
+
+# Two floats (coordinate pairs): the two-lane group, out of line.
+@no_inline
+def float_pair_at(p: P8, len0: Int, inner: Int) -> Int:
+    return float_lanes_at[2](p, len0, inner, 0)
+
+# The floats of a short leaf list (1-16, all floats), in groups of up to four
+# lanes. Out of line so the list loop that calls it stays small.
+@no_inline
+def leaf_floats_at(p: P8, len0: Int, inner: Int, count: Int) -> Int:
+    var len = len0
+    var j = 0
+    while count - j >= 4:
+        len = float_lanes_at[4](p, len, inner, j)
+        j += 4
+    var rest = count - j
+    if rest == 3:
+        len = float_lanes_at[3](p, len, inner, j)
+    elif rest == 2:
+        len = float_lanes_at[2](p, len, inner, j)
+    elif rest == 1:
+        if j > 0:
+            (p + len)[] = 44
+            len += 1
+        len += float_at(p + len, rdi(inner, j))
+    return len
+
 @no_inline
 def float_batch(p: P8, len0: Int, items: Int, i: Int, t_float: Int) -> Int:
     var len = len0
@@ -2327,11 +2401,10 @@ def ser_list[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o_: Origin[mu
                 for j in range(inner_count):
                     numeric = numeric and ob_type(rdi(inner, j)) == t_float
                 if numeric:
-                    for j in range(inner_count):
-                        if j > 0:
-                            (p + len)[] = 44
-                            len += 1
-                        len += float_at(p + len, rdi(inner, j))
+                    if inner_count == 2:
+                        len = float_pair_at(p, len, inner)
+                    else:
+                        len = leaf_floats_at(p, len, inner, inner_count)
                     (p + len)[] = 93
                     len += 1
                     i += 1
@@ -2343,17 +2416,12 @@ def ser_list[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o_: Origin[mu
                     if j > 0:
                         (p + len)[] = 44
                         len += 1
-                    if et == t_float:
-                        len += float_at(p + len, e)
-                    elif et == t_int:
+                    if et == t_int:
                         var r = int_fast(p, len, e)
                         if r < 0:
                             leaf = False
                             break
                         len = r
-                    elif e == none_addr:
-                        store8(p, len, 0x6C6C756E)
-                        len += 4
                     elif et == t_str:
                         var esz = 0
                         var esrc = str_src(e, esz)
@@ -2367,6 +2435,11 @@ def ser_list[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o_: Origin[mu
                             p = bp[].p
                             cap = bp[].cap
                         len = escape_at(p, len, esrc, esz)
+                    elif et == t_float:
+                        len += float_at(p + len, e)
+                    elif e == none_addr:
+                        store8(p, len, 0x6C6C756E)
+                        len += 4
                     elif et == cp[].t_bool:
                         var is_true = e == cp[].true_addr
                         store8(p, len, UInt64(0x65757274) if is_true else UInt64(0x65736C6166))

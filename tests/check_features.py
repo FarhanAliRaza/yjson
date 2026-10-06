@@ -716,6 +716,32 @@ class Features(unittest.TestCase):
         with self.assertRaises(yjson.JSONDecodeError):
             yjson.loads(b"[" * 1025 + b"]" * 1025)
 
+    def test_short_float_lists(self):
+        # Short leaf lists of floats are written in lanes: every digit count, zeros,
+        # subnormals, huge and tiny exponents, and mixtures with other scalars.
+        import random
+        rng = random.Random(16)
+        pool = [0.0, -0.0, 1.0, 0.5, 1e-7, 1e16, 1e300, 5e-324, 2.2250738585072014e-308, 123456.789,
+                -65.61361699999998, 43.42027300000001, 0.1, 1 / 3, 1e22, 9007199254740993.0]
+        def value():
+            kind = rng.random()
+            if kind < 0.5:
+                return rng.uniform(-200, 200)
+            if kind < 0.7:
+                return rng.choice(pool)
+            if kind < 0.85:
+                return float("%.*g" % (rng.randrange(1, 18), rng.uniform(-1e6, 1e6)))
+            return rng.uniform(-1, 1) * 10.0 ** rng.randrange(-300, 300)
+        for _ in range(300):
+            rows = [[value() for _ in range(rng.randrange(1, 17))] for _ in range(rng.randrange(1, 40))]
+            self.same(rows)
+            self.same([tuple(row) for row in rows])
+            mixed = [row[:-1] + [rng.choice((1, "s", None, True, 2.5))] for row in rows]
+            self.same(mixed)
+        self.same([[1.5, 2.5]] * 9)
+        self.same([[1.5, [2.5]], [1.5, 2.5]])
+        self.assertEqual(yjson.dumps([[float("nan"), 1.5], [float("inf"), -0.0]]), b"[[NaN,1.5],[Infinity,-0.0]]")
+
 
 if __name__ == "__main__":
     unittest.main()
