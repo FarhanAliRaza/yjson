@@ -134,10 +134,38 @@ Findings and changes, in the order they were made:
   `OPT_STRICT_INTEGER` and `OPT_PASSTHROUGH_SUBCLASS`.
 
 Not changed, with reasons: the float formatter (already the zmij core, about
-300 instructions per 17-digit value; orjson now uses zmij as well), long and
-escape-heavy strings (memory bound, at parity), and lists mixing `True`,
-`False` and `None` at random (branch mispredictions in the type dispatch,
-0.57×; left as is, since reordering the dispatch would cost the common types).
+300 instructions per 17-digit value; orjson now uses zmij as well), and long
+and escape-heavy strings (memory bound, at parity).
+
+Tried and rejected: a branch-free path for `null`/`true`/`false`. Lists mixing
+`True`, `False` and `None` at random run at 0.57× because the test that
+separates `None` from the bools is a data-dependent branch (homogeneous lists
+of any of the three are at 0.7×, so the rest is the per-element loop cost).
+Choosing the literal with masks and testing both singletons in one non-short-
+circuit expression brought that shape to 1.0×, but the type pointer it needs
+is either a loop-invariant register (which spills the list loop's hot state)
+or a load per element; both variants cost 3% on the corpus in paired runs
+with the roles swapped, so the compact loops keep the branch. Exponential
+back-off after a failed SIMD batch (for lists mixing ints with other types)
+was rejected the same way: one more live counter cost the integer array files
+8%.
+
+### Other libraries
+
+[all-libraries-3.14.txt](python-versions/all-libraries-3.14.txt):
+`bench/bench_all_libraries.py` on 3.14 (best of 21 rotated rounds, CPU 2;
+less robust than the paired method, so mojson's own column differs slightly
+from the paired tables above). Speed relative to orjson, corpus geomean:
+
+| mojson | orjson | msgspec 0.22 | ujson 6.0 | python-rapidjson 1.25 | json (stdlib) | simplejson 4.2 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1.15× | 1.00× | 0.59× | 0.19× | 0.12× | 0.10× | 0.07× |
+
+orjson is the fastest of the other serializers on this workload; msgspec's
+encoder is next. Both read CPython objects directly and use the same class of
+algorithms (zmij floats, SIMD escape scans, direct dict iteration), so the
+remaining differences are in dispatch and per-element overhead rather than in
+a different algorithm.
 
 Corpus, 3.14, before the performance work → current (same process, 40 pairs):
 geometric mean **1.179×**. twitter 1.37×, twitterescaped 1.35×, instruments
