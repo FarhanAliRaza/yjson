@@ -32,7 +32,19 @@ uv run --no-sync --python 3.12 python ../../bench/check_reflex_compat.py
 uv run --no-sync --python 3.12 python ../../bench/check_reflex_native.py
 uv run --no-sync --python 3.12 python ../../bench/bench_reflex.py --batch-ms 25 --output ../socket-reflex-benchmark.json
 uv run --no-sync --python 3.12 python ../../bench/bench_reflex.py --options-only --output ../fix-options.json
+uv run --no-sync --python 3.12 python ../../bench/bench_reflex.py --all-events --batch-ms 25 --output ../reflex-all-events.json
 ```
+
+`--all-events` adds every event workload of the PR's
+`tests/benchmarks/test_event_processing.py` (cold and warm single events,
+bursts of 10 and 100 events on one token and on independent tokens, the
+counter and table batches, and `on_event` router_data preparation), each
+run through the real `BaseStateEventProcessor` with every emitted delta
+encoded by the app's `_sio_dumps`. The fixture's `nested_elements` var is
+quadratic in the counter, so each run resets the counter to its initial
+value, keeping the deltas the size CodSpeed's single round sees. Each row
+also reports the time to encode that run's captured packets alone, and
+its share of the orjson workload time.
 
 Final timing uses 40 alternating paired batches of at least 25 ms, pinned to logical
 CPU 2, with GC enabled. Ratios are the median of each pair's orjson/mojson
