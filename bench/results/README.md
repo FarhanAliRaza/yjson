@@ -268,6 +268,38 @@ type dispatch). Sources are linked from the main README's credits where used.
   simdjson's parsing results (Langdale & Lemire 2019) concern the decoder,
   which mojson delegates to the standard library by design.
 
+## Reflex PR 6116, rerun on the current build
+
+[Reports](python-versions/): `socket-reflex-benchmark-3.12.*`, `reflex-options-3.12.*`.
+Same procedure as [REFLEX.md](../REFLEX.md) (the PR head `f2b00b4` checked out
+with git instead of a source archive, `uv sync --frozen --extra orjson` on
+CPython 3.12.3, orjson 3.12.0), in the cloud container used for the tables
+above, so absolute times are slower than the desktop run below and only the
+ratios compare. Validation before timing: 142 PR codec tests with each
+backend, 14 selected app tests, 8 wire semantic checks (4 byte-identical; the
+rest differ only in float spelling, `1e-07` vs `1e-7`), and 3,000 fuzzed
+native wire packets with the stdlib fallback disabled, all passing.
+
+| Workload | orjson µs | mojson µs | Ratio [quartiles] | Desktop run |
+| --- | ---: | ---: | ---: | ---: |
+| socket encode / 5 rows | 4.28 | 3.00 | 1.43× [1.40–1.47] | 1.64× |
+| socket encode / 500 rows | 183.6 | 59.8 | 3.05× [2.97–3.13] | 3.54× |
+| socket None / 500 rows | 997.9 | 58.6 | 15.9× [15.1–17.3] | 11.65× |
+| socket special values | 27.9 | 3.4 | 8.04× [7.42–8.45] | 6.52× |
+| artifact compact | 92.3 | 77.0 | 1.18× [1.13–1.24] | 1.14× |
+| artifact indent | 102.6 | 87.5 | 1.18× [1.15–1.20] | 0.99× |
+| artifact sorted | 110.2 | 115.5 | 0.95× [0.94–0.98] | 0.98× |
+| wire 3 events / 5 rows | 499.4 | 497.6 | 1.01× [0.99–1.03] | 1.01× |
+| wire 3 events / 500 rows | 3949 | 3493 | 1.12× [1.04–1.20] | 1.18× |
+
+The indented artifact moved from parity to 1.18× with the indent work above.
+The sorted artifact is the one Reflex workload still behind (0.95×): 500 small
+row dicts, each sorted through the native records path, where the per-dict
+C call and reference counting outweigh the sort itself. The stdlib `json`
+rows of the report (0.04–1.25×) are the PR's own fallback codec, kept for
+reference. Options-only run, 500-row native payload: no flags 1.37×,
+passthrough 1.38×, socket flags 2.17× (was 2.22× on the desktop).
+
 ## Reflex PR 6116
 
 [Integration and reproduction details](../REFLEX.md).
