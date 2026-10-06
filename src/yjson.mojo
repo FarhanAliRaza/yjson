@@ -2289,25 +2289,29 @@ def ser_list[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o_: Origin[mu
             len += 4 if is_true else 5
             i += 1
             continue
-        # Short leaf lists of floats (coordinate pairs, small vectors): written
-        # in place, without the nested call and its prologue. Nothing here runs
-        # Python code, so no ancestor or mutation handling.
+        # Short leaf lists of scalars (coordinate pairs, small vectors, rows):
+        # written in place, without the nested call and its prologue. Nothing
+        # here runs Python code, so no ancestor or mutation handling; anything
+        # else inside (a container, a big int, an unknown type) rewinds and
+        # takes the general path.
         if not INDENT and (t == t_list or t == cp[].t_tuple) and depth < 255:
             var inner_count = ob_size(v)
             if inner_count >= 1 and inner_count <= 16:
                 var inner = list_items(v) if t == t_list else tuple_items(v)
+                var start = len
+                var need = inner_count * 27 + 48
+                if unlikely(len + need > cap):
+                    bp[].len = len
+                    bp[].grow(need)
+                    p = bp[].p
+                    cap = bp[].cap
+                (p + len)[] = 91
+                len += 1
+                # all floats (coordinates, vectors): the tightest loop
                 var numeric = True
                 for j in range(inner_count):
                     numeric = numeric and ob_type(rdi(inner, j)) == t_float
                 if numeric:
-                    var need = inner_count * 27 + 8
-                    if unlikely(len + need > cap):
-                        bp[].len = len
-                        bp[].grow(need)
-                        p = bp[].p
-                        cap = bp[].cap
-                    (p + len)[] = 91
-                    len += 1
                     for j in range(inner_count):
                         if j > 0:
                             (p + len)[] = 44
@@ -2317,6 +2321,50 @@ def ser_list[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o_: Origin[mu
                     len += 1
                     i += 1
                     continue
+                var leaf = True
+                for j in range(inner_count):
+                    var e = rdi(inner, j)
+                    var et = ob_type(e)
+                    if j > 0:
+                        (p + len)[] = 44
+                        len += 1
+                    if et == t_float:
+                        len += float_at(p + len, e)
+                    elif et == t_int:
+                        var r = int_fast(p, len, e)
+                        if r < 0:
+                            leaf = False
+                            break
+                        len = r
+                    elif e == none_addr:
+                        store8(p, len, 0x6C6C756E)
+                        len += 4
+                    elif et == t_str:
+                        var esz = 0
+                        var esrc = str_src(e, esz)
+                        if unlikely(esrc == 0):
+                            leaf = False
+                            break
+                        var eneed = esz * 6 + 66
+                        if unlikely(len + eneed > cap):
+                            bp[].len = len
+                            bp[].grow(eneed)
+                            p = bp[].p
+                            cap = bp[].cap
+                        len = escape_at(p, len, esrc, esz)
+                    elif et == cp[].t_bool:
+                        var is_true = e == cp[].true_addr
+                        store8(p, len, UInt64(0x65757274) if is_true else UInt64(0x65736C6166))
+                        len += 4 if is_true else 5
+                    else:
+                        leaf = False
+                        break
+                if leaf:
+                    (p + len)[] = 93
+                    len += 1
+                    i += 1
+                    continue
+                len = start
         bp[].len = len
         if not ser_value[NONSTR, SORT, SOCKET, INDENT](bp, cp, v, depth):
             return False
