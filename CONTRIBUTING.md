@@ -197,6 +197,11 @@ PyPI through [trusted publishing](https://docs.pypi.org/trusted-publishers/) fro
 
 ## Implementation notes
 
+[`docs/decoder-notes.md`](docs/decoder-notes.md) records what was learned building the
+decoder: where decoding time goes, which techniques paid off and which did not, the Mojo port
+and what the Mojo compiler does and does not offer, the encoder's page-fault fix, and how to
+measure without being fooled by the allocator.
+
 - **Object access.** The writers read CPython object layouts directly (type pointers, list
   and tuple items, compact ints, float bits, str data), call the C API through
   `external_call` only where needed, and write straight into a `bytes` object.
