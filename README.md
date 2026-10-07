@@ -275,7 +275,7 @@ cover every document, per-shape measurements, other libraries and the Reflex ben
 explains how to measure your own payloads.
 
 Parsing the same corpus with `loads`, the speedup over `orjson.loads` on CPython 3.13 ranges
-from 0.88× (`numbers.json`) to 1.95× (`gsoc-2018.json`), with a geometric mean of 1.10× over
+from 0.91× (`numbers.json`) to 1.91× (`gsoc-2018.json`), with a geometric mean of 1.16× over
 the 14 documents; `json.loads` is 2–5× slower than either. Measured with
 `bench/bench_loads.py` in 20 alternating pairs per document on a shared cloud machine, so
 differences under about 5% are noise.
@@ -285,12 +285,12 @@ Decoding 1,000 records of nine fields with a nested object into objects, with
 
 | Decoder | Result | Per call |
 | --- | --- | ---: |
-| `orjson.loads`, then dataclasses built by hand | dataclasses | 2.76 ms |
-| `yjson.loads` | dicts | 0.77 ms |
-| `yjson.loads(type=list[Record])` | dataclasses | 0.64 ms |
-| `yjson.loads(type=list[Record])`, `slots=True` | slotted dataclasses | 0.51 ms |
-| msgspec with `list[Record]` | dataclasses | 0.86 ms |
-| msgspec with a `Struct` | Structs | 0.52 ms |
+| `orjson.loads`, then dataclasses built by hand | dataclasses | 2.78 ms |
+| `yjson.loads` | dicts | 0.69 ms |
+| `yjson.loads(type=list[Record])` | dataclasses | 0.61 ms |
+| `yjson.loads(type=list[Record])`, `slots=True` | slotted dataclasses | 0.48 ms |
+| msgspec with `list[Record]` | dataclasses | 0.83 ms |
+| msgspec with a `Struct` | Structs | 0.51 ms |
 
 Across the 14 corpus documents, with a schema inferred from each, slotted dataclasses decode
 1.11× faster than msgspec's Structs (geometric mean), from 0.97× on `marine_ik.json` to
@@ -310,12 +310,15 @@ strings are escaped with a 64-byte SIMD scan. Output is written straight into th
 `bytes` object.
 
 `loads` is a separate recursive-descent parser in C (`src/decoder.c`) that shares no code with
-the encoder. It scans strings 16 bytes at a time, builds `str` objects straight from the input
-(plain ASCII by copy, anything else through CPython's UTF-8 decoder, which also validates it),
-reuses recently seen object keys from a cache so repeated keys share one `str` and its hash,
-and parses floats with the [Eisel-Lemire](https://arxiv.org/abs/2101.11408) algorithm as
-implemented in [fast_float](https://github.com/fastfloat/fast_float), falling back to
-CPython's `strtod` for numbers with more than 19 significant digits.
+the encoder. It scans strings and runs of indentation 16 bytes at a time, builds `str` objects
+straight from the input (plain ASCII by copy, anything else through CPython's UTF-8 decoder,
+which also validates it), and reuses recently seen object keys from a cache so repeated keys
+share one `str` and its hash; since objects of one shape list their keys in the same order,
+each key is first compared with the one that followed the previous key last time, and only a
+miss hashes. Numbers are read with one unrolled step per digit, floats with the
+[Eisel-Lemire](https://arxiv.org/abs/2101.11408) algorithm as implemented in
+[fast_float](https://github.com/fastfloat/fast_float), falling back to CPython's `strtod`
+for numbers with more than 19 significant digits.
 
 ## Limitations
 

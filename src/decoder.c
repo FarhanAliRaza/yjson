@@ -70,6 +70,8 @@ typedef struct {
 
 static PyObject *decode_error_type;              /* yjson.JSONDecodeError */
 static PyObject *key_cache[KEY_CACHE_SLOTS];     /* recently seen ASCII object keys */
+static uint16_t next_slot[KEY_CACHE_SLOTS];      /* the cache slot of the key that last followed each key */
+static int last_slot = -1;                       /* the slot of the previous key, or -1 */
 
 static PyObject *fail(Parser *p, const char *message, const unsigned char *at) {
     p->error = message;
@@ -90,9 +92,31 @@ static PyObject *failf(Parser *p, const unsigned char *at, const char *format, .
 static inline int is_space(unsigned char c) { return c == ' ' || c == '\n' || c == '\r' || c == '\t'; }
 static inline int is_digit(unsigned char c) { return (unsigned)(c - '0') < 10; }
 
-static inline const unsigned char *skip_space(const unsigned char *c, const unsigned char *end) {
+/* Long runs of whitespace (indentation) 16 bytes at a time; kept out of line so the
+   common cases stay small where they are inlined. */
+static __attribute__((noinline)) const unsigned char *skip_space_run(const unsigned char *c, const unsigned char *end) {
+    if (c >= end || !is_space(*c)) return c;  /* a single space after a comma or colon */
+    c++;
+    if (c >= end || !is_space(*c)) return c;
+    c++;
+    const __m128i space = _mm_set1_epi8(' '), newline = _mm_set1_epi8('\n'), carriage = _mm_set1_epi8('\r'), tab = _mm_set1_epi8('\t');
+    while (end - c >= 16) {
+        __m128i v = _mm_loadu_si128((const __m128i *)c);
+        __m128i white = _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(v, space), _mm_cmpeq_epi8(v, newline)),
+                                     _mm_or_si128(_mm_cmpeq_epi8(v, carriage), _mm_cmpeq_epi8(v, tab)));
+        int mask = ~_mm_movemask_epi8(white) & 0xFFFF;
+        if (mask) return c + __builtin_ctz(mask);
+        c += 16;
+    }
     while (c < end && is_space(*c)) c++;
     return c;
+}
+
+/* Whitespace is usually absent (compact documents) or a single space after a comma
+   or colon; those cases are decided in one or two byte checks. */
+static inline const unsigned char *skip_space(const unsigned char *c, const unsigned char *end) {
+    if (c >= end || !is_space(*c)) return c;
+    return skip_space_run(c + 1, end);
 }
 
 /* First byte that is '"', '\\' or a control character, or `end`. With `strict`,
@@ -275,23 +299,38 @@ static inline uint64_t key_hash(const unsigned char *s, size_t n) {
 }
 
 /* Object keys: short ASCII keys without escapes come from a cache, so repeated
-   keys share one str object and its cached hash. */
+   keys share one str object and its cached hash. Objects of the same shape list
+   their keys in the same order, so the key that followed the previous key last
+   time is tried first, by a direct compare; only a miss hashes. */
 static PyObject *parse_key(Parser *p) {
     const unsigned char *start = p->cur + 1, *end = p->end;
     const unsigned char *special = scan(start, end, 1);
     Py_ssize_t length = special - start;
     if (special >= end || *special != '"' || length > KEY_CACHE_MAX_LENGTH) return string_from(p, start, special);
-    PyObject **slot = &key_cache[key_hash(start, (size_t)length) & (KEY_CACHE_SLOTS - 1)];
-    PyObject *cached = *slot;
-    if (cached && PyUnicode_GET_LENGTH(cached) == length && memcmp(PyUnicode_1BYTE_DATA(cached), start, (size_t)length) == 0) {
-        p->cur = special + 1;
-        return Py_NewRef(cached);
+    int index;
+    PyObject *cached;
+    if (last_slot >= 0) {
+        index = next_slot[last_slot];
+        cached = key_cache[index];
+        if (cached && PyUnicode_GET_LENGTH(cached) == length && memcmp(PyUnicode_1BYTE_DATA(cached), start, (size_t)length) == 0) {
+            last_slot = index;
+            p->cur = special + 1;
+            return Py_NewRef(cached);
+        }
     }
-    PyObject *key = ascii_string(start, length);
-    if (!key) return NULL;
-    Py_XSETREF(*slot, Py_NewRef(key));
+    index = (int)(key_hash(start, (size_t)length) & (KEY_CACHE_SLOTS - 1));
+    cached = key_cache[index];
+    if (!(cached && PyUnicode_GET_LENGTH(cached) == length && memcmp(PyUnicode_1BYTE_DATA(cached), start, (size_t)length) == 0)) {
+        cached = ascii_string(start, length);
+        if (!cached) return NULL;
+        Py_XSETREF(key_cache[index], Py_NewRef(cached));
+    } else {
+        Py_INCREF(cached);
+    }
+    if (last_slot >= 0) next_slot[last_slot] = (uint16_t)index;
+    last_slot = index;
     p->cur = special + 1;
-    return key;
+    return cached;
 }
 
 /* --- numbers -------------------------------------------------------------- */
@@ -375,53 +414,57 @@ static PyObject *float_from_text(Parser *p, const unsigned char *start, const un
     return PyFloat_FromDouble(value);
 }
 
-static PyObject *parse_number(Parser *p) {
-    const unsigned char *start = p->cur, *c = start, *end = p->end;
-    int negative = 0;
-    if (*c == '-') {
-        negative = 1;
-        if (++c >= end) return fail(p, MSG_EOF, end);
+/* The value of `count` ASCII digits already known to be digits. */
+static inline uint64_t digits_value(const unsigned char *c, Py_ssize_t count) {
+    uint64_t value = 0;
+    while (count >= 8) {
+        uint64_t word;
+        memcpy(&word, c, 8);
+        value = value * 100000000 + eight_digits_value(word);
+        c += 8;
+        count -= 8;
     }
-    uint64_t mantissa = 0;
-    int digits = 0, inexact = 0, is_float = 0, exponent = 0;
+    while (count--) value = value * 10 + (*c++ - '0');
+    return value;
+}
+
+static const uint64_t powers_of_ten[20] = {
+    1ULL, 10ULL, 100ULL, 1000ULL, 10000ULL, 100000ULL, 1000000ULL, 10000000ULL, 100000000ULL, 1000000000ULL,
+    10000000000ULL, 100000000000ULL, 1000000000000ULL, 10000000000000ULL, 100000000000000ULL, 1000000000000000ULL,
+    10000000000000000ULL, 100000000000000000ULL, 1000000000000000000ULL, 10000000000000000000ULL,
+};
+
+/* The end of a run of digits starting at c. */
+static inline const unsigned char *scan_digits(const unsigned char *c, const unsigned char *end) {
+    uint64_t word;
+    while (eight_digits(c, end, &word)) c += 8;
+    while (c < end && is_digit(*c)) c++;
+    return c;
+}
+
+/* Numbers of any length: scanned first and converted after. The common case takes the
+   unrolled parse_number below and comes here only with 20 or more digits. */
+static PyObject *parse_number_slow(Parser *p) {
+    const unsigned char *start = p->cur, *c = start, *end = p->end;
+    int negative = *c == '-';
+    if (negative && ++c >= end) return fail(p, MSG_EOF, end);
+    const unsigned char *int_start = c;
     if (*c == '0') {
         c++;
         if (c < end && is_digit(*c)) return fail(p, "number with leading zero is not allowed", start);
     } else if (is_digit(*c)) {
-        uint64_t word;
-        while (digits + 8 <= 19 && eight_digits(c, end, &word)) {
-            mantissa = mantissa * 100000000 + eight_digits_value(word);
-            digits += 8;
-            c += 8;
-        }
-        while (c < end && is_digit(*c)) {
-            unsigned d = *c - '0';
-            if (digits < 19) mantissa = mantissa * 10 + d;
-            else if (digits == 19 && mantissa <= (UINT64_MAX - d) / 10) mantissa = mantissa * 10 + d;
-            else inexact = 1;
-            digits++;
-            c++;
-        }
+        c = scan_digits(c + 1, end);
     } else {
         return fail(p, negative ? "no digit after sign" : MSG_VALUE, start);
     }
+    const unsigned char *int_end = c, *frac_start = c, *frac_end = c;
+    int is_float = 0, exponent = 0;
     if (c < end && *c == '.') {
         is_float = 1;
         if (++c >= end) return fail(p, MSG_EOF, end);
         if (!is_digit(*c)) return fail(p, "unexpected character in number, expected a digit", c);
-        uint64_t word;
-        while (digits + 8 <= 19 && eight_digits(c, end, &word)) {
-            mantissa = mantissa * 100000000 + eight_digits_value(word);
-            exponent -= 8;
-            digits += 8;
-            c += 8;
-        }
-        while (c < end && is_digit(*c)) {
-            unsigned d = *c - '0';
-            if (digits < 19) { mantissa = mantissa * 10 + d; exponent--; digits++; }
-            else inexact = 1;
-            c++;
-        }
+        frac_start = c;
+        c = frac_end = scan_digits(c + 1, end);
     }
     if (c < end && (*c == 'e' || *c == 'E')) {
         is_float = 1;
@@ -440,24 +483,117 @@ static PyObject *parse_number(Parser *p) {
         exponent += sign * e;
     }
     p->cur = c;
-    if (!is_float && !inexact) {
+    Py_ssize_t int_digits = int_end - int_start, frac_digits = frac_end - frac_start;
+    if (int_digits + frac_digits > 19) {
+        /* Trailing zeros of the fraction and leading zeros of the integer part carry no value. */
+        while (frac_digits > 0 && frac_end[-1] == '0') { frac_end--; frac_digits--; }
+        while (int_digits > 1 && *int_start == '0') { int_start++; int_digits--; }
+    }
+    uint64_t mantissa;
+    if (int_digits + frac_digits <= 19) {
+        mantissa = digits_value(int_start, int_digits);
+        if (frac_digits) mantissa = mantissa * powers_of_ten[frac_digits] + digits_value(frac_start, frac_digits);
+        exponent -= (int)frac_digits;
+    } else if (!is_float && int_digits == 20) {
+        mantissa = digits_value(int_start, 19);
+        unsigned last = int_start[19] - '0';
+        if (mantissa > (UINT64_MAX - last) / 10) return float_from_text(p, start, c);
+        mantissa = mantissa * 10 + last;
+    } else {
+        return float_from_text(p, start, c);  /* more than 19 significant digits: CPython's strtod decides */
+    }
+    if (!is_float) {
         if (!negative) return mantissa <= (uint64_t)LLONG_MAX ? PyLong_FromLongLong((long long)mantissa) : PyLong_FromUnsignedLongLong(mantissa);
         if (mantissa < (uint64_t)1 << 63) return PyLong_FromLongLong(-(long long)mantissa);
         if (mantissa == (uint64_t)1 << 63) return PyLong_FromLongLong(LLONG_MIN);
+        return float_from_text(p, start, c);
     }
-    if (!inexact) {
-        double value;
-        if (mantissa <= ((uint64_t)1 << 53) && exponent >= -22 && exponent <= 22) {
-            /* Clinger's fast path: the mantissa and the power of ten are exact doubles, so
-               one multiplication or division rounds correctly. */
-            value = (double)mantissa;
-            value = exponent < 0 ? value / exact_powers_of_ten[-exponent] : value * exact_powers_of_ten[exponent];
-            return PyFloat_FromDouble(negative ? -value : value);
-        }
-        if (eisel_lemire(mantissa, exponent, &value)) return PyFloat_FromDouble(negative ? -value : value);
+    double value;
+    if (mantissa <= ((uint64_t)1 << 53) && exponent >= -22 && exponent <= 22) {
+        /* Clinger's fast path: the mantissa and the power of ten are exact doubles, so
+           one multiplication or division rounds correctly. */
+        value = (double)mantissa;
+        value = exponent < 0 ? value / exact_powers_of_ten[-exponent] : value * exact_powers_of_ten[exponent];
+        return PyFloat_FromDouble(negative ? -value : value);
     }
-    /* More than 19 significant digits, or an infinite result: CPython's strtod decides. */
-    return float_from_text(p, start, c);
+    if (eisel_lemire(mantissa, exponent, &value)) return PyFloat_FromDouble(negative ? -value : value);
+    return float_from_text(p, start, c);  /* infinite */
+}
+
+/* A number of at most 19 digits, read with one unrolled step per digit; the input
+   buffer's terminating NUL stops the chain at the end of the document. The integer
+   and fraction digits accumulate into one mantissa; their counts are set at the
+   exits, so the steps carry no counter. 20 or more digits restart in the slow path. */
+#define INT_STEP(i) \
+    if (!is_digit(c[i])) { int_digits = i; c += i; goto int_done; } \
+    mantissa = mantissa * 10 + (c[i] - '0');
+#define FRAC_STEP(i) \
+    if (!is_digit(c[i])) { frac_digits = i; c += i; goto frac_done; } \
+    mantissa = mantissa * 10 + (c[i] - '0');
+
+static PyObject *parse_number(Parser *p) {
+    const unsigned char *start = p->cur, *c = start;
+    int negative = *c == '-';
+    c += negative;
+    uint64_t mantissa;
+    int int_digits, frac_digits = 0, exponent = 0, is_float = 0;
+    if (*c == '0') {
+        if (is_digit(c[1])) return fail(p, "number with leading zero is not allowed", start);
+        mantissa = 0;
+        int_digits = 1;
+        c++;
+    } else {
+        if (!is_digit(*c)) return fail(p, negative ? "no digit after sign" : (c < p->end ? MSG_VALUE : MSG_EOF), c < p->end ? start : p->end);
+        mantissa = *c - '0';
+        INT_STEP(1) INT_STEP(2) INT_STEP(3) INT_STEP(4) INT_STEP(5) INT_STEP(6) INT_STEP(7) INT_STEP(8) INT_STEP(9)
+        INT_STEP(10) INT_STEP(11) INT_STEP(12) INT_STEP(13) INT_STEP(14) INT_STEP(15) INT_STEP(16) INT_STEP(17) INT_STEP(18)
+        if (is_digit(c[19])) return parse_number_slow(p);
+        int_digits = 19;
+        c += 19;
+    }
+int_done:
+    if (*c == '.') {
+        is_float = 1;
+        c++;
+        if (!is_digit(*c)) return c < p->end ? fail(p, "unexpected character in number, expected a digit", c) : fail(p, MSG_EOF, p->end);
+        mantissa = mantissa * 10 + (*c - '0');
+        FRAC_STEP(1) FRAC_STEP(2) FRAC_STEP(3) FRAC_STEP(4) FRAC_STEP(5) FRAC_STEP(6) FRAC_STEP(7) FRAC_STEP(8) FRAC_STEP(9)
+        FRAC_STEP(10) FRAC_STEP(11) FRAC_STEP(12) FRAC_STEP(13) FRAC_STEP(14) FRAC_STEP(15) FRAC_STEP(16) FRAC_STEP(17) FRAC_STEP(18)
+        if (is_digit(c[19])) return parse_number_slow(p);
+        frac_digits = 19;
+        c += 19;
+    }
+frac_done:
+    if (int_digits + frac_digits > 19) return parse_number_slow(p);
+    if (*c == 'e' || *c == 'E') {
+        is_float = 1;
+        c++;
+        int sign = 1;
+        if (*c == '+' || *c == '-') sign = *c++ == '-' ? -1 : 1;
+        if (!is_digit(*c)) return c < p->end ? fail(p, "unexpected character in number, expected a digit", c) : fail(p, MSG_EOF, p->end);
+        int e = 0;
+        do {
+            if (e < 100000) e = e * 10 + (*c - '0');
+            c++;
+        } while (is_digit(*c));
+        exponent = sign * e;
+    }
+    p->cur = c;
+    exponent -= frac_digits;
+    if (!is_float) {
+        if (!negative) return mantissa <= (uint64_t)LLONG_MAX ? PyLong_FromLongLong((long long)mantissa) : PyLong_FromUnsignedLongLong(mantissa);
+        if (mantissa < (uint64_t)1 << 63) return PyLong_FromLongLong(-(long long)mantissa);
+        if (mantissa == (uint64_t)1 << 63) return PyLong_FromLongLong(LLONG_MIN);
+        return float_from_text(p, start, c);
+    }
+    double value;
+    if (mantissa <= ((uint64_t)1 << 53) && exponent >= -22 && exponent <= 22) {
+        value = (double)mantissa;
+        value = exponent < 0 ? value / exact_powers_of_ten[-exponent] : value * exact_powers_of_ten[exponent];
+        return PyFloat_FromDouble(negative ? -value : value);
+    }
+    if (eisel_lemire(mantissa, exponent, &value)) return PyFloat_FromDouble(negative ? -value : value);
+    return float_from_text(p, start, c);  /* infinite */
 }
 
 /* --- containers ----------------------------------------------------------- */
@@ -477,6 +613,7 @@ static int push(Parser *p, PyObject *value) {
 }
 
 static PyObject *parse_value(Parser *p);
+static inline PyObject *parse_at(Parser *p, const unsigned char *c);
 static PyObject *parse_typed(Parser *p, const Plan *plan);
 
 /* `item` types the elements when loads() was given a type; NULL parses them untyped. */
@@ -492,7 +629,8 @@ static PyObject *parse_array(Parser *p, const Plan *item) {
     Py_ssize_t base = p->stack_len;
     for (;;) {
         p->cur = c;
-        PyObject *value = item ? parse_typed(p, item) : parse_value(p);
+        if (c >= end) return fail(p, MSG_EOF, end);
+        PyObject *value = item ? parse_typed(p, item) : parse_at(p, c);
         if (!value || !push(p, value)) return NULL;  /* loads() releases the stack */
         c = skip_space(p->cur, end);
         if (c >= end) return fail(p, MSG_EOF, end);
@@ -535,8 +673,10 @@ static PyObject *parse_object(Parser *p, const Plan *item) {
         c = skip_space(p->cur, end);
         if (c >= end) { Py_DECREF(key); fail(p, MSG_EOF, end); break; }
         if (*c != ':') { Py_DECREF(key); fail(p, "unexpected character, expected ':' after key", c); break; }
-        p->cur = c + 1;
-        PyObject *value = item ? parse_typed(p, item) : parse_value(p);
+        c = skip_space(c + 1, end);
+        p->cur = c;
+        if (c >= end) { Py_DECREF(key); fail(p, MSG_EOF, end); break; }
+        PyObject *value = item ? parse_typed(p, item) : parse_at(p, c);
         if (!value) { Py_DECREF(key); break; }
         int status = PyDict_SetItem(dict, key, value);
         Py_DECREF(key);
@@ -572,10 +712,8 @@ static PyObject *parse_literal(Parser *p, const char *word, int length, PyObject
     return fail(p, MSG_VALUE, p->cur);
 }
 
-static PyObject *parse_value(Parser *p) {
-    const unsigned char *c = skip_space(p->cur, p->end);
-    p->cur = c;
-    if (c >= p->end) return fail(p, MSG_EOF, p->end);
+/* The value starting at c, which p->cur already points at and which is not past the end. */
+static inline PyObject *parse_at(Parser *p, const unsigned char *c) {
     switch (*c) {
     case '"': return parse_string(p);
     case '{': return parse_object(p, NULL);
@@ -587,6 +725,13 @@ static PyObject *parse_value(Parser *p) {
         return parse_number(p);
     default: return fail(p, MSG_VALUE, c);
     }
+}
+
+static PyObject *parse_value(Parser *p) {
+    const unsigned char *c = skip_space(p->cur, p->end);
+    p->cur = c;
+    if (c >= p->end) return fail(p, MSG_EOF, p->end);
+    return parse_at(p, c);
 }
 
 
@@ -1021,6 +1166,7 @@ static PyObject *loads(PyObject *self, PyObject *const *args, Py_ssize_t nargs, 
     Py_buffer view;
     int has_view = 0;
     PyObject *source = NULL;  /* the input when it is already a str */
+    PyObject *copy = NULL;    /* a memoryview's bytes */
     if (PyUnicode_CheckExact(obj)) {
         data = (const unsigned char *)PyUnicode_AsUTF8AndSize(obj, &length);
         if (!data) {
@@ -1033,15 +1179,24 @@ static PyObject *loads(PyObject *self, PyObject *const *args, Py_ssize_t nargs, 
     } else if (PyBytes_CheckExact(obj)) {
         data = (const unsigned char *)PyBytes_AS_STRING(obj);
         length = PyBytes_GET_SIZE(obj);
-    } else if (PyByteArray_CheckExact(obj) || PyMemoryView_Check(obj)) {
+    } else if (PyByteArray_CheckExact(obj)) {
+        /* Exporting the buffer stops the bytearray from being resized by user code the
+           typed path runs (default factories, __post_init__); the NUL after its bytes stays. */
+        if (PyObject_GetBuffer(obj, &view, PyBUF_SIMPLE) < 0) return NULL;
+        has_view = 1;
+        data = view.buf;
+        length = view.len;
+    } else if (PyMemoryView_Check(obj)) {
         if (PyObject_GetBuffer(obj, &view, PyBUF_SIMPLE) < 0) {
             PyErr_Clear();
             raise_decode_error("Input memoryview must be contiguous", NULL, (const unsigned char *)"", 0, 0);
             return NULL;
         }
-        has_view = 1;
-        data = view.buf;
-        length = view.len;
+        copy = PyBytes_FromStringAndSize(view.buf, view.len);  /* NUL-terminated and immutable */
+        PyBuffer_Release(&view);
+        if (!copy) return NULL;
+        data = (const unsigned char *)PyBytes_AS_STRING(copy);
+        length = PyBytes_GET_SIZE(copy);
     } else {
         raise_decode_error("Input must be bytes, bytearray, memoryview, or str", NULL, (const unsigned char *)"", 0, 0);
         return NULL;
@@ -1079,6 +1234,7 @@ static PyObject *loads(PyObject *self, PyObject *const *args, Py_ssize_t nargs, 
     PyMem_Free(p.scratch);
     if (!result && p.error) raise_decode_error(p.error, source, data, length, p.error_at);
     if (has_view) PyBuffer_Release(&view);
+    Py_XDECREF(copy);
     return result;
 }
 
