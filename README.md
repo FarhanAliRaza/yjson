@@ -307,7 +307,9 @@ checked against live objects at import, so an unsupported interpreter fails with
 [Żmij](https://github.com/vitaut/zmij) shortest round-trip algorithm, integers with an
 [itoap](https://github.com/Kogia-sima/itoap)-style writer in 4-wide SIMD batches, and
 strings are escaped with a 64-byte SIMD scan. Output is written straight into the resulting
-`bytes` object.
+`bytes` object, which grows by doubling; a result above 1 MB keeps that allocation (up to
+twice its length) rather than being shrunk in place, as orjson's does, because shrinking
+left glibc mapping fresh pages for every call on large documents.
 
 `loads` is a separate recursive-descent parser in C (`src/decoder.c`) that shares no code with
 the encoder. It scans strings and runs of indentation 16 bytes at a time, builds `str` objects
