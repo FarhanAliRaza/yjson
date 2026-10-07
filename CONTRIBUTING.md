@@ -121,6 +121,7 @@ Build first and fetch the corpus. Every script compares against orjson;
 | `bench/bench_numpy.py` | NumPy arrays, also against `json.dumps(a.tolist())`. |
 | `bench/bench_all_libraries.py CORPUS` | msgspec, ujson, python-rapidjson, `json` and simplejson as well. |
 | `bench/bench_regression.py` | The current build against a baseline build in `build/baseline/`. |
+| `bench/mojo_decoder/` | The decoder ported to Mojo, with a build script and a comparison against the C decoder; an experiment, not part of the package (see its README). |
 
 `bench_paired.py` checks that both libraries produce the same output, warms them up,
 calibrates a common batch size of at least 10 ms, and alternates their order across 40
