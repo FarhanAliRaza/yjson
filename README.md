@@ -275,7 +275,7 @@ cover every document, per-shape measurements, other libraries and the Reflex ben
 explains how to measure your own payloads.
 
 Parsing the same corpus with `loads`, the speedup over `orjson.loads` on CPython 3.13 ranges
-from 0.91× (`numbers.json`) to 1.91× (`gsoc-2018.json`), with a geometric mean of 1.16× over
+from 0.98× (`numbers.json`) to 2.04× (`gsoc-2018.json`), with a geometric mean of 1.20× over
 the 14 documents; `json.loads` is 2–5× slower than either. Measured with
 `bench/bench_loads.py` in 20 alternating pairs per document on a shared cloud machine, so
 differences under about 5% are noise.
@@ -315,7 +315,9 @@ straight from the input (plain ASCII by copy, anything else through CPython's UT
 which also validates it), and reuses recently seen object keys from a cache so repeated keys
 share one `str` and its hash; since objects of one shape list their keys in the same order,
 each key is first compared with the one that followed the previous key last time, and only a
-miss hashes. Numbers are read with one unrolled step per digit, floats with the
+miss hashes. Numbers are read eight digits at a time where a word of digits is present and one unrolled
+step per digit otherwise, and arrays of numbers take a loop of their own without per-value
+dispatch; floats use the
 [Eisel-Lemire](https://arxiv.org/abs/2101.11408) algorithm as implemented in
 [fast_float](https://github.com/fastfloat/fast_float), falling back to CPython's `strtod`
 for numbers with more than 19 significant digits.

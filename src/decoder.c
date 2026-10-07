@@ -523,20 +523,22 @@ static PyObject *parse_number_slow(Parser *p) {
 /* A number of at most 19 digits, read with one unrolled step per digit; the input
    buffer's terminating NUL stops the chain at the end of the document. The integer
    and fraction digits accumulate into one mantissa; their counts are set at the
-   exits, so the steps carry no counter. 20 or more digits restart in the slow path. */
+   exits, so the steps carry no counter. Eight digits at a time are taken first
+   where a word of digits is present. 20 or more digits restart in the slow path.
+   `start` is the number's first byte; on success *stop receives the byte after it. */
 #define INT_STEP(i) \
-    if (!is_digit(c[i])) { int_digits = i; c += i; goto int_done; } \
+    if (!is_digit(c[i])) { int_digits += i; c += i; goto int_done; } \
     mantissa = mantissa * 10 + (c[i] - '0');
 #define FRAC_STEP(i) \
-    if (!is_digit(c[i])) { frac_digits = i; c += i; goto frac_done; } \
+    if (!is_digit(c[i])) { frac_digits += i; c += i; goto frac_done; } \
     mantissa = mantissa * 10 + (c[i] - '0');
 
-static PyObject *parse_number(Parser *p) {
-    const unsigned char *start = p->cur, *c = start;
+static inline PyObject *parse_number_at(Parser *p, const unsigned char *start, const unsigned char **stop) {
+    const unsigned char *c = start;
     int negative = *c == '-';
     c += negative;
-    uint64_t mantissa;
-    int int_digits, frac_digits = 0, exponent = 0, is_float = 0;
+    uint64_t mantissa, word;
+    int int_digits = 0, frac_digits = 0, exponent = 0, is_float = 0;
     if (*c == '0') {
         if (is_digit(c[1])) return fail(p, "number with leading zero is not allowed", start);
         mantissa = 0;
@@ -547,8 +549,8 @@ static PyObject *parse_number(Parser *p) {
         mantissa = *c - '0';
         INT_STEP(1) INT_STEP(2) INT_STEP(3) INT_STEP(4) INT_STEP(5) INT_STEP(6) INT_STEP(7) INT_STEP(8) INT_STEP(9)
         INT_STEP(10) INT_STEP(11) INT_STEP(12) INT_STEP(13) INT_STEP(14) INT_STEP(15) INT_STEP(16) INT_STEP(17) INT_STEP(18)
-        if (is_digit(c[19])) return parse_number_slow(p);
-        int_digits = 19;
+        if (is_digit(c[19])) goto slow;
+        int_digits += 19;
         c += 19;
     }
 int_done:
@@ -557,14 +559,19 @@ int_done:
         c++;
         if (!is_digit(*c)) return c < p->end ? fail(p, "unexpected character in number, expected a digit", c) : fail(p, MSG_EOF, p->end);
         mantissa = mantissa * 10 + (*c - '0');
+        if (eight_digits(c + 1, p->end, &word)) {
+            mantissa = mantissa * 100000000 + eight_digits_value(word);
+            c += 8;
+            frac_digits = 8;
+        }
         FRAC_STEP(1) FRAC_STEP(2) FRAC_STEP(3) FRAC_STEP(4) FRAC_STEP(5) FRAC_STEP(6) FRAC_STEP(7) FRAC_STEP(8) FRAC_STEP(9)
         FRAC_STEP(10) FRAC_STEP(11) FRAC_STEP(12) FRAC_STEP(13) FRAC_STEP(14) FRAC_STEP(15) FRAC_STEP(16) FRAC_STEP(17) FRAC_STEP(18)
-        if (is_digit(c[19])) return parse_number_slow(p);
-        frac_digits = 19;
+        if (is_digit(c[19])) goto slow;
+        frac_digits += 19;
         c += 19;
     }
 frac_done:
-    if (int_digits + frac_digits > 19) return parse_number_slow(p);
+    if (int_digits + frac_digits > 19) goto slow;
     if (*c == 'e' || *c == 'E') {
         is_float = 1;
         c++;
@@ -578,7 +585,7 @@ frac_done:
         } while (is_digit(*c));
         exponent = sign * e;
     }
-    p->cur = c;
+    *stop = c;
     exponent -= frac_digits;
     if (!is_float) {
         if (!negative) return mantissa <= (uint64_t)LLONG_MAX ? PyLong_FromLongLong((long long)mantissa) : PyLong_FromUnsignedLongLong(mantissa);
@@ -594,20 +601,37 @@ frac_done:
     }
     if (eisel_lemire(mantissa, exponent, &value)) return PyFloat_FromDouble(negative ? -value : value);
     return float_from_text(p, start, c);  /* infinite */
+slow:
+    p->cur = start;
+    {
+        PyObject *value = parse_number_slow(p);
+        if (value) *stop = p->cur;
+        return value;
+    }
+}
+
+static PyObject *parse_number(Parser *p) {
+    const unsigned char *stop = p->cur;
+    PyObject *value = parse_number_at(p, p->cur, &stop);
+    if (value) p->cur = stop;
+    return value;
 }
 
 /* --- containers ----------------------------------------------------------- */
 
-static int push(Parser *p, PyObject *value) {
-    if (p->stack_len == p->stack_cap) {
-        Py_ssize_t cap = p->stack_cap * 2;
-        PyObject **fresh = PyMem_Malloc((size_t)cap * sizeof *fresh);
-        if (!fresh) { Py_DECREF(value); PyErr_NoMemory(); return 0; }
-        memcpy(fresh, p->stack, (size_t)p->stack_len * sizeof *fresh);
-        if (p->stack != p->inline_stack) PyMem_Free(p->stack);
-        p->stack = fresh;
-        p->stack_cap = cap;
-    }
+static __attribute__((noinline)) int grow_stack(Parser *p) {
+    Py_ssize_t cap = p->stack_cap * 2;
+    PyObject **fresh = PyMem_Malloc((size_t)cap * sizeof *fresh);
+    if (!fresh) { PyErr_NoMemory(); return 0; }
+    memcpy(fresh, p->stack, (size_t)p->stack_len * sizeof *fresh);
+    if (p->stack != p->inline_stack) PyMem_Free(p->stack);
+    p->stack = fresh;
+    p->stack_cap = cap;
+    return 1;
+}
+
+static inline __attribute__((always_inline)) int push(Parser *p, PyObject *value) {
+    if (p->stack_len == p->stack_cap && !grow_stack(p)) { Py_DECREF(value); return 0; }
     p->stack[p->stack_len++] = value;
     return 1;
 }
@@ -628,11 +652,20 @@ static PyObject *parse_array(Parser *p, const Plan *item) {
     }
     Py_ssize_t base = p->stack_len;
     for (;;) {
-        p->cur = c;
         if (c >= end) return fail(p, MSG_EOF, end);
-        PyObject *value = item ? parse_typed(p, item) : parse_at(p, c);
-        if (!value || !push(p, value)) return NULL;  /* loads() releases the stack */
-        c = skip_space(p->cur, end);
+        PyObject *value;
+        if (!item && (is_digit(*c) || *c == '-')) {
+            /* Numeric arrays: no dispatch, and the cursor stays in registers. */
+            const unsigned char *stop;
+            value = parse_number_at(p, c, &stop);
+            if (!value || !push(p, value)) return NULL;  /* loads() releases the stack */
+            c = skip_space(stop, end);
+        } else {
+            p->cur = c;
+            value = item ? parse_typed(p, item) : parse_at(p, c);
+            if (!value || !push(p, value)) return NULL;
+            c = skip_space(p->cur, end);
+        }
         if (c >= end) return fail(p, MSG_EOF, end);
         if (*c == ',') {
             const unsigned char *comma = c;
