@@ -9,6 +9,7 @@ with [orjson](https://github.com/ijl/orjson).
 
 - About 1.3× faster than orjson at serializing a corpus of real-world JSON documents, and
   about as fast at parsing them.
+- `loads(data, type=...)` parses straight into dataclasses, without building dicts first.
 - A drop-in replacement for orjson, with the same API, options and output, verified against
   orjson's own test suite.
 - Native support for dataclasses, `datetime`, `UUID`, `Enum`, and NumPy arrays and scalars.
@@ -119,7 +120,7 @@ The contents are inserted as they are, without validation.
 ## Deserialization
 
 ```python
-loads(obj, /) -> Any
+loads(obj, /, *, type=None) -> Any
 ```
 
 `loads` accepts `str`, `bytes`, `bytearray` or `memoryview`, and raises `JSONDecodeError`, a
@@ -128,6 +129,52 @@ with orjson's rules: it rejects invalid UTF-8, lone surrogates, `NaN` and `Infin
 order mark, trailing commas and nesting deeper than 1,024 levels, and returns integers outside
 [-2⁶³, 2⁶⁴) as floats. The error's `pos`, `lineno` and `colno` give the position at which
 parsing stopped, as orjson reports it.
+
+### Decoding into dataclasses
+
+With `type`, `loads` builds the objects the annotation describes instead of dicts and lists
+of plain values, and checks the document against it:
+
+```python
+import dataclasses
+from typing import Optional
+
+@dataclasses.dataclass(slots=True)
+class Address:
+    city: str
+    zip: str = ""
+
+@dataclasses.dataclass(slots=True)
+class User:
+    id: int
+    name: str
+    tags: list[str]
+    address: Address
+    note: Optional[str] = None
+
+yjson.loads(b'{"id": 7, "name": "Ada", "tags": ["x"], "address": {"city": "Lahore"}}', type=User)
+# User(id=7, name='Ada', tags=['x'], address=Address(city='Lahore', zip=''), note=None)
+
+yjson.loads(b'[{"id": 1, ...}, ...]', type=list[User])
+```
+
+The annotation can be `Any`, `int`, `float`, `str`, `bool`, `None`, `Optional[X]` (or
+`X | None`), `list[X]`, `dict[str, X]` or a dataclass whose fields use these types, nested to
+any depth and recursively. Anything else, including other unions, tuples, sets, `Enum`,
+`datetime` and `InitVar` fields, raises `TypeError`.
+
+For a dataclass, the JSON keys are the field names. Keys the dataclass does not declare are
+parsed and dropped. Fields missing from the document take their `default` or
+`default_factory`; a missing field without one raises `JSONDecodeError`, as does a value of
+the wrong type (`expected int, got str`, with the position). An `int` field accepts only
+integers; a `float` field accepts integers too and converts them. The instance is allocated
+directly and its fields are written in place, so `__new__` and `__init__` do not run; if the
+class defines `__post_init__`, it is called after the fields are set. This also works for
+frozen dataclasses. The compiled form of each annotation is cached for the life of the
+process, which keeps the classes alive.
+
+Dataclasses with `slots=True` decode fastest, since each field is a direct store; without
+slots, each field goes into the instance's `__dict__`.
 
 ## NumPy
 
@@ -232,6 +279,21 @@ from 0.88× (`numbers.json`) to 1.95× (`gsoc-2018.json`), with a geometric mean
 the 14 documents; `json.loads` is 2–5× slower than either. Measured with
 `bench/bench_loads.py` in 20 alternating pairs per document on a shared cloud machine, so
 differences under about 5% are noise.
+
+Decoding 1,000 records of nine fields with a nested object into objects, with
+`bench/bench_typed.py` on the same machine:
+
+| Decoder | Result | Per call |
+| --- | --- | ---: |
+| `orjson.loads`, then dataclasses built by hand | dataclasses | 2.74 ms |
+| `yjson.loads` | dicts | 0.80 ms |
+| `yjson.loads(type=list[Record])` | dataclasses | 0.79 ms |
+| `yjson.loads(type=list[Record])`, `slots=True` | slotted dataclasses | 0.63 ms |
+| msgspec with `list[Record]` | dataclasses | 0.82 ms |
+| msgspec with a `Struct` | Structs | 0.50 ms |
+
+msgspec's `Struct` stays faster: its fields are C-level slots on a type it controls, while
+yjson writes into whatever dataclass it is given.
 
 ## How it works
 

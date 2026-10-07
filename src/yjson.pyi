@@ -1,8 +1,10 @@
-from typing import Any, Callable
+from typing import Any, Callable, TypeVar, overload
 from json import JSONDecodeError as _JSONDecodeError
 
 JSONEncodeError = TypeError
 class JSONDecodeError(_JSONDecodeError): ...
+
+_T = TypeVar("_T")
 class Fragment:
     def __init__(self, value: bytes | str) -> None: ...
 
@@ -19,7 +21,12 @@ def dumps_socket(
     attribute names writes the object as that dict, a callable writes its result, None uses default.
     """
     ...
+@overload
 def loads(obj: str | bytes | bytearray | memoryview, /) -> Any: ...
+@overload
+def loads(obj: str | bytes | bytearray | memoryview, /, *, type: type[_T]) -> _T: ...
+@overload
+def loads(obj: str | bytes | bytearray | memoryview, /, *, type: Any) -> Any: ...
 
 __version__: str
 
