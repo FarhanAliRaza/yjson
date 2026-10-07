@@ -1,0 +1,50 @@
+{
+  "metadata": "metadata.json",
+  "complete_stages": 9,
+  "encoding_cases": 20,
+  "decoding_cases": 29,
+  "decoding_string_cases": 4,
+  "feature_cases": 11,
+  "shape_cases": 28,
+  "encoding_orjson_over_mojo_geometric_mean": 1.5245398268099286,
+  "decoding": {
+    "corpus_mojo_over_c": 0.9556217497079333,
+    "corpus_orjson_over_mojo": 1.1921272114832064,
+    "compact_mojo_over_c": 0.942714749946176
+  },
+  "decoding_compact_orjson_over_mojo_geometric_mean": 1.1895822122069468,
+  "decoding_mojo_slower_than_c": [],
+  "encoding_mojo_slower_than_orjson": [],
+  "typed": [
+    {
+      "annotation": "Record",
+      "c_us": 451.70989062626177,
+      "mojo_us": 419.1786562515176,
+      "mojo_over_c": 0.9280538816901474,
+      "p25": 0.925522162175877,
+      "p75": 0.9320477557401777
+    },
+    {
+      "annotation": "SlotRecord",
+      "c_us": 389.39362499945673,
+      "mojo_us": 364.70104687680305,
+      "mojo_over_c": 0.9362862580965545,
+      "p25": 0.9282017677020085,
+      "p75": 0.9412965372775678
+    }
+  ],
+  "features_mojo_slower_than_orjson": [
+    "strict integers",
+    "non-str keys"
+  ],
+  "shapes_mojo_slower_than_orjson": [
+    "mixed scalars x10k",
+    "ascii str 128 escapes x2k",
+    "nested dict depth 6 x500",
+    "list of empty dicts x10k",
+    "list of empty lists x10k",
+    "bools and none x10k"
+  ],
+  "method_note": "Core comparisons use 40 paired batches >=10ms on CPU5, PYTHONHASHSEED=0. Features use CPU2 and 40 pairs; types use CPU2 and 20 pairs; NumPy reports minima of 7 runs. Shapes use CPU5 and 40 pairs.",
+  "caveat": "Local results describe this run; system activity and allocator state affect individual cases."
+}

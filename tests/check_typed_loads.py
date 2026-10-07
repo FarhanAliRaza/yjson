@@ -217,6 +217,65 @@ class TestTypedLoads(unittest.TestCase):
         with self.assertRaises(yjson.JSONDecodeError):
             yjson.loads('{"plain": 2}', type=Odd)
 
+    def test_many_fields_and_duplicate_keys(self):
+        # Exercise multiple seen-bit words and the heap fallback beyond 512 fields.
+        for count in (0, 65, 513):
+            cls = dataclasses.make_dataclass(
+                f"Fields{count}", [(f"f{i}", int) for i in range(count)], slots=True
+            )
+            values = {f"f{i}": i for i in reversed(range(count))}
+            result = yjson.loads(yjson.dumps(values), type=cls)
+            self.assertEqual(dataclasses.asdict(result), values)
+            if count:
+                with self.assertRaises(yjson.JSONDecodeError):
+                    yjson.loads(b"{}", type=cls)
+                with self.assertRaises(yjson.JSONDecodeError):
+                    yjson.loads(b'{"f0":"bad"}', type=cls)
+        self.assertEqual(yjson.loads('{"city":"a","city":"b"}', type=Address), Address("b"))
+
+    def test_mutable_input_snapshot_during_python_hooks(self):
+        original = b'[{},{"n":1}]'
+        for view in (False, True):
+            buffer = bytearray(original)
+
+            def factory():
+                # Reentrant decoding is valid, and cannot mutate the outer JSON snapshot.
+                self.assertEqual(yjson.loads(b'{"cached":2}'), {"cached": 2})
+                buffer[-3] = ord("9")
+                return 0
+
+            cls = dataclasses.make_dataclass("Hook", [
+                ("n", int, dataclasses.field(default_factory=factory))
+            ])
+            data = memoryview(buffer) if view else buffer
+            result = yjson.loads(data, type=list[cls])
+            self.assertEqual([item.n for item in result], [0, 1])
+            self.assertEqual(buffer, b'[{},{"n":9}]')
+
+    def test_error_messages_and_character_positions(self):
+        cases = [
+            ('[1 2]', "unexpected character, expected ',' or ']'", 3),
+            ('{"a":1 "b":2}', "unexpected character, expected ',' or '}'", 7),
+            ('"\\ud800', "unexpected end of data", 7),
+            ('"\\ud800\\u0041"', "invalid low surrogate in string", 1),
+            ('"\\u"', "invalid escaped sequence in string", 1),
+            ('"\\ud800\\u"', "invalid low surrogate in string", 1),
+            ('"\\udc00"', "lone low surrogate in string", 1),
+            ('-', "no digit after sign", 1),
+            ('[-', "no digit after sign", 2),
+            ('-x', "no digit after sign", 0),
+            ('1.', "unexpected end of data", 2),
+            ('123456789012345678901e+', "unexpected end of data", 23),
+            ('["é",1 2]', "unexpected character, expected ',' or ']'", 7),
+        ]
+        for text, message, position in cases:
+            for data in (text, text.encode(), bytearray(text.encode()), memoryview(text.encode())):
+                with self.subTest(data=data), self.assertRaises(yjson.JSONDecodeError) as context:
+                    yjson.loads(data)
+                self.assertEqual(context.exception.msg, message)
+                self.assertEqual(context.exception.pos, position)
+                self.assertEqual(context.exception.doc, text)
+
     def test_memory(self):
         try:
             import psutil

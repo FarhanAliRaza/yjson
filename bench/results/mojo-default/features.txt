@@ -1,0 +1,12 @@
+feature (100 items)     orjson us   yjson us    ratio
+compact                     6.315      5.599   1.135x
+indent                      8.404      6.797   1.237x
+sorted                      7.600      7.450   1.019x
+indent + sorted             9.871      8.397   1.174x
+strict integers             6.289      7.447   0.847x
+non-str keys                5.003      5.529   0.910x
+datetime                    1.997      1.493   1.320x
+UUID                        3.175      2.063   1.530x
+dataclass                   5.082      5.063   1.006x
+Enum                        7.000      2.832   2.471x
+default callback            4.436      4.072   1.090x

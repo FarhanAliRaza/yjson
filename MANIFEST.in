@@ -4,4 +4,6 @@ include src/yjson.pyi
 recursive-include src *.mojo *.c *.h *.py *.pyi
 recursive-include tests *.py
 recursive-include examples *.py
+recursive-include bench/c_decoder *.c *.sh *.md
+recursive-include bench/mojo_decoder *.c *.py *.sh *.md
 global-exclude __pycache__ *.py[cod] *.so *.o

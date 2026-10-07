@@ -140,7 +140,7 @@ def _key_string(key, option, native):
 
 
 def describe_type(tp):
-    """Describes one level of a loads(type=...) annotation for the C decoder, which expands the
+    """Describes one level of a loads(type=...) annotation for the Mojo decoder, which expands the
     inner types itself (so a dataclass may refer to itself). Raises TypeError for anything else."""
     import types
     import typing

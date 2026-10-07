@@ -1,5 +1,10 @@
 # Local benchmark evidence
 
+The current default Mojo encoder/decoder measurements are in
+[the production migration report](mojo-default/README.md), including original and compact
+decoding, typed construction, features, Python types, NumPy, and synthetic shapes.
+The measurements below are earlier snapshots and retain their original environments.
+
 Measured on AMD Ryzen 5 5600 (AVX2), CPython 3.12.13, Mojo 1.1.0 and
 orjson 3.12.0. The extension hash is recorded in the reports.
 Absolute project paths have been normalized to relative paths in these copies;

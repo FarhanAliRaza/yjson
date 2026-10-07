@@ -1,0 +1,14 @@
+case (ns per item)        orjson   yjson   ratio
+datetime naive              18.6    14.6   1.28x
+datetime utc                72.3    15.3   4.73x
+datetime zoneinfo           86.1    50.7   1.70x
+date                        13.1    11.9   1.10x
+time                        19.6    13.2   1.49x
+UUID                        32.0    18.9   1.69x
+dataclass                   51.6    50.3   1.03x
+dataclass slots            283.1   179.1   1.58x
+dataclass private           44.1    44.0   1.00x
+Enum                        68.6    28.4   2.41x
+IntEnum                      8.1    11.9   0.68x
+dict of datetimes           67.6    47.9   1.41x
+default callback            40.8    40.1   1.02x

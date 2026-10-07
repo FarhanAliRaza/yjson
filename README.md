@@ -5,7 +5,7 @@
 [![CI](https://github.com/FarhanAliRaza/yjson/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/FarhanAliRaza/yjson/actions/workflows/ci.yml)
 
 A fast JSON library for CPython, compatible with [orjson](https://github.com/ijl/orjson). Its
-serializer is written in [Mojo](https://mojolang.org) and its parser in C.
+serializer and parser are written in [Mojo](https://mojolang.org).
 
 - About 1.3× faster than orjson at serializing a corpus of real-world JSON documents, and
   about 1.2× faster at parsing them.
@@ -320,7 +320,7 @@ and checked against live objects at import, so an unsupported interpreter fails 
 strings are escaped with a 64-byte SIMD scan. Output is written straight into the resulting
 `bytes` object.
 
-`loads` is a separate recursive-descent parser in C that shares no code with the serializer.
+`loads` is a separate recursive-descent parser in Mojo that shares no code with the serializer.
 It scans strings and whitespace 16 bytes at a time, builds `str` objects straight from the
 input, and caches object keys, so repeated keys share one `str` and its hash. Floats
 are parsed with the [Eisel-Lemire](https://arxiv.org/abs/2101.11408) algorithm as implemented
