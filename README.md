@@ -285,15 +285,16 @@ Decoding 1,000 records of nine fields with a nested object into objects, with
 
 | Decoder | Result | Per call |
 | --- | --- | ---: |
-| `orjson.loads`, then dataclasses built by hand | dataclasses | 2.74 ms |
-| `yjson.loads` | dicts | 0.80 ms |
-| `yjson.loads(type=list[Record])` | dataclasses | 0.79 ms |
-| `yjson.loads(type=list[Record])`, `slots=True` | slotted dataclasses | 0.63 ms |
-| msgspec with `list[Record]` | dataclasses | 0.82 ms |
-| msgspec with a `Struct` | Structs | 0.50 ms |
+| `orjson.loads`, then dataclasses built by hand | dataclasses | 2.76 ms |
+| `yjson.loads` | dicts | 0.77 ms |
+| `yjson.loads(type=list[Record])` | dataclasses | 0.64 ms |
+| `yjson.loads(type=list[Record])`, `slots=True` | slotted dataclasses | 0.51 ms |
+| msgspec with `list[Record]` | dataclasses | 0.86 ms |
+| msgspec with a `Struct` | Structs | 0.52 ms |
 
-msgspec's `Struct` stays faster: its fields are C-level slots on a type it controls, while
-yjson writes into whatever dataclass it is given.
+Across the 14 corpus documents, with a schema inferred from each, slotted dataclasses decode
+1.11× faster than msgspec's Structs (geometric mean), from 0.97× on `marine_ik.json` to
+1.34× on `twitterescaped.json`.
 
 ## How it works
 

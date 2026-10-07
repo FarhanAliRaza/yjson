@@ -830,8 +830,12 @@ static PyObject *parse_dataclass(Parser *p, const Plan *plan) {
     const unsigned char *c = skip_space(p->cur + 1, end);
     PyObject *obj = plan->cls->tp_alloc(plan->cls, 0);
     if (!obj) return NULL;
+#ifdef YJSON_EXPERIMENT_UNTRACK
+    PyObject_GC_UnTrack(obj);  /* measurement only: not safe for dataclasses, see the notes */
+#endif
     uint64_t seen[plan->seen_words];
     memset(seen, 0, sizeof seen);
+    int expected = 0;  /* documents usually list the fields in declaration order */
     if (c < end && *c == '}') {
         c++;
         goto defaults;
@@ -839,19 +843,25 @@ static PyObject *parse_dataclass(Parser *p, const Plan *plan) {
     for (;;) {
         if (c >= end) { fail(p, MSG_EOF, end); break; }
         if (*c != '"') { fail(p, "unexpected character, expected a string key", c); break; }
-        /* Match the key against the fields: plain ASCII keys through the hash table,
-           keys with escapes or non-ASCII bytes through the dict. */
+        /* Match the key against the fields: the field expected next by a direct compare,
+           other plain ASCII keys through the hash table, keys with escapes or non-ASCII
+           bytes through the dict. */
         const unsigned char *start = c + 1, *special = scan(start, end, 1);
         int index = -1;
         if (special < end && *special == '"') {
             Py_ssize_t length = special - start;
-            uint64_t hash = key_hash(start, (size_t)length);
-            int at = (int)(hash & (uint64_t)plan->mask);
-            for (; plan->table[at] >= 0; at = (at + 1) & plan->mask) {
-                const Field *field = &plan->fields[plan->table[at]];
-                if (field->hash == hash && field->length == length && memcmp(field->bytes, start, (size_t)length) == 0) {
-                    index = plan->table[at];
-                    break;
+            const Field *next = &plan->fields[expected];
+            if (plan->nfields && next->length == length && memcmp(next->bytes, start, (size_t)length) == 0) {
+                index = expected;
+            } else {
+                uint64_t hash = key_hash(start, (size_t)length);
+                int at = (int)(hash & (uint64_t)plan->mask);
+                for (; plan->table[at] >= 0; at = (at + 1) & plan->mask) {
+                    const Field *field = &plan->fields[plan->table[at]];
+                    if (field->hash == hash && field->length == length && memcmp(field->bytes, start, (size_t)length) == 0) {
+                        index = plan->table[at];
+                        break;
+                    }
                 }
             }
             p->cur = special + 1;
@@ -875,6 +885,7 @@ static PyObject *parse_dataclass(Parser *p, const Plan *plan) {
             Py_DECREF(value);
             if (status < 0) break;
             seen[index / 64] |= (uint64_t)1 << (index % 64);
+            expected = index + 1 < plan->nfields ? index + 1 : 0;
         } else {
             PyObject *value = parse_value(p);  /* an unknown key: its value is checked and dropped */
             if (!value) break;
