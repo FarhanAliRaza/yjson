@@ -10,7 +10,7 @@ from std.sys.intrinsics import likely, unlikely, prefetch, PrefetchOptions, llvm
 from std.sys import get_defined_int
 from std.sys.info import CompilationTarget
 from std.simd import pack_bits
-from std.bit import count_leading_zeros, count_trailing_zeros
+from std.bit import count_leading_zeros, count_trailing_zeros, byte_swap
 from std.memory import bitcast
 
 comptime P8 = Pointer[UInt8, MutUntrackedOrigin]
@@ -65,6 +65,20 @@ comptime DK_LOG2_INDEX_BYTES = get_defined_int["YJSON_DK_LOG2_INDEX_BYTES", 9]()
 comptime DK_KIND = get_defined_int["YJSON_DK_KIND", 10]()
 comptime DK_NENTRIES = get_defined_int["YJSON_DK_NENTRIES", 24]()
 comptime DK_INDICES = get_defined_int["YJSON_DK_INDICES", 32]()
+comptime TP_FLAGS = get_defined_int["YJSON_TP_FLAGS", 168]()
+# tp_flags bits (stable public API)
+comptime FLAG_LONG_SUBCLASS = 1 << 24
+comptime FLAG_LIST_SUBCLASS = 1 << 25
+comptime FLAG_UNICODE_SUBCLASS = 1 << 28
+comptime FLAG_DICT_SUBCLASS = 1 << 29
+# datetime objects (datetime.h): a has-tzinfo byte, big-endian packed fields,
+# and the tzinfo pointer, which exists only when the byte is set.
+comptime DT_HASTZ = get_defined_int["YJSON_DT_HASTZ", 24]()
+comptime DT_DATA = get_defined_int["YJSON_DT_DATA", 25]()
+comptime DT_TZINFO = get_defined_int["YJSON_DT_TZINFO", 40]()
+comptime DATE_DATA = get_defined_int["YJSON_DATE_DATA", 25]()
+comptime TIME_HASTZ = get_defined_int["YJSON_TIME_HASTZ", 24]()
+comptime TIME_DATA = get_defined_int["YJSON_TIME_DATA", 25]()
 
 @always_inline
 def rdb(addr: Int, off: Int) -> Int:
@@ -168,6 +182,15 @@ struct Ctx(ImplicitlyCopyable):
     var request: Int
     var ancestors: Int
     var option: Int
+    # exact datetime/date/time types, the datetime.timezone.utc singleton,
+    # uuid.UUID and the offset of its `int` slot (0: read it through C)
+    var t_datetime: Int
+    var t_date: Int
+    var t_time: Int
+    var utc_addr: Int
+    var t_uuid: Int
+    var uuid_int_off: Int
+    var conv_off: Int   # offset of the default-nesting counter in the C request
 
     def __init__(out self, ready: Bool):
         self.t_str = 0
@@ -183,6 +206,23 @@ struct Ctx(ImplicitlyCopyable):
         self.request = 0
         self.ancestors = 0
         self.option = 0
+        self.t_datetime = 0
+        self.t_date = 0
+        self.t_time = 0
+        self.utc_addr = 0
+        self.t_uuid = 0
+        self.uuid_int_off = 0
+        self.conv_off = 0
+
+    # After yjson_install: the C shim has imported the datetime C API and the uuid module.
+    def load_special(mut self):
+        self.t_datetime = external_call["yjson_special_types", Int](Int32(0))
+        self.t_date = external_call["yjson_special_types", Int](Int32(1))
+        self.t_time = external_call["yjson_special_types", Int](Int32(2))
+        self.utc_addr = external_call["yjson_special_types", Int](Int32(3))
+        self.t_uuid = external_call["yjson_special_types", Int](Int32(4))
+        self.uuid_int_off = external_call["yjson_special_types", Int](Int32(5))
+        self.conv_off = external_call["yjson_special_types", Int](Int32(6))
 
     def load(mut self) raises:
         var bi = Python.import_module("builtins")
@@ -1012,11 +1052,18 @@ def float_bits_at(dst: P8, bits: UInt64) -> Int:
         var tzd = 0
         var D = to_digits16(hi, X - hi * 100000000, tzd)
         return float_layout3(dst, n, k, nd, D, tzd, c)
-    var d = integ * 10 + last
+    return digits_layout[-5, 16](dst, n, integ * 10 + last, k)
+
+# Writes d * 10**k (d <= 17 digits, trailing zeros allowed) at dst+n: fixed
+# notation when the decimal point lands in (LO, HI], otherwise d.ddde[+-]x.
+# The ranges are zmij's: (-5, 16] for binary64, (-6, 13] for binary32.
+@always_inline
+def digits_layout[LO: Int, HI: Int](dst: P8, n0: Int, d: UInt64, k: Int) -> Int:
+    var n = n0
     var nd = ndigits(d)
     var decpt = nd + k
     var zeros = SIMD[DType.uint8, 32](48)
-    if decpt > -5 and decpt <= 16:
+    if decpt > LO and decpt <= HI:
         if decpt <= 0:
             (dst + n).store(zeros)
             (dst + n + 1)[] = 46
@@ -1061,11 +1108,282 @@ def float_bits_at(dst: P8, bits: UInt64) -> Int:
         n = put_u64(dst, n + 2, UInt64(x))
     return n
 
+# ---------------- binary32: zmij's single-precision variant ----------------
+# Regular values need only the high word of the 10**k table: one 64x64
+# multiply with 34 fractional bits. Powers of two reuse the binary64 irregular
+# path (the same arithmetic on a 24-bit significand); subnormals take the
+# regular path with the minimum exponent, as in zmij.
+@always_inline
+def to_decimal_f32(sig: UInt64, bin_exp: Int, mut k: Int, mut last: UInt64) -> UInt64:
+    var dec_exp = (bin_exp * 315653) >> 20
+    var shift = bin_exp + ((-(dec_exp + 1) * 217707) >> 16) + 1 + 34
+    var hi = materialize[Z_TBL]()[2 * (-dec_exp - 1 - ZMIN)]
+    var p = UInt64((UInt128(hi + 1) * UInt128(sig << UInt64(shift))) >> 64)
+    var integral = p >> 34
+    var frac = p & ((UInt64(1) << 34) - 1)
+    var half = (hi >> UInt64(65 - shift)) + (UInt64(1) - (sig & 1))
+    var ru = ((frac + half) >> 34) != 0
+    var rd = half > frac
+    integral += UInt64(1) if ru else UInt64(0)
+    var digit = (frac * 10 + (UInt64(1) << 33)) >> 34
+    if unlikely(frac == (UInt64(1) << 32)):
+        digit = 2
+    last = UInt64(0) if (ru or rd) else digit
+    k = dec_exp
+    return integral
+
+# Shortest round-trip text of a binary32 value, laid out like orjson writes
+# numpy.float32 (fixed notation for decimal points in (-6, 13]).
+@always_inline
+def float32_bits_at(dst: P8, bits: UInt32) -> Int:
+    var raw = Int((bits >> 23) & 0xFF)
+    var m = UInt64(bits & 0x7FFFFF)
+    if unlikely(raw == 0xFF):
+        return nonfinite_at(dst, (UInt64(bits >> 31) << 63) | 0x7FF0000000000000 | (m << 29))
+    (dst + 0)[] = 45
+    var n = Int(bits >> 31)
+    if (bits << 1) == 0:
+        (dst + n)[] = 48
+        (dst + n + 1)[] = 46
+        (dst + n + 2)[] = 48
+        return n + 3
+    var k = 0
+    var last: UInt64 = 0
+    var integ: UInt64
+    if unlikely(raw == 0):
+        integ = to_decimal_f32(m, 1 - 150, k, last)
+    elif unlikely(m == 0):
+        integ = to_decimal_irregular(m | (UInt64(1) << 23), raw - 150, k, last)
+    else:
+        integ = to_decimal_f32(m | (UInt64(1) << 23), raw - 150, k, last)
+    return float32_layout(dst, n, integ * 10 + last, k)
+
+# Layout for binary32 digits (1 <= d < 10**9, d * 10**k): the same text as
+# digits_layout[-6, 13], without its byte loops. The digits come as one
+# 8-digit ASCII word plus an optional leading digit, and the trailing zeros
+# from one count-leading-zeros on that word.
+@always_inline
+def float32_layout(dst: P8, n: Int, d: UInt64, k: Int) -> Int:
+    var nd = ndigits(d)
+    var decpt = nd + k
+    var lead = d // 100000000
+    var w = eight_digits(d - lead * 100000000)
+    # the last digit is in the high byte: trailing '0' digits = leading '0' bytes
+    var tz = Int(count_leading_zeros(w ^ 0x3030303030303030)) >> 3
+    var ns = nd - tz                       # significant digits (>= 1)
+    var nine = nd == 9
+    var block = w if nine else (w >> UInt64((8 - nd) * 8))   # nd <= 8: first digit in the low byte
+    if decpt > -6 and decpt <= 13:
+        if decpt <= 0:
+            # 0.000ddd
+            store8(dst, n, 0x3030303030302E30)   # "0." + six zeros
+            var at = n + 2 - decpt
+            if nine:
+                (dst + at)[] = UInt8(48) + UInt8(lead)
+                store8(dst, at + 1, w)
+            else:
+                store8(dst, at, block)
+            return at + ns
+        if nine:
+            (dst + n)[] = UInt8(48) + UInt8(lead)
+            store8(dst, n + 1, w)
+        else:
+            store8(dst, n, block)
+        if ns <= decpt:
+            # integer-valued: ddd000.0
+            store8(dst, n + nd, 0x3030303030303030)
+            store8(dst, n + nd + 8, 0x3030303030303030)
+            (dst + n + decpt)[] = 46
+            (dst + n + decpt + 1)[] = 48
+            return n + decpt + 2
+        # ddd.ddd: open a gap for the point
+        var tail = (dst + n + decpt).unsafe_bitcast[UInt64]()[]
+        store8(dst, n + decpt + 1, tail)
+        (dst + n + decpt)[] = 46
+        return n + ns + 1
+    # d.ddde[+-]x
+    if nine:
+        (dst + n)[] = UInt8(48) + UInt8(lead)
+        store8(dst, n + 2, w)
+    else:
+        (dst + n)[] = UInt8(block & 0xFF)
+        store8(dst, n + 2, block >> 8)
+    (dst + n + 1)[] = 46
+    var end = n + 1 + ns if ns > 1 else n + 1
+    (dst + end)[] = 101
+    var x = decpt - 1
+    (dst + end + 1)[] = 45 if x < 0 else 43
+    if x < 0:
+        x = -x
+    if x >= 10:
+        put2(dst, end + 2, x)
+        return end + 4
+    (dst + end + 2)[] = UInt8(48) + UInt8(x)
+    return end + 3
+
+@always_inline
+def float16_bits_at(dst: P8, bits: UInt16) -> Int:
+    var f = bitcast[DType.float16, 1](SIMD[DType.uint16, 1](bits)).cast[DType.float32]()
+    return float32_bits_at(dst, bitcast[DType.uint32, 1](f)[0])
+
 @always_inline
 def write_float[o_: Origin[mut=True]](bp: Pointer[Buf, o_], o: Int):
     ref b = bp[]
     b.ensure(96)
     b.len += float_at(b.p + b.len, o)
+
+
+# ---------------- stdlib types written from their object layout ----------------
+@always_inline
+def hex16(v: UInt64) -> SIMD[DType.uint8, 16]:
+    # 16 lowercase hex digits of v, most significant first
+    var b = bitcast[DType.uint8, 8](SIMD[DType.uint64, 1](byte_swap(v)))
+    var nib = (b >> 4).interleave(b & 15)
+    return nib + 48 + nib.gt(9).select(SIMD[DType.uint8, 16](39), SIMD[DType.uint8, 16](0))
+
+# 2-digit fields of a packed datetime: "HH:MM:SS[.ffffff]" at p+n from d (hour, minute, second, us hi, mid, lo).
+@always_inline
+def time_fields_at(p: P8, n0: Int, d: P8, option: Int) -> Int:
+    var n = n0
+    put2(p, n, Int(d[0]))
+    (p + n + 2)[] = 58
+    put2(p, n + 3, Int(d[1]))
+    (p + n + 5)[] = 58
+    put2(p, n + 6, Int(d[2]))
+    n += 8
+    var us = (Int(d[3]) << 16) | (Int(d[4]) << 8) | Int(d[5])
+    if us != 0 and (option & 8) == 0:
+        (p + n)[] = 46
+        put2(p, n + 1, us // 10000)
+        put2(p, n + 3, (us // 100) % 100)
+        put2(p, n + 5, us % 100)
+        n += 7
+    return n
+
+@always_inline
+def date_fields_at(p: P8, n: Int, d: P8) -> Int:
+    var year = (Int(d[0]) << 8) | Int(d[1])
+    put2(p, n, year // 100)
+    put2(p, n + 2, year % 100)
+    (p + n + 4)[] = 45
+    put2(p, n + 5, Int(d[2]))
+    (p + n + 7)[] = 45
+    put2(p, n + 8, Int(d[3]))
+    return n + 10
+
+# Exact datetime/date/time, uuid.UUID, and (SUBCLASS) str/int/list/dict
+# subclasses, written like orjson writes them, with no Python call: the
+# fields are read from the objects. Returns 1 written, 0 not handled here
+# (the fallback takes it), -1 error. Aware datetimes with a zone other than
+# datetime.timezone.utc get their text from the C shim.
+@no_inline
+def ser_special[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, SUBCLASS: Bool, o_: Origin[mut=True], c_: Origin](bp: Pointer[Buf, o_], cp: Pointer[Ctx, c_], o: Int, depth: Int) -> Int:
+    ref ctx = cp[]
+    var t = ob_type(o)
+    var option = ctx.option
+    comptime if SUBCLASS and not SOCKET:
+        # list and dict subclasses share the base layout, so the base writers
+        # apply (orjson does the same); ser_value took int and str subclasses.
+        if (option & 256) == 0:
+            var flags = rdb(t, TP_FLAGS)
+            if (flags & FLAG_LIST_SUBCLASS) != 0:
+                return 1 if ser_list[NONSTR, SORT, SOCKET, INDENT](bp, cp, o, depth + 1, True) else -1
+            if (flags & FLAG_DICT_SUBCLASS) != 0:
+                var ok: Bool
+                comptime if NONSTR or SORT:
+                    if dict_has_general_keys(o):
+                        ok = ser_dict_records[NONSTR, SORT, SOCKET, INDENT](bp, cp, o, depth + 1)
+                        return 1 if ok else -1
+                comptime if SORT:
+                    ok = ser_dict_records[NONSTR, True, SOCKET, INDENT](bp, cp, o, depth + 1)
+                else:
+                    ok = ser_dict_items[NONSTR, False, SOCKET, False, INDENT](bp, cp, o, depth + 1, 0)
+                return 1 if ok else -1
+    if t == ctx.t_datetime:
+        if (option & 512) != 0:
+            return 0
+        var tz = 0
+        if P8(unsafe_from_address=o + DT_HASTZ)[] != 0:
+            tz = rdb(o, DT_TZINFO)
+        if tz != 0 and tz != ctx.utc_addr and tz != ctx.none_addr:
+            bp[].ensure(48)
+            var size = external_call["yjson_tz_datetime_text", Int32](ctx.request, o, Int(bp[].p + bp[].len))
+            if size < 0:
+                return -1
+            bp[].len += Int(size)
+            return 1
+        bp[].ensure(48)
+        var p = bp[].p + bp[].len
+        var d = P8(unsafe_from_address=o + DT_DATA)
+        p[] = 34
+        var n = date_fields_at(p, 1, d)
+        (p + n)[] = 84
+        n = time_fields_at(p, n + 1, d + 4, option)
+        if tz == ctx.utc_addr or (option & 2) != 0:
+            if (option & 128) != 0:
+                (p + n)[] = 90
+                n += 1
+            else:
+                store8(p, n, 0x30303A30302B)   # "+00:00"
+                n += 6
+        (p + n)[] = 34
+        bp[].len += n + 1
+        return 1
+    if t == ctx.t_date:
+        if (option & 512) != 0:
+            return 0
+        bp[].ensure(16)
+        var p = bp[].p + bp[].len
+        p[] = 34
+        var n = date_fields_at(p, 1, P8(unsafe_from_address=o + DATE_DATA))
+        (p + n)[] = 34
+        bp[].len += n + 1
+        return 1
+    if t == ctx.t_time:
+        if (option & 512) != 0 or P8(unsafe_from_address=o + TIME_HASTZ)[] != 0:
+            return 0   # aware times are an error, raised by the fallback
+        bp[].ensure(24)
+        var p = bp[].p + bp[].len
+        p[] = 34
+        var n = time_fields_at(p, 1, P8(unsafe_from_address=o + TIME_DATA), option)
+        (p + n)[] = 34
+        bp[].len += n + 1
+        return 1
+    comptime if not SOCKET:
+        if t == ctx.t_uuid and ctx.uuid_int_off != 0:
+            var v = rdb(o, ctx.uuid_int_off)
+            if v == 0 or ob_type(v) != ctx.t_int:
+                return 0
+            var tag = long_tag(v)
+            var nd = tag >> 3
+            if (tag & 3) == 2 or nd > 5:
+                return 0
+            var dg = long_digits(v)
+            var w = SIMD[DType.uint64, 8](0)
+            for i in range(nd):
+                w[i] = UInt64(dg[i])
+            if w[4] >= 256:
+                return 0
+            var lo = w[0] | (w[1] << 30) | (w[2] << 60)
+            var hi = (w[2] >> 4) | (w[3] << 26) | (w[4] << 56)
+            bp[].ensure(64)
+            var p = bp[].p + bp[].len
+            var H = hex16(hi)
+            var L = hex16(lo)
+            (p + 1).store(H)
+            store8(p, 10, bitcast[DType.uint64, 2](H)[1])
+            (p + 15).unsafe_bitcast[UInt32]()[] = bitcast[DType.uint32, 4](H)[3]
+            (p + 21).store(L)
+            (p + 20).unsafe_bitcast[UInt32]()[] = bitcast[DType.uint32, 4](L)[0]
+            p[] = 34
+            (p + 9)[] = 45
+            (p + 14)[] = 45
+            (p + 19)[] = 45
+            (p + 24)[] = 45
+            (p + 37)[] = 34
+            bp[].len += 38
+            return 1
+    return 0
 
 # ---------------- dispatch: scalars inline, recursion only for containers ----------------
 @always_inline
@@ -1187,9 +1505,20 @@ def ser_value[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o_: Origin[m
             lit4(bp, 102, 97, 108, 115)
             put_byte(bp, 101)
         return True
-    comptime if not INDENT:
-        if is_numpy_type(t):
-            return ser_numpy[NONSTR, SORT, SOCKET](bp, cp, o, depth)
+    comptime if not SOCKET:
+        # int and str subclasses (IntEnum, StrEnum, ...) share the base layout:
+        # written here, as orjson writes them. dumps_socket keeps its own rules.
+        if (ctx.option & 256) == 0:
+            var flags = rdb(t, TP_FLAGS)
+            if (flags & FLAG_LONG_SUBCLASS) != 0:
+                return write_int[False](bp, o)
+            if (flags & FLAG_UNICODE_SUBCLASS) != 0:
+                return write_str[False](bp, o)
+    var special = ser_special[NONSTR, SORT, SOCKET, INDENT, True](bp, cp, o, depth)
+    if special != 0:
+        return special > 0
+    if is_numpy_type(t):
+        return ser_numpy[NONSTR, SORT, SOCKET, INDENT, False](bp, cp, o, depth)
     return ser_fallback[INDENT, SORT, False, NONSTR, SOCKET](bp, cp, o, depth)
 
 
@@ -1198,74 +1527,220 @@ def is_numpy_type(tp: Int) -> Bool:
     var nm = P8(unsafe_from_address=tp_name(tp))
     return (nm + 0)[] == 110 and (nm + 1)[] == 117 and (nm + 2)[] == 109 and (nm + 3)[] == 112 and (nm + 4)[] == 121 and (nm + 5)[] == 46
 
-# kind: 0 f64, 1 f32, 2 i64, 3 i32, 4 bool, 5 u8, -1 unsupported
+# Exactly numpy.ndarray (subclasses go to default, as in orjson). Only called
+# after is_numpy_type, so the name has at least "numpy." before its NUL.
+@always_inline
+def is_ndarray_type(tp: Int) -> Bool:
+    var nm = P8(unsafe_from_address=tp_name(tp))
+    return ((nm + 6)[] == 110 and (nm + 7)[] == 100 and (nm + 8)[] == 97 and (nm + 9)[] == 114
+            and (nm + 10)[] == 114 and (nm + 11)[] == 97 and (nm + 12)[] == 121 and (nm + 13)[] == 0)
+
+# Element kinds of the raw-buffer writers.
+comptime K_F64 = 0
+comptime K_F32 = 1
+comptime K_I64 = 2
+comptime K_I32 = 3
+comptime K_BOOL = 4
+comptime K_U8 = 5
+comptime K_F16 = 6
+comptime K_I16 = 7
+comptime K_I8 = 8
+comptime K_U16 = 9
+comptime K_U32 = 10
+comptime K_U64 = 11
+comptime K_DT64 = 12   # int64 values; aux = option << 8 | unit, formatted by the C shim
+
+# Element kind of a single-item buffer format in native byte order:
+# -1 unsupported, -2 explicitly non-native byte order.
 @always_inline
 def buf_kind(fmt: Int, isz: Int) -> Int:
     var f = P8(unsafe_from_address=fmt)
     var c = (f + 0)[]
     if c == 60 or c == 61 or c == 64:   # '<' '=' '@'
-        c = (f + 1)[]
-    if c == 100 and isz == 8:
-        return 0
-    if c == 102 and isz == 4:
-        return 1
-    if (c == 108 or c == 113) and isz == 8:
-        return 2
-    if c == 105 and isz == 4:
-        return 3
-    if c == 63 and isz == 1:
-        return 4
-    if c == 66 and isz == 1:
-        return 5
+        f = f + 1
+        c = (f + 0)[]
+    elif c == 62 or c == 33:             # '>' '!'
+        return -2
+    if (f + 1)[] != 0:
+        return -1
+    if isz == 8:
+        if c == 100:                     # 'd'
+            return K_F64
+        if c == 108 or c == 113 or c == 110:   # 'l' 'q' 'n'
+            return K_I64
+        if c == 76 or c == 81 or c == 78:      # 'L' 'Q' 'N'
+            return K_U64
+        return -1
+    if isz == 4:
+        if c == 102:                     # 'f'
+            return K_F32
+        if c == 105 or c == 108:         # 'i' 'l'
+            return K_I32
+        if c == 73 or c == 76:           # 'I' 'L'
+            return K_U32
+        return -1
+    if isz == 2:
+        if c == 101:                     # 'e'
+            return K_F16
+        if c == 104:                     # 'h'
+            return K_I16
+        if c == 72:                      # 'H'
+            return K_U16
+        return -1
+    if isz == 1:
+        if c == 63:                      # '?'
+            return K_BOOL
+        if c == 66:                      # 'B'
+            return K_U8
+        if c == 98:                      # 'b'
+            return K_I8
     return -1
 
+# Writes element e of a C-contiguous buffer. Returns the new length, or -1
+# after a datetime64 value the C shim rejected (exception set). The kind is a
+# parameter so the row loops carry no per-element dispatch.
 @always_inline
-def write_elem(dst: P8, n: Int, data: Int, e: Int, kind: Int) -> Int:
-    if kind == 0:
+def write_elem_k[KIND: Int](dst: P8, n: Int, data: Int, e: Int, aux: Int) -> Int:
+    comptime if KIND == K_F64:
         return n + float_bits_at(dst + n, Pointer[UInt64, MutUntrackedOrigin](unsafe_from_address=data + e * 8)[])
-    if kind == 1:
-        var f = Float64(Pointer[Float32, MutUntrackedOrigin](unsafe_from_address=data + e * 4)[])
-        return n + float_bits_at(dst + n, bitcast[DType.uint64, 1](SIMD[DType.float64, 1](f))[0])
-    var v: Int
-    if kind == 2:
-        v = Int(Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=data + e * 8)[])
-    elif kind == 3:
-        v = Int(Pointer[Int32, MutUntrackedOrigin](unsafe_from_address=data + e * 4)[])
-    elif kind == 5:
-        v = Int(Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=data + e)[])
-    else:
+    elif KIND == K_F32:
+        return n + float32_bits_at(dst + n, Pointer[UInt32, MutUntrackedOrigin](unsafe_from_address=data + e * 4)[])
+    elif KIND == K_F16:
+        return n + float16_bits_at(dst + n, Pointer[UInt16, MutUntrackedOrigin](unsafe_from_address=data + e * 2)[])
+    elif KIND == K_U64:
+        return put_u64(dst, n, Pointer[UInt64, MutUntrackedOrigin](unsafe_from_address=data + e * 8)[])
+    elif KIND == K_DT64:
+        var value = Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=data + e * 8)[]
+        var size = external_call["yjson_datetime64_text", Int32](value, Int32(aux & 0xFF), aux >> 8, Int(dst + n))
+        return -1 if size < 0 else n + Int(size)
+    elif KIND == K_BOOL:
         if Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=data + e)[] != 0:
             store8(dst, n, 0x65757274)          # "true"
             return n + 4
         store8(dst, n, 0x65736C6166)            # "false"
         return n + 5
-    if v < 0:
-        (dst + n)[] = 45
-        return put_u64(dst, n + 1, UInt64(0) - UInt64(v))
-    return put_u64(dst, n, UInt64(v))
+    else:
+        var v: Int
+        comptime if KIND == K_I64:
+            v = Int(Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=data + e * 8)[])
+        elif KIND == K_I32:
+            v = Int(Pointer[Int32, MutUntrackedOrigin](unsafe_from_address=data + e * 4)[])
+        elif KIND == K_U32:
+            v = Int(Pointer[UInt32, MutUntrackedOrigin](unsafe_from_address=data + e * 4)[])
+        elif KIND == K_I16:
+            v = Int(Pointer[Int16, MutUntrackedOrigin](unsafe_from_address=data + e * 2)[])
+        elif KIND == K_U16:
+            v = Int(Pointer[UInt16, MutUntrackedOrigin](unsafe_from_address=data + e * 2)[])
+        elif KIND == K_I8:
+            v = Int(Pointer[Int8, MutUntrackedOrigin](unsafe_from_address=data + e)[])
+        else:
+            v = Int(Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=data + e)[])
+        if v < 0:
+            (dst + n)[] = 45
+            return put_u64(dst, n + 1, UInt64(0) - UInt64(v))
+        return put_u64(dst, n, UInt64(v))
+
+# Runtime-kind variant for single scalars and the indented writer.
+@always_inline
+def write_elem(dst: P8, n: Int, data: Int, e: Int, kind: Int, aux: Int) -> Int:
+    if kind == K_F64:
+        return write_elem_k[K_F64](dst, n, data, e, aux)
+    if kind == K_I64:
+        return write_elem_k[K_I64](dst, n, data, e, aux)
+    if kind == K_I32:
+        return write_elem_k[K_I32](dst, n, data, e, aux)
+    if kind == K_BOOL:
+        return write_elem_k[K_BOOL](dst, n, data, e, aux)
+    if kind == K_F32:
+        return write_elem_k[K_F32](dst, n, data, e, aux)
+    if kind == K_U8:
+        return write_elem_k[K_U8](dst, n, data, e, aux)
+    if kind == K_F16:
+        return write_elem_k[K_F16](dst, n, data, e, aux)
+    if kind == K_I16:
+        return write_elem_k[K_I16](dst, n, data, e, aux)
+    if kind == K_I8:
+        return write_elem_k[K_I8](dst, n, data, e, aux)
+    if kind == K_U16:
+        return write_elem_k[K_U16](dst, n, data, e, aux)
+    if kind == K_U32:
+        return write_elem_k[K_U32](dst, n, data, e, aux)
+    if kind == K_U64:
+        return write_elem_k[K_U64](dst, n, data, e, aux)
+    return write_elem_k[K_DT64](dst, n, data, e, aux)
+
+# Elements j0..chunk of one row, comma-separated (the row starts at index
+# `first` of the dimension). Returns the new length, or -1 on error.
+@always_inline
+def row_tail[KIND: Int](p: P8, len0: Int, data: Int, base: Int, first: Int, j0: Int, chunk: Int, aux: Int) -> Int:
+    var len = len0
+    var j = j0
+    while j < chunk:
+        if first + j > 0:
+            (p + len)[] = 44
+            len += 1
+        len = write_elem_k[KIND](p, len, data, base + j, aux)
+        comptime if KIND == K_DT64:
+            if unlikely(len < 0):
+                return -1
+        j += 1
+    return len
+
+# Output bytes reserved per element (including the separator).
+@always_inline
+def elem_reserve(kind: Int) -> Int:
+    if kind == K_DT64:
+        return 40
+    return 26 if kind <= K_F32 else 22
+
+# Row writer for the kinds without a batched path. Returns -1 on error.
+@no_inline
+def row_other(kind: Int, p: P8, len: Int, data: Int, base: Int, first: Int, j: Int, chunk: Int, aux: Int) -> Int:
+    if kind == K_F32:
+        return row_tail[K_F32](p, len, data, base, first, j, chunk, aux)
+    if kind == K_U8:
+        return row_tail[K_U8](p, len, data, base, first, j, chunk, aux)
+    if kind == K_F16:
+        return row_tail[K_F16](p, len, data, base, first, j, chunk, aux)
+    if kind == K_I16:
+        return row_tail[K_I16](p, len, data, base, first, j, chunk, aux)
+    if kind == K_I8:
+        return row_tail[K_I8](p, len, data, base, first, j, chunk, aux)
+    if kind == K_U16:
+        return row_tail[K_U16](p, len, data, base, first, j, chunk, aux)
+    if kind == K_U32:
+        return row_tail[K_U32](p, len, data, base, first, j, chunk, aux)
+    if kind == K_U64:
+        return row_tail[K_U64](p, len, data, base, first, j, chunk, aux)
+    if kind == K_BOOL:
+        return row_tail[K_BOOL](p, len, data, base, first, j, chunk, aux)
+    return row_tail[K_DT64](p, len, data, base, first, j, chunk, aux)
 
 # C-contiguous N-d array -> nested JSON arrays, reading the raw buffer directly.
+# KIND >= 0 specializes the function for one element kind (the kind checks
+# below fold away); KIND == -1 is the generic instance for the rarer kinds.
 @no_inline
-def nd_rec[o_: Origin[mut=True]](bp: Pointer[Buf, o_], data: Int, kind: Int, shp: Int, ndim: Int, dim: Int, e0: Int, block: Int):
+def nd_rec[KIND: Int, o_: Origin[mut=True]](bp: Pointer[Buf, o_], data: Int, kind_rt: Int, shp: Int, ndim: Int, dim: Int, e0: Int, block: Int, aux: Int) -> Bool:
+    var kind: Int
+    comptime if KIND >= 0:
+        kind = KIND
+    else:
+        kind = kind_rt
     var cnt = rdi(shp, dim)
     put_byte(bp, 91)
     if dim == ndim - 1:
         var i = 0
         while i < cnt:
             var chunk = min(cnt - i, 256)
-            bp[].ensure(chunk * 32 + 8)
+            bp[].ensure(chunk * (40 if kind == K_DT64 else 32) + 8)
             var p = bp[].p
             var len = bp[].len
             var j = 0
-            if kind <= 1:
+            if kind == K_F64:
                 while j + 4 <= chunk:
                     var bv = SIMD[DType.uint64, 4](0)
                     comptime for q in range(4):
-                        if kind == 0:
-                            bv[q] = Pointer[UInt64, MutUntrackedOrigin](unsafe_from_address=data + (e0 + i + j + q) * 8)[]
-                        else:
-                            var f = Float64(Pointer[Float32, MutUntrackedOrigin](unsafe_from_address=data + (e0 + i + j + q) * 4)[])
-                            bv[q] = bitcast[DType.uint64, 1](SIMD[DType.float64, 1](f))[0]
+                        bv[q] = Pointer[UInt64, MutUntrackedOrigin](unsafe_from_address=data + (e0 + i + j + q) * 8)[]
                     var r = bits_batch4(p, len, bv, i + j == 0)
                     if r >= 0:
                         len = r
@@ -1275,7 +1750,7 @@ def nd_rec[o_: Origin[mut=True]](bp: Pointer[Buf, o_], data: Int, kind: Int, shp
                             if i + j + q > 0:
                                 (p + len)[] = 44
                                 len += 1
-                            len = write_elem(p, len, data, e0 + i + j + q, kind)
+                            len = write_elem_k[K_F64](p, len, data, e0 + i + j + q, 0)
                     j += 4
             if kind == 2 or kind == 3:
                 # signed ints, 4 at a time, |v| < 10**16: two 8-digit SIMD words per lane, branch-free layout
@@ -1298,7 +1773,10 @@ def nd_rec[o_: Origin[mut=True]](bp: Pointer[Buf, o_], data: Int, kind: Int, shp
                             if i + j + q > 0:
                                 (p + len)[] = 44
                                 len += 1
-                            len = write_elem(p, len, data, e0 + i + j + q, kind)
+                            if kind == 2:
+                                len = write_elem_k[K_I64](p, len, data, e0 + i + j + q, 0)
+                            else:
+                                len = write_elem_k[K_I32](p, len, data, e0 + i + j + q, 0)
                         j += 4
                         continue
                     if hiv.eq(0).reduce_and():
@@ -1344,12 +1822,18 @@ def nd_rec[o_: Origin[mut=True]](bp: Pointer[Buf, o_], data: Int, kind: Int, shp
                     store8(p, len, UInt64(0x65757274) if bv == 1 else UInt64(0x65736C6166))
                     len += 5 - bv
                     j += 1
-            while j < chunk:
-                if i + j > 0:
-                    (p + len)[] = 44
-                    len += 1
-                len = write_elem(p, len, data, e0 + i + j, kind)
-                j += 1
+            var base = e0 + i
+            if kind == K_F64:
+                len = row_tail[K_F64](p, len, data, base, i, j, chunk, aux)
+            elif kind == K_I64:
+                len = row_tail[K_I64](p, len, data, base, i, j, chunk, aux)
+            elif kind == K_I32:
+                len = row_tail[K_I32](p, len, data, base, i, j, chunk, aux)
+            elif kind != K_BOOL:
+                # the other kinds stay out of line so this function stays small
+                len = row_other(kind, p, len, data, base, i, j, chunk, aux)
+                if unlikely(len < 0):
+                    return False
             bp[].len = len
             i += chunk
     else:
@@ -1357,11 +1841,58 @@ def nd_rec[o_: Origin[mut=True]](bp: Pointer[Buf, o_], data: Int, kind: Int, shp
         for i in range(cnt):
             if i > 0:
                 put_byte(bp, 44)
-            nd_rec(bp, data, kind, shp, ndim, dim + 1, e0 + i * sub, sub)
+            if not nd_rec[KIND](bp, data, kind, shp, ndim, dim + 1, e0 + i * sub, sub, aux):
+                return False
     put_byte(bp, 93)
+    return True
 
+# Whole array through the instance specialized for its kind.
+@always_inline
+def nd_write[o_: Origin[mut=True]](bp: Pointer[Buf, o_], data: Int, kind: Int, shp: Int, ndim: Int, block: Int, aux: Int) -> Bool:
+    if kind == K_F64:
+        return nd_rec[K_F64](bp, data, kind, shp, ndim, 0, 0, block, aux)
+    if kind == K_I64:
+        return nd_rec[K_I64](bp, data, kind, shp, ndim, 0, 0, block, aux)
+    if kind == K_I32:
+        return nd_rec[K_I32](bp, data, kind, shp, ndim, 0, 0, block, aux)
+    if kind == K_BOOL:
+        return nd_rec[K_BOOL](bp, data, kind, shp, ndim, 0, 0, block, aux)
+    return nd_rec[-1](bp, data, kind, shp, ndim, 0, 0, block, aux)
+
+# OPT_INDENT_2: one element per line, like the indented list writer (depth is
+# the array's own nesting level; its elements are indented 2*depth spaces).
 @no_inline
-def ser_numpy[NONSTR: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=True], c_: Origin](bp: Pointer[Buf, o_], cp: Pointer[Ctx, c_], o: Int, depth: Int) -> Bool:
+def nd_rec_indent[o_: Origin[mut=True]](bp: Pointer[Buf, o_], data: Int, kind: Int, shp: Int, ndim: Int, dim: Int, e0: Int, block: Int, aux: Int, depth: Int) -> Bool:
+    var cnt = rdi(shp, dim)
+    put_byte(bp, 91)
+    if dim == ndim - 1:
+        for i in range(cnt):
+            bp[].ensure(2 * depth + 96)
+            var p = bp[].p
+            var len = indent_at(p, bp[].len, depth, i > 0)
+            len = write_elem(p, len, data, e0 + i, kind, aux)
+            if unlikely(len < 0):
+                return False
+            bp[].len = len
+    else:
+        var sub = block // cnt if cnt > 0 else 0
+        for i in range(cnt):
+            bp[].ensure(2 * depth + 48)
+            bp[].len = indent_at(bp[].p, bp[].len, depth, i > 0)
+            if not nd_rec_indent(bp, data, kind, shp, ndim, dim + 1, e0 + i * sub, sub, aux, depth + 1):
+                return False
+    if cnt > 0:
+        close_indent(bp, depth - 1)
+    put_byte(bp, 93)
+    return True
+
+# numpy scalars and arrays. Scalars of the numeric kinds expose a 0-d buffer
+# and are written in place. Arrays go through the buffer protocol (datetime64
+# arrays export none, so the C shim reads their array interface). What is not
+# handled natively goes to the fallback, where the C shim applies orjson's
+# rules: non-contiguous, 0-d and unsupported dtypes use default or raise.
+@no_inline
+def ser_numpy[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, CONFIG: Bool, o_: Origin[mut=True], c_: Origin](bp: Pointer[Buf, o_], cp: Pointer[Ctx, c_], o: Int, depth: Int) -> Bool:
     ref ctx = cp[]
     var tp = ob_type(o)
     # np.float64 is a float subclass: same memory layout as float
@@ -1369,9 +1900,14 @@ def ser_numpy[NONSTR: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=True], c_: 
         bp[].ensure(40)
         bp[].len += float_at(bp[].p + bp[].len, o)
         return True
-    # ndarray: buffer protocol fast path for contiguous numeric data
-    var view = SIMD[DType.int64, 16](0)
-    var vp = Int(Pointer(to=view))
+    var is_array = is_ndarray_type(tp)
+    # Py_buffer (80 bytes) in a real stack allocation: the writers below spill
+    # SIMD temporaries, and a value whose address only lives on as an Int could
+    # share their slot.
+    var view = unsafe_stack_allocation[16, Int]()
+    for z in range(16):
+        view[z] = 0
+    var vp = Int(view)
     if external_call["PyObject_GetBuffer", Int32](o, vp, Int32(0x1C)) == 0:
         var vw = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=vp)
         var data = vw[]
@@ -1382,26 +1918,56 @@ def ser_numpy[NONSTR: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=True], c_: 
         var shp = vw[unsafe_offset=6]
         var strd = vw[unsafe_offset=7]
         var kind = buf_kind(fmt, isz) if fmt != 0 else -1
-        var contig = kind >= 0 and ndim >= 1
-        if contig:
-            var expect = isz
-            var d = ndim - 1
-            while d >= 0:
-                if rdi(shp, d) > 1 and rdi(strd, d) != expect:
-                    contig = False
-                expect *= rdi(shp, d)
-                d -= 1
-        if contig:
-            # size the output once for the whole array (avoids repeated grow+copy on big arrays)
-            var per = 26 if kind <= 1 else 22
-            bp[].ensure((total // isz) * per + ndim * 64 + 64)
-            nd_rec(bp, data, kind, shp, ndim, 0, 0, total // isz)
-            external_call["PyBuffer_Release", NoneType](vp)
-            return True
+        if not is_array:
+            if kind >= 0 and ndim == 0:
+                bp[].ensure(48)
+                bp[].len = write_elem(bp[].p, bp[].len, data, 0, kind, 0)
+                external_call["PyBuffer_Release", NoneType](vp)
+                return True
+        else:
+            var contig = kind >= 0 and ndim >= 1 and isz > 0
+            if contig and strd != 0:
+                var expect = isz
+                var d = ndim - 1
+                while d >= 0:
+                    if rdi(shp, d) > 1 and rdi(strd, d) != expect:
+                        contig = False
+                    expect *= rdi(shp, d)
+                    d -= 1
+            if contig:
+                var ok: Bool
+                comptime if INDENT:
+                    ok = nd_rec_indent(bp, data, kind, shp, ndim, 0, 0, total // isz, 0, depth + 1)
+                else:
+                    # size the output once for the whole array (avoids repeated grow+copy on big arrays)
+                    bp[].ensure((total // isz) * elem_reserve(kind) + ndim * 64 + 64)
+                    ok = nd_write(bp, data, kind, shp, ndim, total // isz, 0)
+                external_call["PyBuffer_Release", NoneType](vp)
+                return ok
         external_call["PyBuffer_Release", NoneType](vp)
     else:
         external_call["PyErr_Clear", NoneType]()
-    return ser_fallback[False, SORT, False, NONSTR, SOCKET](bp, cp, o, depth)
+        if is_array:
+            # info: data, ndim, shape, unit, capsule, element count
+            var info = unsafe_stack_allocation[8, Int]()
+            for z in range(8):
+                info[z] = 0
+            var ip = Int(info)
+            var status = external_call["yjson_numpy_datetime_array", Int32](ctx.request, o, ip)
+            if status < 0:
+                return False
+            if status == 1:
+                var iw = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=ip)
+                var aux = (ctx.option << 8) | iw[unsafe_offset=3]
+                var ok: Bool
+                comptime if INDENT:
+                    ok = nd_rec_indent(bp, iw[], K_DT64, iw[unsafe_offset=2], iw[unsafe_offset=1], 0, 0, iw[unsafe_offset=5], aux, depth + 1)
+                else:
+                    bp[].ensure(iw[unsafe_offset=5] * 40 + iw[unsafe_offset=1] * 64 + 64)
+                    ok = nd_rec[-1](bp, iw[], K_DT64, iw[unsafe_offset=2], iw[unsafe_offset=1], 0, 0, iw[unsafe_offset=5], aux)
+                external_call["Py_DecRef", NoneType](iw[unsafe_offset=4])
+                return ok
+    return ser_fallback[INDENT, SORT, CONFIG, NONSTR, SOCKET](bp, cp, o, depth)
 
 @no_inline
 def int_batch(p: P8, len0: Int, items: Int, i: Int, cnt: Int, t_int: Int) -> Int:
@@ -1414,11 +1980,14 @@ def int_batch(p: P8, len0: Int, items: Int, i: Int, cnt: Int, t_int: Int) -> Int
         objs[j] = oj
         ok = ok and ob_type(oj) == t_int
     if ok:
+        var lane_tags = SIMD[DType.int, NL](0)
         comptime for j in range(NL):
-            tags |= long_tag(Int(objs[j]))
-        # all compact and non-negative: ndigits <= 1 (bit 3), sign 0/1 (bit 0);
-        # bit 2 is the small-int immortality flag on 3.14+
-        if (tags & ~13) == 0:
+            lane_tags[j] = long_tag(Int(objs[j]))
+            tags |= lane_tags[j]
+        # all compact: ndigits <= 1 (bit 3), sign bits 0-1 (0 positive, 1 zero,
+        # 2 negative); bit 2 is the small-int immortality flag on 3.14+. The
+        # sign is written without a branch, so random signs do not mispredict.
+        if (tags & ~15) == 0:
             if i + 2 * NL <= cnt:
                 comptime for j in range(NL):
                     prefetch[PrefetchOptions().for_read().high_locality()](Pointer[Int, MutUntrackedOrigin](unsafe_from_address=rdi(items, i + NL + j)))
@@ -1428,14 +1997,100 @@ def int_batch(p: P8, len0: Int, items: Int, i: Int, cnt: Int, t_int: Int) -> Int
             if m.lt(U4(100000000)).reduce_and():
                 var nd = ndigits_v(m)
                 var w = eight_digits_x4(m) >> ((U4(8) - nd) * 8)
+                if (tags & 2) == 0:
+                    # no negative in this group: nothing between the comma and the digits
+                    comptime for j in range(NL):
+                        if i + j > 0:
+                            (p + len)[] = 44
+                            len += 1
+                        store8(p, len, w[j])
+                        len += Int(nd[j])
+                    return len
+                var negative = (lane_tags >> 1) & 1
                 comptime for j in range(NL):
                     if i + j > 0:
                         (p + len)[] = 44
                         len += 1
+                    (p + len)[] = 45
+                    len += Int(negative[j])
                     store8(p, len, w[j])
                     len += Int(nd[j])
                 return len
     return -1
+
+# M floats (1-4) of a short leaf list, written as one group: the shortest-
+# digit conversions first (independent work the CPU overlaps), then the
+# layouts, as the flat-list batch does. Lanes outside the 16-17 digit case use
+# the generic layout from the same digits; NaN/Infinity/zero take the scalar
+# writer. A comma precedes every lane whose index (j0 + j) is not 0.
+@always_inline
+def float_lanes_at[M: Int](p: P8, len0: Int, inner: Int, j0: Int) -> Int:
+    var len = len0
+    var bits = SIMD[DType.uint64, 4](0)
+    var ig = SIMD[DType.uint64, 4](0)
+    var kk = SIMD[DType.int, 4](0)
+    var last = SIMD[DType.uint64, 4](0)
+    var regular = True
+    comptime for j in range(M):
+        var b = float_bits(rdi(inner, j0 + j))
+        bits[j] = b
+        regular = regular and ((b >> 52) & 0x7FF) != 0x7FF and (b << 1) != 0
+    if likely(regular):
+        comptime for j in range(M):
+            var k = 0
+            var l: UInt64 = 0
+            ig[j] = to_decimal2(bits[j] & 0x7FFFFFFFFFFFFFFF, k, l)
+            kk[j] = k
+            last[j] = l
+        comptime for j in range(M):
+            if j0 + j > 0:
+                (p + len)[] = 44
+                len += 1
+            (p + len)[] = 45
+            var sign = Int(bits[j] >> 63)
+            var g = ig[j]
+            if likely(g >= 100000000000000 and g < 10000000000000000):
+                var he = g >= 1000000000000000
+                var x = g if he else g * 10 + last[j]
+                var hh = x // 100000000
+                var tz = 0
+                var D = to_digits16(hh, x - hh * 100000000, tz)
+                len += float_layout3(p + len, sign, Int(kk[j]), 16 + Int(he), D, tz, (48 + last[j]) if he else UInt64(48))
+            else:
+                len += float_at(p + len, rdi(inner, j0 + j))
+        return len
+    comptime for j in range(M):
+        if j0 + j > 0:
+            (p + len)[] = 44
+            len += 1
+        len += float_at(p + len, rdi(inner, j0 + j))
+    return len
+
+# Two floats (coordinate pairs): the two-lane group, out of line.
+@no_inline
+def float_pair_at(p: P8, len0: Int, inner: Int) -> Int:
+    return float_lanes_at[2](p, len0, inner, 0)
+
+# The floats of a short leaf list (1-16, all floats), in groups of up to four
+# lanes. Out of line so the list loop that calls it stays small.
+@no_inline
+def leaf_floats_at(p: P8, len0: Int, inner: Int, count: Int) -> Int:
+    var len = len0
+    var j = 0
+    while count - j >= 4:
+        len = float_lanes_at[4](p, len, inner, j)
+        j += 4
+    var rest = count - j
+    if rest == 3:
+        len = float_lanes_at[3](p, len, inner, j)
+    elif rest == 2:
+        len = float_lanes_at[2](p, len, inner, j)
+    elif rest == 1:
+        if j > 0:
+            (p + len)[] = 44
+            len += 1
+        len += float_at(p + len, rdi(inner, j))
+    return len
 
 @no_inline
 def float_batch(p: P8, len0: Int, items: Int, i: Int, t_float: Int) -> Int:
@@ -1723,34 +2378,81 @@ def ser_list[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o_: Origin[mu
             len += 4 if is_true else 5
             i += 1
             continue
-        # Short leaf lists of floats (coordinate pairs, small vectors): written
-        # in place, without the nested call and its prologue. Nothing here runs
-        # Python code, so no ancestor or mutation handling.
+        # Short leaf lists of scalars (coordinate pairs, small vectors, rows):
+        # written in place, without the nested call and its prologue. Nothing
+        # here runs Python code, so no ancestor or mutation handling; anything
+        # else inside (a container, a big int, an unknown type) rewinds and
+        # takes the general path.
         if not INDENT and (t == t_list or t == cp[].t_tuple) and depth < 255:
             var inner_count = ob_size(v)
             if inner_count >= 1 and inner_count <= 16:
                 var inner = list_items(v) if t == t_list else tuple_items(v)
+                var start = len
+                var need = inner_count * 27 + 48
+                if unlikely(len + need > cap):
+                    bp[].len = len
+                    bp[].grow(need)
+                    p = bp[].p
+                    cap = bp[].cap
+                (p + len)[] = 91
+                len += 1
+                # all floats (coordinates, vectors): the tightest loop
                 var numeric = True
                 for j in range(inner_count):
                     numeric = numeric and ob_type(rdi(inner, j)) == t_float
                 if numeric:
-                    var need = inner_count * 27 + 8
-                    if unlikely(len + need > cap):
-                        bp[].len = len
-                        bp[].grow(need)
-                        p = bp[].p
-                        cap = bp[].cap
-                    (p + len)[] = 91
-                    len += 1
-                    for j in range(inner_count):
-                        if j > 0:
-                            (p + len)[] = 44
-                            len += 1
-                        len += float_at(p + len, rdi(inner, j))
+                    if inner_count == 2:
+                        len = float_pair_at(p, len, inner)
+                    else:
+                        len = leaf_floats_at(p, len, inner, inner_count)
                     (p + len)[] = 93
                     len += 1
                     i += 1
                     continue
+                var leaf = True
+                for j in range(inner_count):
+                    var e = rdi(inner, j)
+                    var et = ob_type(e)
+                    if j > 0:
+                        (p + len)[] = 44
+                        len += 1
+                    if et == t_int:
+                        var r = int_fast(p, len, e)
+                        if r < 0:
+                            leaf = False
+                            break
+                        len = r
+                    elif et == t_str:
+                        var esz = 0
+                        var esrc = str_src(e, esz)
+                        if unlikely(esrc == 0):
+                            leaf = False
+                            break
+                        var eneed = esz * 6 + 66
+                        if unlikely(len + eneed > cap):
+                            bp[].len = len
+                            bp[].grow(eneed)
+                            p = bp[].p
+                            cap = bp[].cap
+                        len = escape_at(p, len, esrc, esz)
+                    elif et == t_float:
+                        len += float_at(p + len, e)
+                    elif e == none_addr:
+                        store8(p, len, 0x6C6C756E)
+                        len += 4
+                    elif et == cp[].t_bool:
+                        var is_true = e == cp[].true_addr
+                        store8(p, len, UInt64(0x65757274) if is_true else UInt64(0x65736C6166))
+                        len += 4 if is_true else 5
+                    else:
+                        leaf = False
+                        break
+                if leaf:
+                    (p + len)[] = 93
+                    len += 1
+                    i += 1
+                    continue
+                len = start
         bp[].len = len
         if not ser_value[NONSTR, SORT, SOCKET, INDENT](bp, cp, v, depth):
             return False
@@ -1792,7 +2494,7 @@ def ser_dict_records[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o_: O
     return ok
 
 @no_inline
-def ser_dict_items[NONSTR: Bool, SORT: Bool, SOCKET: Bool, RECORDS: Bool, INDENT: Bool, o_: Origin[mut=True], c_: Origin](bp: Pointer[Buf, o_], cp: Pointer[Ctx, c_], o: Int, depth: Int, sorted_items: Int) -> Bool:
+def ser_dict_items[NONSTR: Bool, SORT: Bool, SOCKET: Bool, RECORDS: Bool, INDENT: Bool, o_: Origin[mut=True], c_: Origin, SKIP_PRIVATE: Bool = False](bp: Pointer[Buf, o_], cp: Pointer[Ctx, c_], o: Int, depth: Int, sorted_items: Int) -> Bool:
     if depth > 255:
         bp[].err = 3
         return False
@@ -1841,6 +2543,12 @@ def ser_dict_items[NONSTR: Bool, SORT: Bool, SOCKET: Bool, RECORDS: Bool, INDENT
                     bp[].len = len
                     bp[].err = 8 if NONSTR else 4
                     return False
+        comptime if SKIP_PRIVATE:
+            # dataclass instance dict: attributes starting with "_" are not written
+            var ksz0 = 0
+            var ksrc0 = str_src(k, ksz0)
+            if ksz0 > 0 and P8(unsafe_from_address=ksrc0)[] == 95:
+                continue
         comptime if RECORDS:
             # Key text comes from the record: utf8 bytes, or (negative length)
             # a complete JSON string written verbatim. Non-str keys may own
@@ -2047,12 +2755,15 @@ def ser_fallback[INDENT: Bool, SORT: Bool, CONFIG: Bool, NONSTR: Bool, SOCKET: B
     if depth > 254:
         bp[].err = 3
         return False
-    if external_call["yjson_enter_fallback", Int32](cp[].request) == 0:
-        return False
+    # default may nest 255 deep; the count lives in the C request (it raises the error)
+    var conversions = Pointer[Int32, MutUntrackedOrigin](unsafe_from_address=cp[].request + cp[].conv_off)
+    if unlikely(conversions[] >= 255):
+        return external_call["yjson_enter_fallback", Int32](cp[].request) != 0
+    conversions[] += 1
     var fragment = Int32(0)
     var converted = external_call["yjson_convert", Int](cp[].request, o, Int(Pointer(to=fragment)), cp[].ancestors, depth)
     if converted == 0:
-        external_call["yjson_leave_fallback", NoneType](cp[].request)
+        conversions[] -= 1
         return False
     var ok: Bool
     if fragment == 1:
@@ -2074,11 +2785,14 @@ def ser_fallback[INDENT: Bool, SORT: Bool, CONFIG: Bool, NONSTR: Bool, SOCKET: B
             if fragment == 2:
                 # dataclass fields keep their declaration order (never sorted)
                 ok = ser_dict_items[NONSTR, SORT, SOCKET, False, INDENT](bp, cp, converted, depth + 1, 0)
+            elif fragment == 3:
+                # a dataclass instance's own dict: its order, minus "_" attributes
+                ok = ser_dict_items[NONSTR, SORT, SOCKET, False, INDENT, SKIP_PRIVATE=True](bp, cp, converted, depth + 1, 0)
             else:
                 ok = ser_value[NONSTR, SORT, SOCKET, INDENT](bp, cp, converted, depth)
         generation[] += 1
     external_call["Py_DecRef", NoneType](converted)
-    external_call["yjson_leave_fallback", NoneType](cp[].request)
+    conversions[] -= 1
     return ok
 
 # Optional ',' then '\n' and 2*depth spaces, in one reservation and (up to
@@ -2192,6 +2906,11 @@ def ser_configured[INDENT: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=True],
         return True
     if tp == ctx.t_dict:
         return ser_configured_dict[INDENT, SORT, SOCKET](bp, cp, o, depth, False)
+    var special = ser_special[False, SORT, SOCKET, INDENT, False](bp, cp, o, depth)
+    if special != 0:
+        return special > 0
+    if is_numpy_type(tp):
+        return ser_numpy[False, SORT, SOCKET, INDENT, True](bp, cp, o, depth)
     return ser_fallback[INDENT, SORT, True, False, SOCKET](bp, cp, o, depth)
 
 @inline(.never)
@@ -2389,6 +3108,7 @@ def PyInit_yjson() abi("C") -> PythonObject:
         ctx[].kc = Int(kc)
         if external_call["yjson_install", Int32](Int(mod._obj_ptr), Int(ctx)) != 0:
             return PythonObject(from_owned=external_call["yjson_null", PyObjectPtr]())
+        ctx[].load_special()
         return mod
     except e:
         var detail = String(e)

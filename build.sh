@@ -12,13 +12,15 @@ cd "$(dirname "$0")"
 mkdir -p build
 PYTHON_BIN="${PYTHON:-.venv-bench/bin/python}"
 if [ ! -x "$PYTHON_BIN" ]; then PYTHON_BIN="${PYTHON:-python3}"; fi
-read -r PYTHON_INCLUDE EXT_SUFFIX PYTHON_TAG < <("$PYTHON_BIN" - <<'EOF'
-import sys, sysconfig
+read -r PYTHON_INCLUDE EXT_SUFFIX PYTHON_TAG VERSION < <("$PYTHON_BIN" - <<'EOF'
+import sys, sysconfig, tomllib
 if not (3, 11) <= sys.version_info[:2] <= (3, 15):
     sys.exit(f"yjson supports CPython 3.11 through 3.15, not {sys.version.split()[0]}")
 if sysconfig.get_config_var("Py_GIL_DISABLED"):
     sys.exit("yjson does not support free-threaded CPython builds")
-print(sysconfig.get_path("include"), sysconfig.get_config_var("EXT_SUFFIX"), f"{sys.version_info[0]}.{sys.version_info[1]}")
+with open("pyproject.toml", "rb") as f:
+    version = tomllib.load(f)["project"]["version"]
+print(sysconfig.get_path("include"), sysconfig.get_config_var("EXT_SUFFIX"), f"{sys.version_info[0]}.{sys.version_info[1]}", version)
 EOF
 )
 CC_BIN="${CC:-cc}"
@@ -32,7 +34,8 @@ while IFS='=' read -r name value; do
 done < <(build/layout_probe)
 LAYOUT_MOJO+=(-D "YJSON_DIRECT_DICT=${YJSON_DIRECT_DICT:-1}")
 OUT="build/yjson$EXT_SUFFIX"
-"$CC_BIN" -O3 -fPIC -Wall -Wextra -Werror "${LAYOUT_C[@]}" -I "$PYTHON_INCLUDE" -c src/python_api.c -o "build/python_api-$PYTHON_TAG.o"
+# yjson.__version__ comes from pyproject.toml.
+"$CC_BIN" -O3 -fPIC -Wall -Wextra -Werror "${LAYOUT_C[@]}" -DYJSON_VERSION="\"$VERSION\"" -I "$PYTHON_INCLUDE" -c src/python_api.c -o "build/python_api-$PYTHON_TAG.o"
 "${MOJO:-mojo}" build --mcpu "${MCPU:-x86-64-v3}" "${LAYOUT_MOJO[@]}" src/yjson.mojo --emit shared-lib -Xlinker "$PWD/build/python_api-$PYTHON_TAG.o" -o "$OUT"
 cp src/_yjson_support.py build/_yjson_support.py
 cp src/yjson.pyi build/yjson.pyi

@@ -58,9 +58,14 @@ See `examples/usage.py` (NumPy, NaN, files, errors).
 `dumps(obj, /, default=None, option=None)` returns bytes. In addition to the
 basic JSON types, it supports datetime/date/time, UUID, Enum, dataclass
 instances, and subclasses of str/int/list/dict. Dataclass fields beginning
-with `_` are omitted. Tuple subclasses use `default` rather than being treated
-as arrays. Encoding errors are `JSONEncodeError`, an alias of `TypeError`;
-exceptions raised by a default callback are attached as `__cause__`.
+with `_` are omitted. Tuple and UUID subclasses use `default` rather than
+being serialized natively, as in orjson. Aware datetimes work with
+`datetime.timezone`, zoneinfo, dateutil, pendulum and pytz (a pytz zone
+attached with `tzinfo=` is normalized first, so it gets its real offset rather
+than LMT). Encoding errors are `JSONEncodeError`, an alias of `TypeError`; when
+a `default` callback raises, the error reads `Type is not JSON serializable:
+<type>` and the callback's exception is attached as `__cause__`. A `default`
+may nest up to 255 deep.
 
 ```python
 import datetime
@@ -91,13 +96,31 @@ the 64-bit range in strict mode. Non-string key conversion preserves duplicate
 JSON keys. Fragments insert their contents verbatim, including under indentation;
 validate the contents yourself when needed.
 
+NumPy arrays and scalars of bool, int8-int64, uint8-uint64, float16, float32,
+float64 and datetime64 are written from their raw buffers, in every option
+mode (indentation included). float32 and float16 values are written with their
+own shortest round-trip digits (`3.4028235e+38`, not the float64 expansion),
+and datetime64 values as `YYYY-MM-DDTHH:MM:SS[.ffffff]` for years 0000-9999 in
+units from years to nanoseconds, honoring `OPT_NAIVE_UTC`, `OPT_UTC_Z` and
+`OPT_OMIT_MICROSECONDS`; NaT and finer units raise. The remaining rules follow
+orjson: arrays that are not C-contiguous, 0-dimensional, or of another dtype go
+to `default` and otherwise raise (`numpy array is not C contiguous; use
+ndarray.tolist() in default`, `unsupported datatype in numpy array`), arrays in
+non-native byte order always raise, and other numpy scalars (complex,
+timedelta64, bytes_, ...) go to `default`. Unlike orjson, yjson does not
+require `OPT_SERIALIZE_NUMPY`, writes NaN and infinity as `NaN`/`Infinity`,
+and represents the whole of year 9999.
+
 `OPT_INDENT_2`, `OPT_SORT_KEYS` and `OPT_NON_STR_KEYS` run on the same
 compiled writers as the compact default (indentation is a compile-time variant
 of those loops; sorting and non-str keys snapshot the dict as native records),
 so they stay close to orjson's speed for the same option. `OPT_STRICT_INTEGER`
 and `OPT_PASSTHROUGH_SUBCLASS` use a generic traversal that checks every value
-and is slower. Custom conversions and uncommon types cost additional work;
-measure their speed on your payload (`bench/bench_shapes.py`). `loads` uses Python's standard parser with UTF-8, nonfinite-number,
+and is slower. datetime, date, time, UUID, Enum and int/str subclasses are
+written from their object layouts without a Python call (dataclass instances
+from their `__dict__`), at or beyond orjson's speed per item
+(`bench/bench_types.py`); `default` callbacks and other custom conversions cost
+a Python call each. Measure on your payload (`bench/bench_shapes.py`). `loads` uses Python's standard parser with UTF-8, nonfinite-number,
 and surrogate checks. It accepts str/bytes/bytearray/contiguous memoryview and
 raises `JSONDecodeError` (a subclass of `json.JSONDecodeError`). Its parsing
 speed and maximum nesting follow the stdlib backend, rather than orjson's parser.
@@ -136,6 +159,7 @@ python tests/check_correctness.py path/to/jsonexamples     # corpus optional
 python tests/check_features.py                            # options, types, callbacks, decoding
 python bench/bench_paired.py path/to/jsonexamples          # yjson vs orjson, robust
 python bench/bench_features.py                            # enabled feature paths vs orjson
+python bench/bench_types.py                               # datetime, UUID, dataclass, Enum per item vs orjson
 python bench/bench_shapes.py --cpu 2                      # per payload shape vs orjson (where it wins or loses)
 python bench/bench_regression.py                          # requires a baseline build in build/baseline/
 python bench/bench_all_libraries.py path/to/jsonexamples   # + msgspec, ujson, rapidjson, json, simplejson
@@ -143,9 +167,13 @@ python bench/bench_numpy.py
 ```
 
 `tests/suite/` is orjson 3.12.0's own test suite run against yjson (see
-`THIRD_PARTY_NOTICES.md`). It reports every difference as a failure, including
-the intended ones (NaN/Infinity written as Python's `json` writes them, stdlib
-parsing), and runs each test in a forked child so a crash fails one test:
+`THIRD_PARTY_NOTICES.md`). It runs each test in a forked child so a crash fails
+one test. Seven tests differ by design and are declared strict expected
+failures in `tests/suite/conftest.py`: five write NaN/Infinity (yjson writes
+them as Python's `json` does, orjson writes `null`), and two check the stdlib
+parser's error message and position for an empty document and an unterminated
+string. Any other difference, or one of those seven starting to pass, fails
+the run:
 
 ```bash
 pip install -r tests/suite/requirements.txt
@@ -200,7 +228,10 @@ x86-64-v3 (AVX2) by design.
 every push and pull request: it builds the sdist, builds one wheel per
 interpreter from that sdist, repairs it, installs it into a clean environment
 and runs `tests/check_features.py`, `tests/check_correctness.py` (with the
-simdjson corpus) and `examples/usage.py` against the installed wheel. Pushing a
+simdjson corpus), `examples/usage.py` and orjson's test suite (`tests/suite`)
+against the installed wheel. A separate informational job runs the benchmarks
+against orjson on CPython 3.13 and writes the tables to the run summary (shared
+runners are noisy, so it never fails the build). Pushing a
 tag `vX.Y.Z` whose version matches `pyproject.toml` additionally publishes the
 sdist and wheels to PyPI through [trusted publishing](https://docs.pypi.org/trusted-publishers/)
 from the `pypi` GitHub environment, so no API token is stored. To release:

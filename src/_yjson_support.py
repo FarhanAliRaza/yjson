@@ -4,6 +4,7 @@ import datetime
 import enum
 import json
 import math
+import sys
 import uuid
 
 OPT_INDENT_2 = 1
@@ -24,16 +25,20 @@ JSONEncodeError = TypeError
 
 
 class JSONDecodeError(json.JSONDecodeError):
-    pass
+    __module__ = "yjson"
 
 
 class Fragment:
     """Insert pre-serialized JSON verbatim. Contents are deliberately unvalidated."""
     __slots__ = ("_data",)
+    __module__ = "yjson"
 
     def __init__(self, value):
         if type(value) is str:
-            value = value.encode("utf-8")
+            try:
+                value = value.encode("utf-8")
+            except UnicodeEncodeError:
+                pass  # lone surrogates: dumps() raises JSONEncodeError, as orjson does
         elif type(value) is not bytes:
             raise TypeError("Fragment requires bytes or str")
         self._data = value
@@ -43,9 +48,23 @@ class _DataclassFields(dict):
     pass
 
 
+def _utc_offset(obj):
+    """orjson's rule: pendulum (convert) through the datetime, pytz (normalize) after normalizing, else utcoffset(dt)."""
+    tzinfo = obj.tzinfo
+    if tzinfo is None:
+        return None
+    if isinstance(tzinfo, datetime.timezone) or hasattr(tzinfo, "convert"):
+        return obj.utcoffset()
+    if hasattr(tzinfo, "normalize"):
+        return tzinfo.normalize(obj).utcoffset()
+    if hasattr(tzinfo, "dst"):
+        return tzinfo.utcoffset(obj)
+    raise TypeError("datetime's timezone library is not supported: use datetime.timezone.utc, pendulum, pytz, or dateutil")
+
+
 def _datetime_string(obj, option):
     if isinstance(obj, datetime.datetime):
-        offset = obj.utcoffset()
+        offset = _utc_offset(obj)
         if offset is None and option & OPT_NAIVE_UTC:
             offset = datetime.timedelta(0)
         text = obj.replace(tzinfo=None).isoformat(timespec="seconds" if option & OPT_OMIT_MICROSECONDS or not obj.microsecond else "microseconds")
@@ -58,7 +77,7 @@ def _datetime_string(obj, option):
             return text + f"{sign}{minutes // 60:02d}:{minutes % 60:02d}"
     elif isinstance(obj, datetime.time):
         if obj.tzinfo is not None:
-            raise TypeError("datetime.time must not have tzinfo")
+            raise TypeError("datetime.time must not have tzinfo set")
         text = obj.isoformat(timespec="seconds" if option & OPT_OMIT_MICROSECONDS or not obj.microsecond else "microseconds")
     else:
         text = obj.isoformat()
@@ -71,13 +90,11 @@ def convert(obj, default, option):
     if isinstance(obj, (datetime.datetime, datetime.date, datetime.time)):
         if not option & OPT_PASSTHROUGH_DATETIME:
             return _datetime_string(obj, option)
-    elif isinstance(obj, uuid.UUID):
+    elif type(obj) is uuid.UUID:
         return str(obj)
     elif dataclasses.is_dataclass(obj) and not isinstance(obj, type):
         if not option & OPT_PASSTHROUGH_DATACLASS:
             return _DataclassFields((field.name, getattr(obj, field.name)) for field in dataclasses.fields(obj) if not field.name.startswith("_"))
-    elif type(obj).__module__.startswith("numpy"):
-        return obj.tolist()
     elif not option & OPT_PASSTHROUGH_SUBCLASS:
         if isinstance(obj, str):
             return str.__str__(obj)
@@ -117,9 +134,9 @@ def _key_string(key, option, native):
         return native(key).decode("utf-8") if math.isfinite(key) else "null"
     if isinstance(key, (datetime.datetime, datetime.date, datetime.time)):
         return _datetime_string(key, option)
-    if isinstance(key, uuid.UUID):
+    if type(key) is uuid.UUID:
         return str(key)
-    raise TypeError("Dict key must be a supported type")
+    raise TypeError("Dict key must a type serializable with OPT_NON_STR_KEYS")
 
 
 def _float(text):
@@ -138,6 +155,21 @@ def _constant(text):
     raise ValueError(f"unexpected character: {text}")
 
 
+def _parse(text):
+    try:
+        return json.loads(text, parse_constant=_constant, parse_float=_float, parse_int=_integer)
+    except RecursionError:
+        # CPython < 3.12 charges the C scanner's nesting to the Python recursion limit (1000 by
+        # default), which documents at orjson's 1024-deep limit exceed. Retry with room for them;
+        # anything deeper still fails and is reported as a decode error by the caller.
+        limit = sys.getrecursionlimit()
+        sys.setrecursionlimit(limit + 1100)
+        try:
+            return json.loads(text, parse_constant=_constant, parse_float=_float, parse_int=_integer)
+        finally:
+            sys.setrecursionlimit(limit)
+
+
 def loads(obj, /):
     if type(obj) not in (str, bytes, bytearray, memoryview):
         raise JSONDecodeError("Input must be bytes, bytearray, memoryview, or str", "", 0)
@@ -148,15 +180,16 @@ def loads(obj, /):
             obj = obj.tobytes()
         text = obj if type(obj) is str else obj.decode("utf-8")
         text.encode("utf-8")  # reject lone surrogate codepoints in input
-        result = json.loads(text, parse_constant=_constant, parse_float=_float, parse_int=_integer)
+        result = _parse(text)
         # json.loads accepts escaped lone surrogates; RFC 8259 UTF-8 output does not.
+        # Containers nest at most 1024 deep (orjson's limit), counted from the top-level one.
         pending = [(result, 0)]
         while pending:
             value, depth = pending.pop()
-            if depth > 1024:
-                raise ValueError("array and object recursion depth exceeded")
             if type(value) is str:
                 value.encode("utf-8")
+            elif depth >= 1024 and type(value) in (dict, list):
+                raise ValueError("array and object recursion depth exceeded")
             elif type(value) is dict:
                 pending.extend((key, depth + 1) for key in value)
                 pending.extend((child, depth + 1) for child in value.values())
@@ -167,3 +200,6 @@ def loads(obj, /):
         raise JSONDecodeError(error.msg, error.doc, error.pos) from None
     except (ValueError, UnicodeError, RecursionError) as error:
         raise JSONDecodeError(str(error), locals().get("text", ""), 0) from None
+
+
+loads.__module__ = "yjson"
