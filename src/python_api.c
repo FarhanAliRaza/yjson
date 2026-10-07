@@ -1625,7 +1625,7 @@ void yjson_error(int code) {
     PyErr_SetString(PyExc_TypeError, message);
 }
 
-int yjson_install_loads(PyObject *module, PyObject *support);  /* src/decoder.c */
+int yjson_install_loads(PyObject *module, PyObject *support);  /* src/decoder_api.c */
 
 int yjson_install(uintptr_t module_ptr, uintptr_t context) {
     restore_environment();

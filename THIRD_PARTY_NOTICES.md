@@ -64,7 +64,7 @@ The MIT License (MIT)
 
 ## fast_float
 
-The float parser in `src/decoder.c` (`eisel_lemire` and the eight-digit routines) and the
+The float parsers in `src/decoder.mojo` and `bench/c_decoder/decoder.c` (`eisel_lemire` and the eight-digit routines) and the
 power-of-five table generator `tools/powers_of_five.py` follow
 [fast_float](https://github.com/fastfloat/fast_float), which is licensed under
 the Apache License 2.0, the MIT License or the Boost Software License 1.0 at the

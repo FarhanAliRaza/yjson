@@ -36,9 +36,11 @@ LAYOUT_MOJO+=(-D "YJSON_DIRECT_DICT=${YJSON_DIRECT_DICT:-1}")
 OUT="build/yjson$EXT_SUFFIX"
 # yjson.__version__ comes from pyproject.toml.
 "$CC_BIN" -O3 -fPIC -Wall -Wextra -Werror "${LAYOUT_C[@]}" -DYJSON_VERSION="\"$VERSION\"" -I "$PYTHON_INCLUDE" -c src/python_api.c -o "build/python_api-$PYTHON_TAG.o"
-# The loads() parser is a separate C file with no dependence on the encoder.
-"$CC_BIN" -O3 -fPIC -Wall -Wextra -Werror -I "$PYTHON_INCLUDE" -c src/decoder.c -o "build/decoder-$PYTHON_TAG.o"
-"${MOJO:-mojo}" build --mcpu "${MCPU:-x86-64-v3}" "${LAYOUT_MOJO[@]}" src/yjson.mojo --emit shared-lib -Xlinker "$PWD/build/python_api-$PYTHON_TAG.o" -Xlinker "$PWD/build/decoder-$PYTHON_TAG.o" -o "$OUT"
+# C supplies the Python binding, annotation plans and generated constant table.
+"$CC_BIN" -O3 -fPIC -Wall -Wextra -Werror -I "$PYTHON_INCLUDE" -c src/decoder_api.c -o "build/decoder_api-$PYTHON_TAG.o"
+"$CC_BIN" -O3 -fPIC -Wall -Wextra -Werror -c src/decoder_powers.c -o "build/decoder_powers-$PYTHON_TAG.o"
+"${MOJO:-mojo}" build --mcpu "${MCPU:-x86-64-v3}" "${LAYOUT_MOJO[@]}" src/decoder.mojo --emit object -o "build/decoder-$PYTHON_TAG.o"
+"${MOJO:-mojo}" build --mcpu "${MCPU:-x86-64-v3}" "${LAYOUT_MOJO[@]}" src/yjson.mojo --emit shared-lib -Xlinker "$PWD/build/python_api-$PYTHON_TAG.o" -Xlinker "$PWD/build/decoder-$PYTHON_TAG.o" -Xlinker "$PWD/build/decoder_api-$PYTHON_TAG.o" -Xlinker "$PWD/build/decoder_powers-$PYTHON_TAG.o" -o "$OUT"
 cp src/_yjson_support.py build/_yjson_support.py
 cp src/yjson.pyi build/yjson.pyi
 echo "built $OUT for CPython $PYTHON_TAG"

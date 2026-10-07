@@ -1,10 +1,5 @@
-# The loads() parser ported to Mojo, for a like-for-like comparison with src/decoder.c.
-# Not part of the package: the C decoder is the one shipped. See README.md here.
-#
-# Same algorithm as the C version: SSE scans, key cache with next-key prediction,
-# unrolled digit chain, Clinger + Eisel-Lemire floats, lists built from a value
-# stack. Untyped decoding only. CPython object layouts come from -D defines that
-# build.sh takes from the main build's layout probe (defaults: CPython 3.13).
+# Strict JSON decoder: untyped Python values and direct typed dataclass construction.
+# CPython layouts and schema offsets are probed for the target interpreter.
 from std.ffi import external_call
 from std.memory import alloc, unsafe_stack_allocation
 from std.bit import count_trailing_zeros, count_leading_zeros
@@ -13,6 +8,27 @@ from std.sys.intrinsics import likely, unlikely
 from std.sys import get_defined_int
 from std.memory import bitcast
 from std.collections import Array
+
+comptime P32 = Pointer[Int32, MutUntrackedOrigin]
+comptime PLAN_SIZE = get_defined_int["YJSON_PLAN_SIZE"]()
+comptime PLAN_KIND = get_defined_int["YJSON_PLAN_KIND"]()
+comptime PLAN_ITEM = get_defined_int["YJSON_PLAN_ITEM"]()
+comptime PLAN_FIELDS = get_defined_int["YJSON_PLAN_FIELDS"]()
+comptime PLAN_NFIELDS = get_defined_int["YJSON_PLAN_NFIELDS"]()
+comptime PLAN_SEEN_WORDS = get_defined_int["YJSON_PLAN_SEEN_WORDS"]()
+comptime PLAN_TABLE = get_defined_int["YJSON_PLAN_TABLE"]()
+comptime PLAN_MASK = get_defined_int["YJSON_PLAN_MASK"]()
+comptime PLAN_KEY_INDEX = get_defined_int["YJSON_PLAN_KEY_INDEX"]()
+comptime PLAN_POST_INIT = get_defined_int["YJSON_PLAN_POST_INIT"]()
+comptime FIELD_SIZE = get_defined_int["YJSON_FIELD_SIZE"]()
+comptime FIELD_NAME = get_defined_int["YJSON_FIELD_NAME"]()
+comptime FIELD_PLAN = get_defined_int["YJSON_FIELD_PLAN"]()
+comptime FIELD_DEFAULT_VALUE = get_defined_int["YJSON_FIELD_DEFAULT_VALUE"]()
+comptime FIELD_DEFAULT_KIND = get_defined_int["YJSON_FIELD_DEFAULT_KIND"]()
+comptime FIELD_SLOT = get_defined_int["YJSON_FIELD_SLOT"]()
+comptime FIELD_HASH = get_defined_int["YJSON_FIELD_HASH"]()
+comptime FIELD_LENGTH = get_defined_int["YJSON_FIELD_LENGTH"]()
+comptime FIELD_BYTES = get_defined_int["YJSON_FIELD_BYTES"]()
 
 comptime P8 = Pointer[UInt8, MutUntrackedOrigin]
 comptime PI = Pointer[Int, MutUntrackedOrigin]
@@ -44,6 +60,12 @@ comptime ERR_EMPTY = 15
 comptime ERR_BOM = 16
 comptime ERR_TRAILING = 17
 comptime ERR_MEMORY = 18
+comptime ERR_LOW_SURROGATE = 19
+comptime ERR_LONE_SURROGATE = 20
+comptime ERR_TYPE = 21
+comptime ERR_MISSING = 22
+comptime ERR_OBJECT_SEPARATOR = 23
+comptime ERR_SIGN = 24
 
 
 
@@ -108,6 +130,8 @@ struct Parser:
     var end: Int
     var depth: Int
     var err: Int
+    var err_plan: Int
+    var err_detail: Int
     var err_at: Int
     var stack: PI
     var stack_len: Int
@@ -123,6 +147,8 @@ struct Parser:
         self.end = data + length
         self.depth = 0
         self.err = 0
+        self.err_plan = 0
+        self.err_detail = 0
         self.err_at = 0
         self.stack = PI(unsafe_from_address=inline_stack)
         self.stack_len = 0
@@ -149,7 +175,7 @@ def fail[o_: Origin[mut=True]](p: Pointer[Parser, o_], code: Int, at: Int) -> In
 
 @always_inline
 def is_space(b: UInt8) -> Bool:
-    # One bit test: bits 9, 10, 13 and 32 of the mask.
+    # JSON whitespace occupies bits 9, 10, 13 and 32 of the mask.
     return b <= 32 and ((UInt64(0x100002600) >> UInt64(b)) & 1) != 0
 
 
@@ -184,12 +210,19 @@ def decref(o: Int):
 @no_inline
 def skip_space_run(c0: Int, end: Int) -> Int:
     var c = c0
-    if c >= end or not is_space(rd(c)):
-        return c
-    c += 1
-    if c >= end or not is_space(rd(c)):
-        return c
-    c += 1
+    # Keep the ordinary-space path and non-whitespace exits separate: combining
+    # them into one Boolean made LLVM emit shifts, flag chains and cmov here.
+    comptime for i in range(2):
+        if c >= end:
+            return c
+        var b = rd(c)
+        if unlikely(b != 32):
+            if b > 13:
+                return c
+            # Clearing bit 2 maps CR (13) to TAB (9).
+            if b != 10 and (b & UInt8(0xFB)) != 9:
+                return c
+        c += 1
     while end - c >= 16:
         var v = P8(unsafe_from_address=c).unsafe_load[width=16]()
         var white = v.eq(32) | v.eq(10) | v.eq(13) | v.eq(9)
@@ -197,7 +230,13 @@ def skip_space_run(c0: Int, end: Int) -> Int:
         if mask != 0:
             return c + Int(count_trailing_zeros(mask))
         c += 16
-    while c < end and is_space(rd(c)):
+    while c < end:
+        var b = rd(c)
+        if unlikely(b != 32):
+            if b > 13:
+                break
+            if b != 10 and (b & UInt8(0xFB)) != 9:
+                break
         c += 1
     return c
 
@@ -258,7 +297,17 @@ def hex_value(b: UInt8) -> Int:
 @always_inline
 def hex4(hex: P8, c: Int, end: Int) -> Int:
     if c + 6 > end:
-        return -2
+        # An invalid byte already present takes precedence over a missing byte.
+        # Preserve the public diagnostic for malformed partial Unicode escapes.
+        var result = 0
+        for i in range(2, 6):
+            if c + i >= end:
+                return -2
+            var digit = Int(hex[unsafe_offset=Int(rd(c + i))])
+            if digit >= 16:
+                return -1
+            result = (result << 4) | digit
+        return result
     var a = Int(hex[unsafe_offset=Int(rd(c + 2))])
     var b = Int(hex[unsafe_offset=Int(rd(c + 3))])
     var d = Int(hex[unsafe_offset=Int(rd(c + 4))])
@@ -338,18 +387,19 @@ def string_slow[o_: Origin[mut=True]](p: Pointer[Parser, o_], start: Int, c0: In
                     return fail(p, ERR_ESCAPE, c)
                 if cp >= 0xD800 and cp <= 0xDBFF:
                     if c + 8 > end:
-                        return fail(p, ERR_SURROGATE, c)
+                        var prefix = c + 6 >= end or (rd(c + 6) == 92 and c + 7 >= end)
+                        return fail(p, ERR_EOF if prefix else ERR_SURROGATE, end if prefix else c)
                     if rd(c + 6) != 92 or rd(c + 7) != 117:
                         return fail(p, ERR_SURROGATE, c)
                     var low = hex4(hex, c + 6, end)
                     if low == -2:
                         return fail(p, ERR_EOF, end)
                     if low < 0xDC00 or low > 0xDFFF:
-                        return fail(p, ERR_SURROGATE, c)
+                        return fail(p, ERR_LOW_SURROGATE, c)
                     cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00)
                     c += 12
                 elif cp >= 0xDC00 and cp <= 0xDFFF:
-                    return fail(p, ERR_SURROGATE, c)
+                    return fail(p, ERR_LONE_SURROGATE, c)
                 else:
                     c += 6
                 out = put_utf8(out, cp)
@@ -418,6 +468,12 @@ def key_matches(cached: Int, start: Int, n: Int) -> Bool:
         return False
     if PI(unsafe_from_address=cached + STR_LENGTH)[] != n:
         return False
+    if n >= 8 and n <= 16:
+        # Both words lie inside the validated key; overlap covers lengths 8–15.
+        var data = cached + STR_ASCII_DATA
+        if P64(unsafe_from_address=data)[] != P64(unsafe_from_address=start)[]:
+            return False
+        return P64(unsafe_from_address=data + n - 8)[] == P64(unsafe_from_address=start + n - 8)[]
     return external_call["memcmp", Int32](cached + STR_ASCII_DATA, start, n) == 0
 
 
@@ -509,6 +565,18 @@ def double_to_bits(value: Float64) -> UInt64:
     return bitcast[DType.uint64, 1](value)
 
 
+@no_inline
+def eisel_subnormal(m0: UInt64, power2: Int) -> UInt64:
+    # Keep subnormal rounding out of the normal-float instruction path.
+    if -power2 + 1 >= 64:
+        return 0
+    var m = m0 >> UInt64(-power2 + 1)
+    m += m & 1
+    m >>= 1
+    var exponent = 0 if m < (UInt64(1) << 52) else 1
+    return m | (UInt64(exponent) << 52)
+
+
 # Eisel-Lemire, as in decoder.c. Returns False only for an infinite result.
 @always_inline
 def eisel_lemire(powers: P64, mantissa: UInt64, exponent: Int, mut out: UInt64) -> Bool:
@@ -532,25 +600,20 @@ def eisel_lemire(powers: P64, mantissa: UInt64, exponent: Int, mut out: UInt64) 
     var shift = upper_bit + 64 - 52 - 3
     var m = high >> UInt64(shift)
     var power2 = (((152170 + 65536) * exponent) >> 16) + 63 + upper_bit - lz + 1023
-    if power2 <= 0:
-        if -power2 + 1 >= 64:
-            out = 0
-            return True
-        m >>= UInt64(-power2 + 1)
-        m += m & 1
-        m >>= 1
-        power2 = 0 if m < (UInt64(1) << 52) else 1
-    else:
-        if low <= 1 and exponent >= -4 and exponent <= 23 and (m & 3) == 1 and (m << UInt64(shift)) == high:
+    if unlikely(power2 <= 0):
+        out = eisel_subnormal(m, power2)
+        return True
+    if unlikely(low <= 1):
+        if exponent >= -4 and exponent <= 23 and (m & 3) == 1 and (m << UInt64(shift)) == high:
             m &= ~UInt64(1)
-        m += m & 1
-        m >>= 1
-        if m >= (UInt64(2) << 52):
-            m = UInt64(1) << 52
-            power2 += 1
-        m &= ~(UInt64(1) << 52)
-        if power2 >= 0x7FF:
-            return False
+    m += m & 1
+    m >>= 1
+    if unlikely(m >= (UInt64(2) << 52)):
+        m = UInt64(1) << 52
+        power2 += 1
+    m &= ~(UInt64(1) << 52)
+    if power2 >= 0x7FF:
+        return False
     out = m | (UInt64(power2) << 52)
     return True
 
@@ -592,22 +655,28 @@ def make_int[o_: Origin[mut=True]](negative: Bool, mantissa: UInt64, p: Pointer[
     return float_from_text(p, start, c)
 
 
-@always_inline
-def make_float[o_: Origin[mut=True]](negative: Bool, mantissa: UInt64, exponent: Int, p: Pointer[Parser, o_], start: Int, c: Int) -> Int:
+@no_inline
+def make_float_general[o_: Origin[mut=True]](negative: Bool, mantissa: UInt64, exponent: Int, p: Pointer[Parser, o_], start: Int, c: Int) -> Int:
+    # Keep Eisel-Lemire's checks and register demand out of integer/Clinger paths.
     ref ctx = p[].ctx[]
-    var value: Float64
-    if mantissa <= (UInt64(1) << 53) and exponent >= -22 and exponent <= 22:
-        value = Float64(Int64(mantissa))  # below 2^53 here: a signed conversion is one instruction
-        if exponent < 0:
-            value = value / ctx.exact10[unsafe_offset=-exponent]
-        else:
-            value = value * ctx.exact10[unsafe_offset=exponent]
-        return external_call["PyFloat_FromDouble", Int](-value if negative else value)
     var bits: UInt64 = 0
     if eisel_lemire(ctx.powers, mantissa, exponent, bits):
-        value = bits_to_double(bits)
+        var value = bits_to_double(bits)
         return external_call["PyFloat_FromDouble", Int](-value if negative else value)
     return float_from_text(p, start, c)
+
+
+@always_inline
+def make_float[o_: Origin[mut=True]](negative: Bool, mantissa: UInt64, exponent: Int, p: Pointer[Parser, o_], start: Int, c: Int) -> Int:
+    if mantissa <= (UInt64(1) << 53) and exponent >= -22 and exponent <= 22:
+        var value = Float64(Int64(mantissa))
+        var exact10 = p[].ctx[].exact10
+        if exponent < 0:
+            value = value / exact10[unsafe_offset=-exponent]
+        else:
+            value = value * exact10[unsafe_offset=exponent]
+        return external_call["PyFloat_FromDouble", Int](-value if negative else value)
+    return make_float_general(negative, mantissa, exponent, p, start, c)
 
 
 # Numbers of any length: scanned first, converted after. Reached with 20 or more digits.
@@ -633,7 +702,7 @@ def parse_number_slow[o_: Origin[mut=True]](p: Pointer[Parser, o_]) -> Int:
         is_float = True
         c += 1
         if not is_digit(rd(c)):
-            return fail(p, ERR_NUMBER, c)
+            return fail(p, ERR_NUMBER if c < end else ERR_EOF, c)
         frac_start = c
         c = scan_digits(c + 1, end)
         frac_end = c
@@ -648,7 +717,7 @@ def parse_number_slow[o_: Origin[mut=True]](p: Pointer[Parser, o_]) -> Int:
             c += 1
             b = rd(c)
         if not is_digit(b):
-            return fail(p, ERR_NUMBER, c)
+            return fail(p, ERR_NUMBER if c < end else ERR_EOF, c)
         var e = 0
         while is_digit(b):
             if e < 100000:
@@ -698,8 +767,10 @@ def digit_chain(c: P8, mut m: UInt64) -> Int:
     return 19
 
 
-def parse_number[o_: Origin[mut=True]](p: Pointer[Parser, o_]) -> Int:
-    var start = p[].cur
+@always_inline
+def parse_number_at[array_number: Bool, o_: Origin[mut=True]](p: Pointer[Parser, o_], start: Int) -> Tuple[Int, Int]:
+    # Specialize at compile time: bulk fractions and a local cursor for arrays,
+    # the compact original path for scalar and object-field numbers.
     var c = start
     var negative = rd(c) == 45
     if negative:
@@ -708,39 +779,55 @@ def parse_number[o_: Origin[mut=True]](p: Pointer[Parser, o_]) -> Int:
     var int_digits: Int
     var frac_digits = 0
     var exponent = 0
-    var is_float = False
     var b = rd(c)
     if b == 48:
         if is_digit(rd(c + 1)):
-            return fail(p, ERR_LEADING_ZERO, start)
+            return (fail(p, ERR_LEADING_ZERO, start), start)
         int_digits = 1
         c += 1
     else:
         if not is_digit(b):
-            return fail(p, ERR_VALUE, start)
+            var at_end = c >= p[].end
+            return (fail(p, ERR_SIGN if negative else (ERR_EOF if at_end else ERR_VALUE), p[].end if at_end else start), start)
         mantissa = UInt64(b - 48)
         var n = digit_chain(P8(unsafe_from_address=c), mantissa)
         if n == 20:
-            return parse_number_slow(p)
+            p[].cur = start
+            var value = parse_number_slow(p)
+            return (value, p[].cur)
         int_digits = n
         c += n
-    if rd(c) == 46:
-        is_float = True
+    b = rd(c)
+    if b != 46 and (b | UInt8(0x20)) != 101:
+        if not array_number:
+            p[].cur = c
+        return (make_int(negative, mantissa, p, start, c), c)
+    if b == 46:
         c += 1
         b = rd(c)
         if not is_digit(b):
-            return fail(p, ERR_NUMBER, c)
+            return (fail(p, ERR_NUMBER if c < p[].end else ERR_EOF, c), start)
         mantissa = mantissa * 10 + UInt64(b - 48)
+        # The word is read only when all eight bytes are inside the input.
+        if array_number and p[].end - c >= 9:
+            var word = P64(unsafe_from_address=c + 1)[]
+            if is_eight_digits(word):
+                mantissa = mantissa * 100000000 + eight_digits_value(word)
+                c += 8
+                frac_digits = 8
         var n = digit_chain(P8(unsafe_from_address=c), mantissa)
         if n == 20:
-            return parse_number_slow(p)
-        frac_digits = n
+            p[].cur = start
+            var value = parse_number_slow(p)
+            return (value, p[].cur)
+        frac_digits += n
         c += n
     if int_digits + frac_digits > 19:
-        return parse_number_slow(p)
+        p[].cur = start
+        var value = parse_number_slow(p)
+        return (value, p[].cur)
     b = rd(c)
     if b == 101 or b == 69:
-        is_float = True
         c += 1
         var sign = 1
         b = rd(c)
@@ -749,7 +836,7 @@ def parse_number[o_: Origin[mut=True]](p: Pointer[Parser, o_]) -> Int:
             c += 1
             b = rd(c)
         if not is_digit(b):
-            return fail(p, ERR_NUMBER, c)
+            return (fail(p, ERR_NUMBER if c < p[].end else ERR_EOF, c), start)
         var e = 0
         while is_digit(b):
             if e < 100000:
@@ -757,11 +844,15 @@ def parse_number[o_: Origin[mut=True]](p: Pointer[Parser, o_]) -> Int:
             c += 1
             b = rd(c)
         exponent = sign * e
-    p[].cur = c
     exponent -= frac_digits
-    if not is_float:
-        return make_int(negative, mantissa, p, start, c)
-    return make_float(negative, mantissa, exponent, p, start, c)
+    if not array_number:
+        p[].cur = c
+    return (make_float(negative, mantissa, exponent, p, start, c), c)
+
+
+def parse_number[o_: Origin[mut=True]](p: Pointer[Parser, o_]) -> Int:
+    var result, _ = parse_number_at[False](p, p[].cur)
+    return result
 
 
 # ---- containers ----
@@ -791,7 +882,7 @@ def push[o_: Origin[mut=True]](p: Pointer[Parser, o_], value: Int) -> Bool:
     return True
 
 
-def parse_array[o_: Origin[mut=True]](p: Pointer[Parser, o_]) -> Int:
+def parse_array[typed: Bool, o_: Origin[mut=True]](p: Pointer[Parser, o_], item: Int) -> Int:
     var end = p[].end
     p[].depth += 1
     if p[].depth > MAX_DEPTH:
@@ -803,13 +894,25 @@ def parse_array[o_: Origin[mut=True]](p: Pointer[Parser, o_]) -> Int:
         return external_call["PyList_New", Int](0)
     var base = p[].stack_len
     while True:
-        p[].cur = c
         if c >= end:
             return fail(p, ERR_EOF, end)
-        var value = parse_at(p, c)
+        var value: Int
+        var stop: Int
+        var first = rd(c)
+        if typed:
+            p[].cur = c
+            value = parse_typed(p, item)
+            stop = p[].cur
+        elif first == 45 or is_digit(first):
+            # Keep the numeric cursor in registers instead of in Parser.cur.
+            value, stop = parse_number_at[True](p, c)
+        else:
+            p[].cur = c
+            value = parse_at(p, c)
+            stop = p[].cur
         if value == 0 or not push(p, value):
             return 0
-        c = skip_space(p[].cur, end)
+        c = skip_space(stop, end)
         if c >= end:
             return fail(p, ERR_EOF, end)
         var b = rd(c)
@@ -827,14 +930,27 @@ def parse_array[o_: Origin[mut=True]](p: Pointer[Parser, o_]) -> Int:
     if lst == 0:
         return 0
     var items = PI(unsafe_from_address=lst + LIST_ITEMS)[]
-    external_call["memcpy", NoneType](items, Int(p[].stack) + base * 8, count * 8)
+    if count <= 4:
+        # Avoid a libc call for the small lists common in nested JSON arrays.
+        var target = P64(unsafe_from_address=items)
+        var source = P64(unsafe_from_address=Int(p[].stack) + base * 8)
+        if count >= 2:
+            var first = source.unsafe_load[width=2]()
+            var last_source = P64(unsafe_from_address=Int(source) + (count - 2) * 8)
+            var last = last_source.unsafe_load[width=2]()
+            target.unsafe_store[width=2](first)
+            P64(unsafe_from_address=items + (count - 2) * 8).unsafe_store[width=2](last)
+        elif count == 1:
+            target[] = source[]
+    else:
+        external_call["memcpy", NoneType](items, Int(p[].stack) + base * 8, count * 8)
     p[].stack_len = base
     p[].cur = c + 1
     p[].depth -= 1
     return lst
 
 
-def parse_object[o_: Origin[mut=True]](p: Pointer[Parser, o_]) -> Int:
+def parse_object[typed: Bool, o_: Origin[mut=True]](p: Pointer[Parser, o_], item: Int) -> Int:
     var end = p[].end
     p[].depth += 1
     if p[].depth > MAX_DEPTH:
@@ -869,7 +985,11 @@ def parse_object[o_: Origin[mut=True]](p: Pointer[Parser, o_]) -> Int:
             decref(key)
             _ = fail(p, ERR_EOF, end)
             break
-        var value = parse_at(p, c)
+        var value: Int
+        if typed:
+            value = parse_typed(p, item)
+        else:
+            value = parse_at(p, c)
         if value == 0:
             decref(key)
             break
@@ -894,7 +1014,7 @@ def parse_object[o_: Origin[mut=True]](p: Pointer[Parser, o_]) -> Int:
             p[].cur = c + 1
             p[].depth -= 1
             return dict
-        _ = fail(p, ERR_SEPARATOR, c)
+        _ = fail(p, ERR_OBJECT_SEPARATOR, c)
         break
     decref(dict)
     return 0
@@ -930,9 +1050,9 @@ def parse_at[o_: Origin[mut=True]](p: Pointer[Parser, o_], c: Int) -> Int:
     if b == 34:
         return parse_string(p)
     if b == 123:
-        return parse_object(p)
+        return parse_object[False](p, 0)
     if b == 91:
-        return parse_array(p)
+        return parse_array[False](p, 0)
     if b == 116:
         return parse_literal(p, 116, 114, 117, 101, 4, p[].ctx[].py_true)
     if b == 102:
@@ -952,6 +1072,234 @@ def parse_value[o_: Origin[mut=True]](p: Pointer[Parser, o_]) -> Int:
     return parse_at(p, c)
 
 
+# ---- typed traversal; annotation plan construction and Python hooks use the C API ----
+@always_inline
+def word(address: Int, offset: Int) -> Int:
+    return PI(unsafe_from_address=address + offset)[]
+
+
+@always_inline
+def small_word(address: Int, offset: Int) -> Int:
+    return Int(P32(unsafe_from_address=address + offset)[])
+
+
+@always_inline
+def type_error[o_: Origin[mut=True]](p: Pointer[Parser, o_], plan: Int, at: Int, is_float: Int = 0) -> Int:
+    p[].err_plan = plan
+    p[].err_detail = is_float
+    return fail(p, ERR_TYPE, at)
+
+
+@always_inline
+def field_matches(field: Int, start: Int, length: Int) -> Bool:
+    var bytes = word(field, FIELD_BYTES)
+    return bytes != 0 and word(field, FIELD_LENGTH) == length and external_call["memcmp", Int32](bytes, start, length) == 0
+
+
+def parse_dataclass[o_: Origin[mut=True]](p: Pointer[Parser, o_], plan: Int) -> Int:
+    var end = p[].end
+    p[].depth += 1
+    if p[].depth > MAX_DEPTH:
+        return fail(p, ERR_DEPTH, p[].cur)
+    var c = skip_space(p[].cur + 1, end)
+    var obj = external_call["yjson_decoder_alloc", Int](plan)
+    if obj == 0:
+        return 0
+    var seen_inline = unsafe_stack_allocation[8, UInt64]()
+    var seen = P64(unsafe_from_address=Int(seen_inline))
+    var words = small_word(plan, PLAN_SEEN_WORDS)
+    if words > 8:
+        seen = P64(unsafe_from_address=external_call["malloc", Int](words * 8))
+        if Int(seen) == 0:
+            decref(obj)
+            return fail(p, ERR_MEMORY, c)
+    external_call["memset", NoneType](Int(seen), 0, words * 8)
+    var fields = word(plan, PLAN_FIELDS)
+    var count = small_word(plan, PLAN_NFIELDS)
+    var table = P32(unsafe_from_address=word(plan, PLAN_TABLE))
+    var mask = small_word(plan, PLAN_MASK)
+    var expected = 0
+    var complete = c < end and rd(c) == 125
+    if complete:
+        c += 1
+    while not complete:
+        if c >= end:
+            _ = fail(p, ERR_EOF, end)
+            break
+        if rd(c) != 34:
+            _ = fail(p, ERR_KEY, c)
+            break
+        var start = c + 1
+        var special = scan[True](start, end)
+        var index = -1
+        if special < end and rd(special) == 34:
+            var length = special - start
+            var next = fields + expected * FIELD_SIZE
+            if count != 0 and field_matches(next, start, length):
+                index = expected
+            else:
+                var hash = key_hash(start, length)
+                var at = Int(hash & UInt64(mask))
+                while table[unsafe_offset=at] >= 0:
+                    var candidate = Int(table[unsafe_offset=at])
+                    var field = fields + candidate * FIELD_SIZE
+                    if UInt64(word(field, FIELD_HASH)) == hash and field_matches(field, start, length):
+                        index = candidate
+                        break
+                    at = (at + 1) & mask
+            p[].cur = special + 1
+        else:
+            var key = string_from(p, start, special)
+            if key == 0:
+                break
+            var found = external_call["PyDict_GetItemWithError", Int](word(plan, PLAN_KEY_INDEX), key)
+            decref(key)
+            if found != 0:
+                index = external_call["PyLong_AsLong", Int](found)
+            elif external_call["PyErr_Occurred", Int]() != 0:
+                break
+        c = skip_space(p[].cur, end)
+        if c >= end:
+            _ = fail(p, ERR_EOF, end)
+            break
+        if rd(c) != 58:
+            _ = fail(p, ERR_COLON, c)
+            break
+        p[].cur = c + 1
+        if index >= 0:
+            var field = fields + index * FIELD_SIZE
+            var value = parse_typed(p, word(field, FIELD_PLAN))
+            if value == 0:
+                break
+            var status = external_call["yjson_decoder_set_field", Int32](obj, field, value)
+            decref(value)
+            if status < 0:
+                break
+            seen[unsafe_offset=index // 64] |= UInt64(1) << UInt64(index % 64)
+            expected = index + 1 if index + 1 < count else 0
+        else:
+            var value = parse_value(p)
+            if value == 0:
+                break
+            decref(value)
+        c = skip_space(p[].cur, end)
+        if c >= end:
+            _ = fail(p, ERR_EOF, end)
+            break
+        var b = rd(c)
+        if b == 44:
+            var comma = c
+            c = skip_space(c + 1, end)
+            if c < end and rd(c) == 125:
+                _ = fail(p, ERR_COMMA, comma)
+                break
+            continue
+        if b == 125:
+            c += 1
+            complete = True
+            break
+        _ = fail(p, ERR_OBJECT_SEPARATOR, c)
+        break
+    if complete:
+        for i in range(count):
+            if (seen[unsafe_offset=i // 64] & (UInt64(1) << UInt64(i % 64))) != 0:
+                continue
+            var field = fields + i * FIELD_SIZE
+            var kind = small_word(field, FIELD_DEFAULT_KIND)
+            var value: Int
+            if kind == 1:
+                value = word(field, FIELD_DEFAULT_VALUE)
+                incref(value)
+            elif kind == 2:
+                value = external_call["PyObject_CallNoArgs", Int](word(field, FIELD_DEFAULT_VALUE))
+            elif kind == 3:
+                continue
+            else:
+                p[].err_plan = plan
+                p[].err_detail = field
+                _ = fail(p, ERR_MISSING, c - 1)
+                complete = False
+                break
+            if value == 0:
+                complete = False
+                break
+            var status = external_call["yjson_decoder_set_field", Int32](obj, field, value)
+            decref(value)
+            if status < 0:
+                complete = False
+                break
+        if complete and small_word(plan, PLAN_POST_INIT) != 0:
+            var result = external_call["yjson_decoder_post_init", Int](obj)
+            if result == 0:
+                complete = False
+            else:
+                decref(result)
+    if words > 8:
+        external_call["free", NoneType](Int(seen))
+    if not complete:
+        decref(obj)
+        return 0
+    p[].cur = c
+    p[].depth -= 1
+    return obj
+
+
+def parse_typed[o_: Origin[mut=True]](p: Pointer[Parser, o_], plan: Int) -> Int:
+    var kind = small_word(plan, PLAN_KIND)
+    if kind == 0:
+        return parse_value(p)
+    var c = skip_space(p[].cur, p[].end)
+    p[].cur = c
+    if c >= p[].end:
+        return fail(p, ERR_EOF, p[].end)
+    var b = rd(c)
+    if kind == 1 or kind == 2:
+        if b != 45 and not is_digit(b):
+            return type_error(p, plan, c)
+        var value = parse_number(p)
+        if value == 0:
+            return 0
+        if external_call["yjson_decoder_is_int", Int32](value) != 0:
+            if kind == 1:
+                return value
+            var as_double = external_call["PyLong_AsDouble", Float64](value)
+            decref(value)
+            if as_double == -1.0 and external_call["PyErr_Occurred", Int]() != 0:
+                return 0
+            return external_call["PyFloat_FromDouble", Int](as_double)
+        if kind == 2:
+            return value
+        decref(value)
+        return type_error(p, plan, c, 1)
+    if kind == 3:
+        if b != 34:
+            return type_error(p, plan, c)
+        return parse_string(p)
+    if kind == 4:
+        if b == 116:
+            return parse_literal(p, 116, 114, 117, 101, 4, p[].ctx[].py_true)
+        if b == 102:
+            return parse_literal(p, 102, 97, 108, 115, 5, p[].ctx[].py_false)
+        return type_error(p, plan, c)
+    if kind == 5 or kind == 6:
+        if b == 110:
+            return parse_literal(p, 110, 117, 108, 108, 4, p[].ctx[].py_none)
+        if kind == 5:
+            return type_error(p, plan, c)
+        return parse_typed(p, word(plan, PLAN_ITEM))
+    if kind == 7:
+        if b != 91:
+            return type_error(p, plan, c)
+        return parse_array[True](p, word(plan, PLAN_ITEM))
+    if kind == 8:
+        if b != 123:
+            return type_error(p, plan, c)
+        return parse_object[True](p, word(plan, PLAN_ITEM))
+    if b != 123:
+        return type_error(p, plan, c)
+    return parse_dataclass(p, plan)
+
+
 # ---- entry points ----
 @export
 def yjson_mojo_init(py_true: Int, py_false: Int, py_none: Int) abi("C") -> Int:
@@ -960,10 +1308,25 @@ def yjson_mojo_init(py_true: Int, py_false: Int, py_none: Int) abi("C") -> Int:
     return Int(ctx)
 
 
+@export
+def yjson_mojo_destroy(address: Int) abi("C"):
+    var ctx = Pointer[Ctx, MutUntrackedOrigin](unsafe_from_address=address)
+    for i in range(SLOTS):
+        var key = ctx[].key_cache[unsafe_offset=i]
+        if key != 0:
+            decref(key)
+    ctx[].key_cache.unsafe_free()
+    ctx[].next_slot.unsafe_free()
+    ctx[].exact10.unsafe_free()
+    ctx[].pow10.unsafe_free()
+    ctx[].hex.unsafe_free()
+    ctx[].escapes.unsafe_free()
+    ctx.unsafe_free()
+
+
 # Parses the NUL-terminated buffer; returns a new reference, or 0 with the error code and
 # byte position written to err_out[0] and err_out[1] (code 0 means a Python exception is set).
-@export
-def yjson_mojo_loads(ctx: Int, data: Int, length: Int, err_out: Int) abi("C") -> Int:
+def loads_impl[typed: Bool](ctx: Int, data: Int, length: Int, plan: Int, err_out: Int) -> Int:
     var inline_stack = unsafe_stack_allocation[INLINE_STACK, Int]()
     var parser = Parser(ctx, data, length, Int(inline_stack))
     var p = Pointer(to=parser)
@@ -973,7 +1336,10 @@ def yjson_mojo_loads(ctx: Int, data: Int, length: Int, err_out: Int) abi("C") ->
     elif length >= 3 and rd(data) == 0xEF and rd(data + 1) == 0xBB and rd(data + 2) == 0xBF:
         _ = fail(p, ERR_BOM, data)
     else:
-        result = parse_value(p)
+        if typed and plan != 0:
+            result = parse_typed(p, plan)
+        else:
+            result = parse_value(p)
         if result != 0:
             var c = skip_space(p[].cur, p[].end)
             if c < p[].end:
@@ -989,4 +1355,17 @@ def yjson_mojo_loads(ctx: Int, data: Int, length: Int, err_out: Int) abi("C") ->
     var out = PI(unsafe_from_address=err_out)
     out[] = p[].err
     out[unsafe_offset=1] = p[].err_at
+    if typed:
+        out[unsafe_offset=2] = p[].err_plan
+        out[unsafe_offset=3] = p[].err_detail
     return result
+
+
+@export
+def yjson_mojo_loads(ctx: Int, data: Int, length: Int, err_out: Int) abi("C") -> Int:
+    return loads_impl[False](ctx, data, length, 0, err_out)
+
+
+@export
+def yjson_mojo_loads_typed(ctx: Int, data: Int, length: Int, plan: Int, err_out: Int) abi("C") -> Int:
+    return loads_impl[True](ctx, data, length, plan, err_out)

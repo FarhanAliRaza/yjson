@@ -1,0 +1,4 @@
+decode ascii C 49.470 us Mojo 50.390 us orjson 96.088 us ctypes 52.231 us
+decode utf8 C 253.918 us Mojo 253.863 us orjson 184.188 us ctypes 257.140 us
+decode unicode escapes C 664.578 us Mojo 751.939 us orjson 520.556 us ctypes 755.151 us
+decode ascii escapes C 451.880 us Mojo 449.213 us orjson 256.283 us ctypes 454.828 us

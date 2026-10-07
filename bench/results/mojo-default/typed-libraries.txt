@@ -1,0 +1,9 @@
+decoder                                per call   vs yjson type=list[Record]
+yjson.loads -> dicts                    462.9 µs    1.01×
+orjson.loads -> dicts                   537.2 µs    1.17×
+orjson + dataclasses by hand           1471.2 µs    3.20×
+yjson type=list[Record]                 459.2 µs    1.00×
+yjson type=list[SlotRecord]             369.2 µs    0.80×
+msgspec -> dicts                        545.3 µs    1.19×
+msgspec -> list[Record] dataclass       601.3 µs    1.31×
+msgspec -> list[Struct]                 391.2 µs    0.85×
