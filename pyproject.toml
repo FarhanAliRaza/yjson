@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "yjson"
 version = "0.3.1"
-description = "JSON serializer for CPython written in Mojo, with an orjson-style API"
+description = "Fast orjson-compatible JSON serializer and parser for CPython, written in Mojo and C"
 readme = "README.md"
 requires-python = ">=3.11,<3.16"
 authors = [{ name = "Farhan Ali Raza" }]
