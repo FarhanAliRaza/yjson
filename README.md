@@ -7,7 +7,8 @@
 A fast JSON serializer for CPython, written in [Mojo](https://mojolang.org) and compatible
 with [orjson](https://github.com/ijl/orjson).
 
-- About 1.3× faster than orjson on a corpus of real-world JSON documents.
+- About 1.3× faster than orjson at serializing a corpus of real-world JSON documents, and
+  about as fast at parsing them.
 - A drop-in replacement for orjson, with the same API, options and output, verified against
   orjson's own test suite.
 - Native support for dataclasses, `datetime`, `UUID`, `Enum`, and NumPy arrays and scalars.
@@ -122,10 +123,11 @@ loads(obj, /) -> Any
 ```
 
 `loads` accepts `str`, `bytes`, `bytearray` or `memoryview`, and raises `JSONDecodeError`, a
-subclass of `json.JSONDecodeError` and `ValueError`, on invalid input. It is the standard
-library parser with orjson's checks added: it rejects invalid UTF-8, lone surrogates, `NaN`
-and `Infinity`, and nesting deeper than 1,024 levels. It therefore runs at the speed of
-`json.loads`; yjson speeds up serialization only.
+subclass of `json.JSONDecodeError` and `ValueError`, on invalid input. It is a strict parser
+with orjson's rules: it rejects invalid UTF-8, lone surrogates, `NaN` and `Infinity`, a byte
+order mark, trailing commas and nesting deeper than 1,024 levels, and returns integers outside
+[-2⁶³, 2⁶⁴) as floats. The error's `pos`, `lineno` and `colno` give the position at which
+parsing stopped, as orjson reports it.
 
 ## NumPy
 
@@ -196,8 +198,6 @@ yjson. The deliberate differences are:
   orjson writes `null`. Strict parsers, including `yjson.loads`, orjson and JavaScript's
   `JSON.parse`, reject these tokens; Python's `json.loads` accepts them.
 - NumPy values are serialized without `OPT_SERIALIZE_NUMPY`.
-- `loads` uses the standard library parser. It is slower than orjson's, and its error
-  messages and positions differ.
 - Wheels are available only for x86-64 Linux with AVX2.
 - `dumps_socket` has no orjson equivalent.
 
@@ -227,6 +227,12 @@ cover every document, per-shape measurements, other libraries and the Reflex ben
 [CONTRIBUTING.md](https://github.com/FarhanAliRaza/yjson/blob/main/CONTRIBUTING.md#benchmarks)
 explains how to measure your own payloads.
 
+Parsing the same corpus with `loads`, the speedup over `orjson.loads` on CPython 3.13 ranges
+from 0.88× (`numbers.json`) to 1.95× (`gsoc-2018.json`), with a geometric mean of 1.10× over
+the 14 documents; `json.loads` is 2–5× slower than either. Measured with
+`bench/bench_loads.py` in 20 alternating pairs per document on a shared cloud machine, so
+differences under about 5% are noise.
+
 ## How it works
 
 yjson is a CPython extension module written in Mojo, with a C shim for the Python C API.
@@ -239,6 +245,14 @@ checked against live objects at import, so an unsupported interpreter fails with
 [itoap](https://github.com/Kogia-sima/itoap)-style writer in 4-wide SIMD batches, and
 strings are escaped with a 64-byte SIMD scan. Output is written straight into the resulting
 `bytes` object.
+
+`loads` is a separate recursive-descent parser in C (`src/decoder.c`) that shares no code with
+the encoder. It scans strings 16 bytes at a time, builds `str` objects straight from the input
+(plain ASCII by copy, anything else through CPython's UTF-8 decoder, which also validates it),
+reuses recently seen object keys from a cache so repeated keys share one `str` and its hash,
+and parses floats with the [Eisel-Lemire](https://arxiv.org/abs/2101.11408) algorithm as
+implemented in [fast_float](https://github.com/fastfloat/fast_float), falling back to
+CPython's `strtod` for numbers with more than 19 significant digits.
 
 ## Limitations
 
@@ -261,6 +275,8 @@ building from source, running the tests and benchmarks, and making a release.
 - Float formatting and its power-of-ten table are ported from
   [Żmij](https://github.com/vitaut/zmij) by Victor Zverovich.
 - The integer writer is ported from [itoap](https://github.com/Kogia-sima/itoap).
+- The float parser and its power-of-five table follow
+  [fast_float](https://github.com/fastfloat/fast_float) by Daniel Lemire and contributors.
 - The API and the test suite in `tests/suite/` come from [orjson](https://github.com/ijl/orjson),
   whose source also informed the design.
 
