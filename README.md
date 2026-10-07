@@ -4,12 +4,13 @@
 [![Python versions](https://img.shields.io/pypi/pyversions/yjson.svg)](https://pypi.org/project/yjson/)
 [![CI](https://github.com/FarhanAliRaza/yjson/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/FarhanAliRaza/yjson/actions/workflows/ci.yml)
 
-A fast JSON serializer for CPython, written in [Mojo](https://mojolang.org) and compatible
-with [orjson](https://github.com/ijl/orjson).
+A fast JSON library for CPython, compatible with [orjson](https://github.com/ijl/orjson). Its
+serializer is written in [Mojo](https://mojolang.org) and its parser in C.
 
 - About 1.3× faster than orjson at serializing a corpus of real-world JSON documents, and
-  about as fast at parsing them.
-- `loads(data, type=...)` parses straight into dataclasses, without building dicts first.
+  about 1.2× faster at parsing them.
+- `loads(data, type=...)` parses straight into dataclasses and validates them, without
+  building dicts first.
 - A drop-in replacement for orjson, with the same API, options and output, verified against
   orjson's own test suite.
 - Native support for dataclasses, `datetime`, `UUID`, `Enum`, and NumPy arrays and scalars.
@@ -123,17 +124,16 @@ The contents are inserted as they are, without validation.
 loads(obj, /, *, type=None) -> Any
 ```
 
-`loads` accepts `str`, `bytes`, `bytearray` or `memoryview`, and raises `JSONDecodeError`, a
-subclass of `json.JSONDecodeError` and `ValueError`, on invalid input. It is a strict parser
-with orjson's rules: it rejects invalid UTF-8, lone surrogates, `NaN` and `Infinity`, a byte
-order mark, trailing commas and nesting deeper than 1,024 levels, and returns integers outside
-[-2⁶³, 2⁶⁴) as floats. The error's `pos`, `lineno` and `colno` give the position at which
-parsing stopped, as orjson reports it.
+`loads` parses `str`, `bytes`, `bytearray` or `memoryview` input with orjson's rules. It
+rejects invalid UTF-8, lone surrogates, `NaN` and `Infinity`, a byte order mark, trailing
+commas and nesting deeper than 1,024 levels, and returns integers outside [-2⁶³, 2⁶⁴) as
+floats. Invalid input raises `JSONDecodeError`, a subclass of `json.JSONDecodeError` and
+`ValueError`, whose `pos`, `lineno` and `colno` give the position where parsing stopped.
 
 ### Decoding into dataclasses
 
-With `type`, `loads` builds the objects the annotation describes instead of dicts and lists
-of plain values, and checks the document against it:
+With `type`, `loads` builds the objects an annotation describes instead of dicts and lists,
+and checks the document against the annotation as it parses:
 
 ```python
 import dataclasses
@@ -152,29 +152,34 @@ class User:
     address: Address
     note: Optional[str] = None
 
-yjson.loads(b'{"id": 7, "name": "Ada", "tags": ["x"], "address": {"city": "Lahore"}}', type=User)
+user_json = b'{"id": 7, "name": "Ada", "tags": ["x"], "address": {"city": "Lahore"}}'
+yjson.loads(user_json, type=User)
 # User(id=7, name='Ada', tags=['x'], address=Address(city='Lahore', zip=''), note=None)
 
-yjson.loads(b'[{"id": 1, ...}, ...]', type=list[User])
+users_json = b'[{"id": 1, "name": "Grace", "tags": [], "address": {"city": "Oslo"}}]'
+yjson.loads(users_json, type=list[User])
+# [User(id=1, name='Grace', tags=[], address=Address(city='Oslo', zip=''), note=None)]
+
+yjson.loads(b'{"id": "7"}', type=User)
+# JSONDecodeError: expected int, got str: line 1 column 8 (char 7)
 ```
 
-The annotation can be `Any`, `int`, `float`, `str`, `bool`, `None`, `Optional[X]` (or
-`X | None`), `list[X]`, `dict[str, X]` or a dataclass whose fields use these types, nested to
-any depth and recursively. Anything else, including other unions, tuples, sets, `Enum`,
-`datetime` and `InitVar` fields, raises `TypeError`.
+Supported annotations are `Any`, `int`, `float`, `str`, `bool`, `None`, `Optional[X]` (or
+`X | None`), `list[X]`, `dict[str, X]`, and dataclasses whose fields use these, nested to any
+depth and recursively. Anything else, including other unions, tuples, sets, `Enum`, `datetime`
+and `InitVar` fields, raises `TypeError`.
 
-For a dataclass, the JSON keys are the field names. Keys the dataclass does not declare are
-parsed and dropped. Fields missing from the document take their `default` or
-`default_factory`; a missing field without one raises `JSONDecodeError`, as does a value of
-the wrong type (`expected int, got str`, with the position). An `int` field accepts only
-integers; a `float` field accepts integers too and converts them. The instance is allocated
-directly and its fields are written in place, so `__new__` and `__init__` do not run; if the
-class defines `__post_init__`, it is called after the fields are set. This also works for
-frozen dataclasses. The compiled form of each annotation is cached for the life of the
-process, which keeps the classes alive.
+For dataclasses:
 
-Dataclasses with `slots=True` decode fastest, since each field is a direct store; without
-slots, each field goes into the instance's `__dict__`.
+- JSON keys match field names. Keys the dataclass does not declare are parsed and ignored.
+- A missing field takes its `default` or `default_factory`. A missing field without one, or a
+  value of the wrong type, raises `JSONDecodeError` with its position.
+- `int` fields accept only integers; `float` fields also accept integers and convert them.
+- Instances are created without calling `__new__` or `__init__`: fields are stored directly,
+  then `__post_init__` runs if the class defines it. Frozen dataclasses work too.
+- `slots=True` dataclasses decode fastest, since each field is a direct store.
+- Each annotation is compiled once and cached for the life of the process, which keeps its
+  classes alive.
 
 ## NumPy
 
@@ -238,17 +243,19 @@ yjson.dumps_socket([Row(1, "a"), Row(2, "b")], classify=classify)
 
 ## Differences from orjson
 
-`dumps` produces the same bytes as orjson, and CI runs orjson 3.12.0's test suite against
-yjson. The deliberate differences are:
+`dumps` produces the same bytes as orjson, `loads` returns the same values, and CI runs
+orjson 3.12.0's test suite against yjson. The deliberate differences are:
 
 - `NaN`, `Infinity` and `-Infinity` are written as Python's `json` module writes them, where
   orjson writes `null`. Strict parsers, including `yjson.loads`, orjson and JavaScript's
   `JSON.parse`, reject these tokens; Python's `json.loads` accepts them.
 - NumPy values are serialized without `OPT_SERIALIZE_NUMPY`.
 - Wheels are available only for x86-64 Linux with AVX2.
-- `dumps_socket` has no orjson equivalent.
+- `loads(type=...)` and `dumps_socket` have no orjson equivalent.
 
 ## Performance
+
+### Serialization
 
 Speedup over orjson 3.12.0 when serializing documents from the
 [simdjson-data](https://github.com/simdjson/simdjson-data) corpus (higher is better):
@@ -274,23 +281,27 @@ cover every document, per-shape measurements, other libraries and the Reflex ben
 [CONTRIBUTING.md](https://github.com/FarhanAliRaza/yjson/blob/main/CONTRIBUTING.md#benchmarks)
 explains how to measure your own payloads.
 
-Parsing the same corpus with `loads`, the speedup over `orjson.loads` on CPython 3.13 ranges
-from 0.98× (`numbers.json`) to 2.04× (`gsoc-2018.json`), with a geometric mean of 1.20× over
-the 14 documents; `json.loads` is 2–5× slower than either. Measured with
+### Parsing
+
+Parsing the same corpus, `loads` is 1.20× faster than `orjson.loads` (geometric mean over
+the 14 documents on CPython 3.13), from 0.98× on `numbers.json` to 2.04× on
+`gsoc-2018.json`; `json.loads` is 2–5× slower than either. Measured with
 `bench/bench_loads.py` in 20 alternating pairs per document on a shared cloud machine, so
 differences under about 5% are noise.
 
-Decoding 1,000 records of nine fields with a nested object into objects, with
-`bench/bench_typed.py` on the same machine:
+Decoding 1,000 records of nine fields with a nested object, measured with
+`bench/bench_typed.py` on the same kind of machine (fastest first):
 
 | Decoder | Result | Per call |
 | --- | --- | ---: |
-| `orjson.loads`, then dataclasses built by hand | dataclasses | 2.78 ms |
-| `yjson.loads` | dicts | 0.69 ms |
-| `yjson.loads(type=list[Record])` | dataclasses | 0.61 ms |
-| `yjson.loads(type=list[Record])`, `slots=True` | slotted dataclasses | 0.48 ms |
-| msgspec with `list[Record]` | dataclasses | 0.83 ms |
-| msgspec with a `Struct` | Structs | 0.51 ms |
+| `yjson.loads(type=list[Record])`, `slots=True` | slotted dataclasses | 0.47 ms |
+| msgspec with a `Struct` | Structs | 0.50 ms |
+| `yjson.loads(type=list[Record])` | dataclasses | 0.62 ms |
+| `yjson.loads` | dicts | 0.71 ms |
+| msgspec, untyped | dicts | 0.80 ms |
+| msgspec with `list[Record]` | dataclasses | 0.82 ms |
+| `orjson.loads` | dicts | 0.85 ms |
+| `orjson.loads`, then dataclasses built by hand | dataclasses | 2.72 ms |
 
 Across the 14 corpus documents, with a schema inferred from each, slotted dataclasses decode
 1.11× faster than msgspec's Structs (geometric mean), from 0.97× on `marine_ik.json` to
@@ -298,31 +309,24 @@ Across the 14 corpus documents, with a schema inferred from each, slotted datacl
 
 ## How it works
 
-yjson is a CPython extension module written in Mojo, with a C shim for the Python C API.
-Instead of calling the C API for each value, its writers read CPython's object layouts
-directly: list and tuple items, compact integers, float bits, string data and dict key
-tables. The field offsets are probed from the target interpreter's headers at build time and
-checked against live objects at import, so an unsupported interpreter fails with an
+yjson is a CPython extension module. The serializer is written in Mojo, with a C shim for the
+Python C API. Instead of calling the C API for each value, its writers read CPython's object
+layouts directly: list and tuple items, compact integers, float bits, string data and dict
+key tables. The field offsets are probed from the target interpreter's headers at build time
+and checked against live objects at import, so an unsupported interpreter fails with an
 `ImportError` rather than misreading memory. Floats are formatted with the
 [Żmij](https://github.com/vitaut/zmij) shortest round-trip algorithm, integers with an
 [itoap](https://github.com/Kogia-sima/itoap)-style writer in 4-wide SIMD batches, and
 strings are escaped with a 64-byte SIMD scan. Output is written straight into the resulting
-`bytes` object, which grows by doubling; a result above 1 MB keeps that allocation (up to
-twice its length) rather than being shrunk in place, as orjson's does, because shrinking
-left glibc mapping fresh pages for every call on large documents.
+`bytes` object.
 
-`loads` is a separate recursive-descent parser in C (`src/decoder.c`) that shares no code with
-the encoder. It scans strings and runs of indentation 16 bytes at a time, builds `str` objects
-straight from the input (plain ASCII by copy, anything else through CPython's UTF-8 decoder,
-which also validates it), and reuses recently seen object keys from a cache so repeated keys
-share one `str` and its hash; since objects of one shape list their keys in the same order,
-each key is first compared with the one that followed the previous key last time, and only a
-miss hashes. Numbers are read eight digits at a time where a word of digits is present and one unrolled
-step per digit otherwise, and arrays of numbers take a loop of their own without per-value
-dispatch; floats use the
-[Eisel-Lemire](https://arxiv.org/abs/2101.11408) algorithm as implemented in
-[fast_float](https://github.com/fastfloat/fast_float), falling back to CPython's `strtod`
-for numbers with more than 19 significant digits.
+`loads` is a separate recursive-descent parser in C that shares no code with the serializer.
+It scans strings and whitespace 16 bytes at a time, builds `str` objects straight from the
+input, and caches object keys, so repeated keys share one `str` and its hash. Floats
+are parsed with the [Eisel-Lemire](https://arxiv.org/abs/2101.11408) algorithm as implemented
+in [fast_float](https://github.com/fastfloat/fast_float), falling back to CPython's `strtod`
+beyond 19 significant digits. With `type`, each annotation is compiled once into a plan that
+builds the target objects directly.
 
 ## Limitations
 
@@ -331,6 +335,9 @@ for numbers with more than 19 significant digits.
 - CPython 3.11–3.15 with the GIL. Free-threaded builds are not supported.
 - The string scan can read up to 31 bytes past the end of a string, within the same memory
   page. This is safe, but Valgrind and AddressSanitizer report it.
+- Once the output buffer of a `dumps` call reaches 1 MB, the result keeps that buffer, as
+  orjson's does, so it can occupy up to twice its length until it is freed. Shrinking the
+  buffer made glibc map fresh pages on every call.
 - On import, yjson points the bundled Mojo runtime at the running interpreter. If
   `MOJO_PYTHON_LIBRARY` is already set, it takes precedence and must refer to that
   interpreter.
