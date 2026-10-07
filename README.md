@@ -7,7 +7,9 @@
 A fast JSON serializer for CPython, written in [Mojo](https://mojolang.org) and compatible
 with [orjson](https://github.com/ijl/orjson).
 
-- About 1.3× faster than orjson on a corpus of real-world JSON documents.
+- About 1.3× faster than orjson at serializing a corpus of real-world JSON documents, and
+  about as fast at parsing them.
+- `loads(data, type=...)` parses straight into dataclasses, without building dicts first.
 - A drop-in replacement for orjson, with the same API, options and output, verified against
   orjson's own test suite.
 - Native support for dataclasses, `datetime`, `UUID`, `Enum`, and NumPy arrays and scalars.
@@ -118,14 +120,61 @@ The contents are inserted as they are, without validation.
 ## Deserialization
 
 ```python
-loads(obj, /) -> Any
+loads(obj, /, *, type=None) -> Any
 ```
 
 `loads` accepts `str`, `bytes`, `bytearray` or `memoryview`, and raises `JSONDecodeError`, a
-subclass of `json.JSONDecodeError` and `ValueError`, on invalid input. It is the standard
-library parser with orjson's checks added: it rejects invalid UTF-8, lone surrogates, `NaN`
-and `Infinity`, and nesting deeper than 1,024 levels. It therefore runs at the speed of
-`json.loads`; yjson speeds up serialization only.
+subclass of `json.JSONDecodeError` and `ValueError`, on invalid input. It is a strict parser
+with orjson's rules: it rejects invalid UTF-8, lone surrogates, `NaN` and `Infinity`, a byte
+order mark, trailing commas and nesting deeper than 1,024 levels, and returns integers outside
+[-2⁶³, 2⁶⁴) as floats. The error's `pos`, `lineno` and `colno` give the position at which
+parsing stopped, as orjson reports it.
+
+### Decoding into dataclasses
+
+With `type`, `loads` builds the objects the annotation describes instead of dicts and lists
+of plain values, and checks the document against it:
+
+```python
+import dataclasses
+from typing import Optional
+
+@dataclasses.dataclass(slots=True)
+class Address:
+    city: str
+    zip: str = ""
+
+@dataclasses.dataclass(slots=True)
+class User:
+    id: int
+    name: str
+    tags: list[str]
+    address: Address
+    note: Optional[str] = None
+
+yjson.loads(b'{"id": 7, "name": "Ada", "tags": ["x"], "address": {"city": "Lahore"}}', type=User)
+# User(id=7, name='Ada', tags=['x'], address=Address(city='Lahore', zip=''), note=None)
+
+yjson.loads(b'[{"id": 1, ...}, ...]', type=list[User])
+```
+
+The annotation can be `Any`, `int`, `float`, `str`, `bool`, `None`, `Optional[X]` (or
+`X | None`), `list[X]`, `dict[str, X]` or a dataclass whose fields use these types, nested to
+any depth and recursively. Anything else, including other unions, tuples, sets, `Enum`,
+`datetime` and `InitVar` fields, raises `TypeError`.
+
+For a dataclass, the JSON keys are the field names. Keys the dataclass does not declare are
+parsed and dropped. Fields missing from the document take their `default` or
+`default_factory`; a missing field without one raises `JSONDecodeError`, as does a value of
+the wrong type (`expected int, got str`, with the position). An `int` field accepts only
+integers; a `float` field accepts integers too and converts them. The instance is allocated
+directly and its fields are written in place, so `__new__` and `__init__` do not run; if the
+class defines `__post_init__`, it is called after the fields are set. This also works for
+frozen dataclasses. The compiled form of each annotation is cached for the life of the
+process, which keeps the classes alive.
+
+Dataclasses with `slots=True` decode fastest, since each field is a direct store; without
+slots, each field goes into the instance's `__dict__`.
 
 ## NumPy
 
@@ -196,8 +245,6 @@ yjson. The deliberate differences are:
   orjson writes `null`. Strict parsers, including `yjson.loads`, orjson and JavaScript's
   `JSON.parse`, reject these tokens; Python's `json.loads` accepts them.
 - NumPy values are serialized without `OPT_SERIALIZE_NUMPY`.
-- `loads` uses the standard library parser. It is slower than orjson's, and its error
-  messages and positions differ.
 - Wheels are available only for x86-64 Linux with AVX2.
 - `dumps_socket` has no orjson equivalent.
 
@@ -227,6 +274,28 @@ cover every document, per-shape measurements, other libraries and the Reflex ben
 [CONTRIBUTING.md](https://github.com/FarhanAliRaza/yjson/blob/main/CONTRIBUTING.md#benchmarks)
 explains how to measure your own payloads.
 
+Parsing the same corpus with `loads`, the speedup over `orjson.loads` on CPython 3.13 ranges
+from 0.98× (`numbers.json`) to 2.04× (`gsoc-2018.json`), with a geometric mean of 1.20× over
+the 14 documents; `json.loads` is 2–5× slower than either. Measured with
+`bench/bench_loads.py` in 20 alternating pairs per document on a shared cloud machine, so
+differences under about 5% are noise.
+
+Decoding 1,000 records of nine fields with a nested object into objects, with
+`bench/bench_typed.py` on the same machine:
+
+| Decoder | Result | Per call |
+| --- | --- | ---: |
+| `orjson.loads`, then dataclasses built by hand | dataclasses | 2.78 ms |
+| `yjson.loads` | dicts | 0.69 ms |
+| `yjson.loads(type=list[Record])` | dataclasses | 0.61 ms |
+| `yjson.loads(type=list[Record])`, `slots=True` | slotted dataclasses | 0.48 ms |
+| msgspec with `list[Record]` | dataclasses | 0.83 ms |
+| msgspec with a `Struct` | Structs | 0.51 ms |
+
+Across the 14 corpus documents, with a schema inferred from each, slotted dataclasses decode
+1.11× faster than msgspec's Structs (geometric mean), from 0.97× on `marine_ik.json` to
+1.34× on `twitterescaped.json`.
+
 ## How it works
 
 yjson is a CPython extension module written in Mojo, with a C shim for the Python C API.
@@ -238,7 +307,22 @@ checked against live objects at import, so an unsupported interpreter fails with
 [Żmij](https://github.com/vitaut/zmij) shortest round-trip algorithm, integers with an
 [itoap](https://github.com/Kogia-sima/itoap)-style writer in 4-wide SIMD batches, and
 strings are escaped with a 64-byte SIMD scan. Output is written straight into the resulting
-`bytes` object.
+`bytes` object, which grows by doubling; a result above 1 MB keeps that allocation (up to
+twice its length) rather than being shrunk in place, as orjson's does, because shrinking
+left glibc mapping fresh pages for every call on large documents.
+
+`loads` is a separate recursive-descent parser in C (`src/decoder.c`) that shares no code with
+the encoder. It scans strings and runs of indentation 16 bytes at a time, builds `str` objects
+straight from the input (plain ASCII by copy, anything else through CPython's UTF-8 decoder,
+which also validates it), and reuses recently seen object keys from a cache so repeated keys
+share one `str` and its hash; since objects of one shape list their keys in the same order,
+each key is first compared with the one that followed the previous key last time, and only a
+miss hashes. Numbers are read eight digits at a time where a word of digits is present and one unrolled
+step per digit otherwise, and arrays of numbers take a loop of their own without per-value
+dispatch; floats use the
+[Eisel-Lemire](https://arxiv.org/abs/2101.11408) algorithm as implemented in
+[fast_float](https://github.com/fastfloat/fast_float), falling back to CPython's `strtod`
+for numbers with more than 19 significant digits.
 
 ## Limitations
 
@@ -261,6 +345,8 @@ building from source, running the tests and benchmarks, and making a release.
 - Float formatting and its power-of-ten table are ported from
   [Żmij](https://github.com/vitaut/zmij) by Victor Zverovich.
 - The integer writer is ported from [itoap](https://github.com/Kogia-sima/itoap).
+- The float parser and its power-of-five table follow
+  [fast_float](https://github.com/fastfloat/fast_float) by Daniel Lemire and contributors.
 - The API and the test suite in `tests/suite/` come from [orjson](https://github.com/ijl/orjson),
   whose source also informed the design.
 

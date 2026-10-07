@@ -1,7 +1,7 @@
 include build.sh
 include THIRD_PARTY_NOTICES.md
 include src/yjson.pyi
-recursive-include src *.mojo *.c *.py *.pyi
+recursive-include src *.mojo *.c *.h *.py *.pyi
 recursive-include tests *.py
 recursive-include examples *.py
 global-exclude __pycache__ *.py[cod] *.so *.o

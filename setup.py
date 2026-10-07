@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parent
 SOURCES = [
     "src/yjson.mojo",
     "src/python_api.c",
+    "src/decoder.c",
     "src/layout_probe.c",
 ]
 
@@ -48,6 +49,6 @@ class MojoBuildExt(build_ext):
 
 
 setup(
-    ext_modules=[Extension("yjson", sources=SOURCES, depends=["build.sh"])],
+    ext_modules=[Extension("yjson", sources=SOURCES, depends=["build.sh", "src/decoder_powers.h"])],
     cmdclass={"build_ext": MojoBuildExt},
 )

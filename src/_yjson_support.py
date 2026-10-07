@@ -1,10 +1,9 @@
-"""Cold type conversion and strict stdlib-backed decoding for yjson."""
+"""Cold type conversion and the exception types for yjson."""
 import dataclasses
 import datetime
 import enum
 import json
 import math
-import sys
 import uuid
 
 OPT_INDENT_2 = 1
@@ -139,67 +138,53 @@ def _key_string(key, option, native):
     raise TypeError("Dict key must a type serializable with OPT_NON_STR_KEYS")
 
 
-def _float(text):
-    result = float(text)
-    if not math.isfinite(result):
-        raise ValueError("number is infinity when parsed as double")
-    return result
 
-
-def _integer(text):
-    result = int(text)
-    return result if -(1 << 63) <= result < (1 << 64) else _float(text)
-
-
-def _constant(text):
-    raise ValueError(f"unexpected character: {text}")
-
-
-def _parse(text):
-    try:
-        return json.loads(text, parse_constant=_constant, parse_float=_float, parse_int=_integer)
-    except RecursionError:
-        # CPython < 3.12 charges the C scanner's nesting to the Python recursion limit (1000 by
-        # default), which documents at orjson's 1024-deep limit exceed. Retry with room for them;
-        # anything deeper still fails and is reported as a decode error by the caller.
-        limit = sys.getrecursionlimit()
-        sys.setrecursionlimit(limit + 1100)
-        try:
-            return json.loads(text, parse_constant=_constant, parse_float=_float, parse_int=_integer)
-        finally:
-            sys.setrecursionlimit(limit)
-
-
-def loads(obj, /):
-    if type(obj) not in (str, bytes, bytearray, memoryview):
-        raise JSONDecodeError("Input must be bytes, bytearray, memoryview, or str", "", 0)
-    try:
-        if type(obj) is memoryview:
-            if not obj.c_contiguous:
-                raise ValueError("Input memoryview must be contiguous")
-            obj = obj.tobytes()
-        text = obj if type(obj) is str else obj.decode("utf-8")
-        text.encode("utf-8")  # reject lone surrogate codepoints in input
-        result = _parse(text)
-        # json.loads accepts escaped lone surrogates; RFC 8259 UTF-8 output does not.
-        # Containers nest at most 1024 deep (orjson's limit), counted from the top-level one.
-        pending = [(result, 0)]
-        while pending:
-            value, depth = pending.pop()
-            if type(value) is str:
-                value.encode("utf-8")
-            elif depth >= 1024 and type(value) in (dict, list):
-                raise ValueError("array and object recursion depth exceeded")
-            elif type(value) is dict:
-                pending.extend((key, depth + 1) for key in value)
-                pending.extend((child, depth + 1) for child in value.values())
-            elif type(value) is list:
-                pending.extend((child, depth + 1) for child in value)
-        return result
-    except json.JSONDecodeError as error:
-        raise JSONDecodeError(error.msg, error.doc, error.pos) from None
-    except (ValueError, UnicodeError, RecursionError) as error:
-        raise JSONDecodeError(str(error), locals().get("text", ""), 0) from None
-
-
-loads.__module__ = "yjson"
+def describe_type(tp):
+    """Describes one level of a loads(type=...) annotation for the C decoder, which expands the
+    inner types itself (so a dataclass may refer to itself). Raises TypeError for anything else."""
+    import types
+    import typing
+    if tp is typing.Any or tp is object:
+        return ("any",)
+    if tp is int:
+        return ("int",)
+    if tp is float:
+        return ("float",)
+    if tp is str:
+        return ("str",)
+    if tp is bool:
+        return ("bool",)
+    if tp is None or tp is type(None):
+        return ("none",)
+    origin = typing.get_origin(tp)
+    if origin is typing.Union or origin is types.UnionType:
+        members = typing.get_args(tp)
+        inner = [member for member in members if member is not type(None)]
+        if len(inner) != 1 or len(inner) == len(members):
+            raise TypeError(f"loads(type=...) supports Optional[X] but not other unions: {tp!r}")
+        return ("optional", inner[0])
+    if tp is list or origin is list:
+        args = typing.get_args(tp)
+        return ("list", args[0] if args else typing.Any)
+    if tp is dict or origin is dict:
+        args = typing.get_args(tp)
+        if args and args[0] is not str:
+            raise TypeError(f"loads(type=...) supports dict[str, X] but not {tp!r}: JSON object keys are str")
+        return ("dict", args[1] if args else typing.Any)
+    if isinstance(tp, type) and dataclasses.is_dataclass(tp):
+        hints = typing.get_type_hints(tp)
+        fields = []
+        for field in tp.__dataclass_fields__.values():
+            if field._field_type is dataclasses._FIELD_INITVAR:
+                raise TypeError(f"loads(type=...) does not support InitVar fields: {tp.__name__}.{field.name}")
+            if field._field_type is not dataclasses._FIELD:
+                continue  # ClassVar
+            if field.default is not dataclasses.MISSING:
+                kind, default = 1, field.default
+            elif field.default_factory is not dataclasses.MISSING:
+                kind, default = 2, field.default_factory
+            else:
+                kind, default = (0 if field.init else 3), None  # 0 required; 3 left unset when absent
+            fields.append((field.name, hints.get(field.name, typing.Any), kind, default))
+        return ("dataclass", tp, tuple(fields), hasattr(tp, "__post_init__"))
+    raise TypeError(f"loads(type=...) does not support {tp!r}")

@@ -1625,6 +1625,8 @@ void yjson_error(int code) {
     PyErr_SetString(PyExc_TypeError, message);
 }
 
+int yjson_install_loads(PyObject *module, PyObject *support);  /* src/decoder.c */
+
 int yjson_install(uintptr_t module_ptr, uintptr_t context) {
     restore_environment();
     PyObject *module = (PyObject *)module_ptr;
@@ -1709,14 +1711,14 @@ int yjson_install(uintptr_t module_ptr, uintptr_t context) {
     status = PyObject_SetAttrString(module, "dumps_socket", func);
     Py_DECREF(func);
     if (status < 0) goto fail;
+    if (yjson_install_loads(module, support) < 0) goto fail;
     PyObject *dict = PyModule_GetDict(support), *key, *value;
     Py_ssize_t position = 0;
     while (PyDict_Next(dict, &position, &key, &value)) {
         const char *name = PyUnicode_AsUTF8(key);
         if (!name) goto fail;
         if (strncmp(name, "OPT_", 4) == 0 || strcmp(name, "Fragment") == 0
-            || strcmp(name, "JSONEncodeError") == 0 || strcmp(name, "JSONDecodeError") == 0
-            || strcmp(name, "loads") == 0) {
+            || strcmp(name, "JSONEncodeError") == 0 || strcmp(name, "JSONDecodeError") == 0) {
             if (PyObject_SetAttr(module, key, value) < 0) goto fail;
         }
     }

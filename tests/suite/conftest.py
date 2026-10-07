@@ -17,15 +17,12 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "build"))
 
 NAN_INFINITY = "yjson writes NaN and Infinity as Python's json does; orjson writes null"
-STDLIB_PARSER = "loads() uses the stdlib parser, whose error message and position differ"
 INTENDED_DIFFERENCES = {
     "test_type.py::TestType::test_nan_dumps": NAN_INFINITY,
     "test_type.py::TestType::test_infinity_dumps": NAN_INFINITY,
     "test_numpy.py::TestNumpy::test_numpy_array_f16_edge": NAN_INFINITY,
     "test_numpy.py::TestNumpy::test_numpy_array_f32_edge": NAN_INFINITY,
     "test_numpy.py::TestNumpy::test_numpy_array_f64_edge": NAN_INFINITY,
-    "test_error.py::TestJsonDecodeError::test_empty": STDLIB_PARSER,
-    "test_error.py::TestJsonDecodeError::test_leading_padding": STDLIB_PARSER,
 }
 
 

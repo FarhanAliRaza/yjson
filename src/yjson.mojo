@@ -3084,6 +3084,15 @@ def yjson_encode(context: Int, obj: Int, request: Int) abi("C") -> Int:
     if (option & 1024) != 0:
         put_byte(Pointer(to=buffer), 10)
     var result = buffer.obj
+    if buffer.cap >= 1 << 20:
+        # Large results keep their allocation and only get their size set, as orjson does.
+        # Shrinking in place would leave glibc with a freed chunk smaller than the next
+        # call's peak, so its dynamic mmap threshold never clears the peak and every call
+        # maps fresh pages: one page fault per 4 KB of output, 3.5x slower on a 3 MB
+        # document. Freed whole, the chunk raises the threshold past the peak instead.
+        Pointer[Int, MutUntrackedOrigin](unsafe_from_address=result + OB_SIZE)[] = buffer.len
+        buffer.p[unsafe_offset=buffer.len] = 0
+        return result
     if external_call["_PyBytes_Resize", Int32](Int(Pointer(to=result)), buffer.len) != 0:
         return 0
     return result

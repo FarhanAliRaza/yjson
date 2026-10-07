@@ -137,6 +137,10 @@ jobs:
         run: .venv/bin/python tests/check_features.py
       - name: Correctness tests (byte-identical to orjson)
         run: .venv/bin/python tests/check_correctness.py build/jsonexamples
+      - name: loads() against orjson and float()
+        run: .venv/bin/python tests/check_loads.py build/jsonexamples
+      - name: loads(type=...)
+        run: .venv/bin/python tests/check_typed_loads.py
       - name: Example
         run: .venv/bin/python examples/usage.py
       - name: orjson's test suite
