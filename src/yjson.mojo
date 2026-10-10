@@ -1661,10 +1661,6 @@ def ser_value[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o_: Origin[m
     var special = ser_special[NONSTR, SORT, SOCKET, INDENT, True](bp, cp, o, depth)
     if special != 0:
         return special > 0
-    if (ctx.option & 2048) == 0:
-        var plan = external_call["yjson_dataclass_plan", Int](o)
-        if plan != 0:
-            return ser_dataclass[NONSTR, SORT, SOCKET, INDENT](bp, cp, o, plan, depth + 1)
     if is_numpy_type(t):
         return ser_numpy[NONSTR, SORT, SOCKET, INDENT, False](bp, cp, o, depth)
     return ser_fallback[INDENT, SORT, False, NONSTR, SOCKET](bp, cp, o, depth)
@@ -2495,16 +2491,6 @@ def ser_list[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o_: Origin[mu
             len += float_at(p + len, v)
             i += 1
             continue
-        elif v == none_addr or t == cp[].t_bool:
-            # null, true, false without a value-dependent branch: mixed lists
-            # of them mispredicted once per element.
-            var is_none = v == none_addr
-            var is_true = v == cp[].true_addr
-            var word = UInt64(0x6C6C756E) if is_none else (UInt64(0x65757274) if is_true else UInt64(0x65736C6166))
-            store8(p, len, word)
-            len += 5 - Int(is_none or is_true)
-            i += 1
-            continue
         if t == t_str:
             var vsz = 0
             var vsrc = str_src(v, vsz)
@@ -2532,6 +2518,16 @@ def ser_list[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o_: Origin[mu
         # Literals and empty containers without the generic dispatch and a
         # nested call. Type pointers are read here, not hoisted, so the loop
         # above keeps its registers (the buffer has 160 bytes of slack).
+        if v == none_addr or t == cp[].t_bool:
+            # null, true, false without a value-dependent branch: mixed lists
+            # of them mispredicted once per element.
+            var is_none = v == none_addr
+            var is_true = v == cp[].true_addr
+            var word = UInt64(0x6C6C756E) if is_none else (UInt64(0x65757274) if is_true else UInt64(0x65736C6166))
+            store8(p, len, word)
+            len += 5 - Int(is_none or is_true)
+            i += 1
+            continue
         if (t == t_dict or t == t_list) and ob_size(v) == 0:
             (p + len)[] = 123 if t == t_dict else 91
             (p + len + 1)[] = 125 if t == t_dict else 93
@@ -2910,6 +2906,13 @@ def ser_fallback[INDENT: Bool, SORT: Bool, CONFIG: Bool, NONSTR: Bool, SOCKET: B
     if depth > 254:
         bp[].err = 3
         return False
+    # Dataclasses first, from here rather than ser_value: a call site inside
+    # the inlined dispatch would cost every container loop registers.
+    comptime if not CONFIG:
+        if (cp[].option & 2048) == 0:
+            var plan = external_call["yjson_dataclass_plan", Int](o)
+            if plan != 0:
+                return ser_dataclass[NONSTR, SORT, SOCKET, INDENT](bp, cp, o, plan, depth + 1)
     # default may nest 255 deep; the count lives in the C request (it raises the error)
     var conversions = Pointer[Int32, MutUntrackedOrigin](unsafe_from_address=cp[].request + cp[].conv_off)
     if unlikely(conversions[] >= 255):
