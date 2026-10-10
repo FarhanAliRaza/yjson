@@ -82,7 +82,6 @@ struct Ctx:
     var pow10: P64
     var hex: P8
     var escapes: P8
-    var utf8_dfa: P8
 
     def __init__(out self, t: Int, f: Int, n: Int):
         self.key_cache = alloc[Int](SLOTS)
@@ -124,10 +123,6 @@ struct Ctx:
         self.escapes[unsafe_offset=114] = 13
         self.escapes[unsafe_offset=116] = 9
         self.escapes[unsafe_offset=117] = 1
-        self.utf8_dfa = P8(unsafe_from_address=Int(alloc[UInt8](364)))
-        var dfa = materialize[UTF8_DFA]()
-        for i in range(364):
-            self.utf8_dfa[unsafe_offset=i] = dfa[i]
 
 
 struct Parser:
@@ -145,6 +140,8 @@ struct Parser:
     var stack_inline: Int
     var scratch: Int
     var scratch_cap: Int
+    var wide: Int        # UCS-2 scratch for non-ASCII strings, in bytes
+    var wide_cap: Int
     var ctx: Pointer[Ctx, MutUntrackedOrigin]
 
     def __init__(out self, ctx: Int, data: Int, length: Int, inline_stack: Int):
@@ -162,6 +159,8 @@ struct Parser:
         self.stack_inline = inline_stack
         self.scratch = 0
         self.scratch_cap = 0
+        self.wide = 0
+        self.wide_cap = 0
         self.ctx = Pointer[Ctx, MutUntrackedOrigin](unsafe_from_address=ctx)
 
 
@@ -347,107 +346,136 @@ def put_utf8(out0: Int, cp: Int) -> Int:
 
 @always_inline
 def decode_utf8[o_: Origin[mut=True]](p: Pointer[Parser, o_], src: Int, n: Int, quote: Int) -> Int:
-    var s = utf8_string(p[].ctx[].utf8_dfa, src, n)
+    var s = utf8_string(p, src, n)
     if s == 0:
         return fail(p, ERR_UTF8, quote)
     return s
 
 
-# Builds a str from UTF-8 the way CPython's decoder would, in two passes: a
-# table-driven automaton (Bjoern Hoehrmann's) validates the bytes (RFC 3629:
-# no overlongs, no surrogates, nothing past U+10FFFF), counts the characters
-# and finds the widest lead byte; a second pass fills a str of exactly that
-# kind. ASCII words are skipped eight bytes at a time in both passes.
-# Returns 0 on invalid input, with no error set.
-comptime UTF8_DFA: Array[UInt8, 364] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 8, 8, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 10, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 3, 3, 11, 6, 6, 6, 5, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 0, 12, 24, 36, 60, 96, 84, 12, 12, 12, 48, 72, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 0, 12, 12, 12, 12, 12, 0, 12, 0, 12, 12, 12, 24, 12, 12, 12, 12, 12, 24, 12, 24, 12, 12, 12, 12, 12, 12, 12, 12, 12, 24, 12, 12, 12, 12, 12, 24, 12, 12, 12, 12, 12, 12, 12, 24, 12, 12, 12, 12, 12, 12, 12, 12, 12, 36, 12, 36, 12, 12, 12, 36, 12, 12, 12, 12, 12, 36, 12, 36, 12, 12, 12, 36, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12]
-
+# Builds a str from UTF-8 the way CPython's decoder would (RFC 3629: no
+# overlongs, no surrogates, nothing past U+10FFFF) in one pass that decodes
+# into a UCS-2 scratch, widening ASCII words with one vector instruction.
+# The result is then narrowed or copied into a str of the right kind; the
+# rare 4-byte sequence takes a second UCS-4 pass. Returns 0 on invalid input,
+# with no error set.
 @no_inline
-def utf8_string(dfa: P8, src: Int, n: Int) -> Int:
+def utf8_string[o_: Origin[mut=True]](p: Pointer[Parser, o_], src: Int, n: Int) -> Int:
+    if p[].wide_cap < 2 * n + 16:
+        var fresh = external_call["realloc", Int](p[].wide, 2 * n + 16)
+        if fresh == 0:
+            return 0
+        p[].wide = fresh
+        p[].wide_cap = 2 * n + 16
+    var out = Pointer[UInt16, MutUntrackedOrigin](unsafe_from_address=p[].wide)
     var i = 0
-    var continuations = 0
-    var maxlead = UInt8(0)
-    var state = 0
+    var j = 0
+    var widest = UInt16(0)   # OR of every decoded non-ASCII character
+    var four = False
     while i < n:
-        if state == 0 and n - i >= 8:
-            var w = P64(unsafe_from_address=src + i)[]
-            if (w & 0x8080808080808080) == 0:
-                i += 8
-                continue
-            # Run this word through the automaton byte by byte, then look again.
-            var stop = i + 8
-            while i < stop:
-                var b = rd(src + i)
-                state = Int(dfa[unsafe_offset=256 + state + Int(dfa[unsafe_offset=Int(b)])])
-                if state == 12:
-                    return 0
-                var lead = (b & 0xC0) != 0x80
-                continuations += Int(not lead)
-                maxlead = max(maxlead, b if lead else UInt8(0))
-                i += 1
-            continue
         var b = rd(src + i)
-        state = Int(dfa[unsafe_offset=256 + state + Int(dfa[unsafe_offset=Int(b)])])
-        if state == 12:
-            return 0
-        var lead = (b & 0xC0) != 0x80
-        continuations += Int(not lead)
-        maxlead = max(maxlead, b if lead else UInt8(0))
-        i += 1
-    if state != 0:
-        return 0
-    if maxlead < 0x80:
-        return ascii_string(src, n)
-    var chars = n - continuations
-    if maxlead < 0xC4:
-        var s = external_call["PyUnicode_New", Int](chars, 255)
-        if s == 0:
-            return 0
-        var out = P8(unsafe_from_address=s + STR_COMPACT_DATA)
-        var j = 0
-        i = 0
-        while i < n:
+        if b < 0x80:
             if n - i >= 8:
-                var w = P64(unsafe_from_address=src + i)[]
-                if (w & 0x8080808080808080) == 0:
-                    P64(unsafe_from_address=Int(out) + j)[] = w
+                var w = P8(unsafe_from_address=src + i).unsafe_load[width=8]()
+                if (w & 0x80).reduce_or() == 0:
+                    out.unsafe_offset(j).unsafe_store(w.cast[DType.uint16]())
                     i += 8
                     j += 8
                     continue
-            var b = rd(src + i)
-            if b < 0x80:
-                out[unsafe_offset=j] = b
-                i += 1
-            else:
-                out[unsafe_offset=j] = ((b & 0x1F) << 6) | (rd(src + i + 1) & 0x3F)
-                i += 2
+            out[unsafe_offset=j] = UInt16(b)
+            i += 1
             j += 1
-        return s
-    if maxlead < 0xF0:
-        var s = external_call["PyUnicode_New", Int](chars, 65535)
+            continue
+        if b < 0xE0:
+            if b < 0xC2 or i + 1 >= n:
+                return 0
+            var b1 = rd(src + i + 1)
+            if (b1 & 0xC0) != 0x80:
+                return 0
+            var cp = (UInt16(b & 0x1F) << 6) | UInt16(b1 & 0x3F)
+            out[unsafe_offset=j] = cp
+            widest |= cp
+            i += 2
+            j += 1
+            continue
+        if b < 0xF0:
+            if i + 2 >= n:
+                return 0
+            var b1 = rd(src + i + 1)
+            var b2 = rd(src + i + 2)
+            if (b1 & 0xC0) != 0x80 or (b2 & 0xC0) != 0x80:
+                return 0
+            if b == 0xE0 and b1 < 0xA0:
+                return 0
+            if b == 0xED and b1 >= 0xA0:
+                return 0
+            var cp = (UInt16(b & 0x0F) << 12) | (UInt16(b1 & 0x3F) << 6) | UInt16(b2 & 0x3F)
+            out[unsafe_offset=j] = cp
+            widest |= cp
+            i += 3
+            j += 1
+            # Text in a 3-byte script (CJK, Devanagari, ...) continues with
+            # more of the same: decode such runs without the full dispatch.
+            # Leads E1..EC and EE..EF have no special second-byte rule.
+            while i + 3 <= n:
+                var lb = rd(src + i)
+                var l1 = rd(src + i + 1)
+                var l2 = rd(src + i + 2)
+                if (lb - 0xE1) >= 0x0C and (lb - 0xEE) >= 0x02:
+                    break
+                if ((l1 & 0xC0) | ((l2 & 0xC0) << 2)) != 0x280:
+                    break
+                cp = (UInt16(lb & 0x0F) << 12) | (UInt16(l1 & 0x3F) << 6) | UInt16(l2 & 0x3F)
+                out[unsafe_offset=j] = cp
+                i += 3
+                j += 1
+            widest |= 0x800
+            continue
+        if b >= 0xF5 or i + 3 >= n:
+            return 0
+        var c1 = rd(src + i + 1)
+        if (c1 & 0xC0) != 0x80 or (rd(src + i + 2) & 0xC0) != 0x80 or (rd(src + i + 3) & 0xC0) != 0x80:
+            return 0
+        if b == 0xF0 and c1 < 0x90:
+            return 0
+        if b == 0xF4 and c1 >= 0x90:
+            return 0
+        four = True
+        out[unsafe_offset=j] = 0xFFFF
+        i += 4
+        j += 1
+    if four:
+        return utf8_string_ucs4(src, n, j)
+    if widest < 0x80:
+        return ascii_string(src, n)
+    if widest < 0x100:
+        var s = external_call["PyUnicode_New", Int](j, 255)
         if s == 0:
             return 0
-        var out = Pointer[UInt16, MutUntrackedOrigin](unsafe_from_address=s + STR_COMPACT_DATA)
-        var j = 0
-        i = 0
-        while i < n:
-            var b = rd(src + i)
-            if b < 0x80:
-                out[unsafe_offset=j] = UInt16(b)
-                i += 1
-            elif b < 0xE0:
-                out[unsafe_offset=j] = (UInt16(b & 0x1F) << 6) | UInt16(rd(src + i + 1) & 0x3F)
-                i += 2
-            else:
-                out[unsafe_offset=j] = (UInt16(b & 0x0F) << 12) | (UInt16(rd(src + i + 1) & 0x3F) << 6) | UInt16(rd(src + i + 2) & 0x3F)
-                i += 3
-            j += 1
+        var dst = P8(unsafe_from_address=s + STR_COMPACT_DATA)
+        var k = 0
+        while k + 8 <= j:
+            dst.unsafe_offset(k).unsafe_store(out.unsafe_offset(k).unsafe_load[width=8]().cast[DType.uint8]())
+            k += 8
+        while k < j:
+            dst[unsafe_offset=k] = UInt8(out[unsafe_offset=k])
+            k += 1
         return s
+    var s = external_call["PyUnicode_New", Int](j, 65535)
+    if s == 0:
+        return 0
+    external_call["memcpy", NoneType](s + STR_COMPACT_DATA, Int(out), 2 * j)
+    return s
+
+
+# Strings with a character past U+FFFF, already validated: a UCS-4 fill.
+@no_inline
+def utf8_string_ucs4(src: Int, n: Int, chars: Int) -> Int:
     var s = external_call["PyUnicode_New", Int](chars, 0x10FFFF)
     if s == 0:
         return 0
     var out = Pointer[UInt32, MutUntrackedOrigin](unsafe_from_address=s + STR_COMPACT_DATA)
     var j = 0
-    i = 0
+    var i = 0
     while i < n:
         var b = rd(src + i)
         if b < 0x80:
@@ -1441,7 +1469,6 @@ def yjson_mojo_destroy(address: Int) abi("C"):
     ctx[].pow10.unsafe_free()
     ctx[].hex.unsafe_free()
     ctx[].escapes.unsafe_free()
-    ctx[].utf8_dfa.unsafe_free()
     ctx.unsafe_free()
 
 
@@ -1473,6 +1500,8 @@ def loads_impl[typed: Bool](ctx: Int, data: Int, length: Int, plan: Int, err_out
         external_call["free", NoneType](Int(p[].stack))
     if p[].scratch != 0:
         external_call["free", NoneType](p[].scratch)
+    if p[].wide != 0:
+        external_call["free", NoneType](p[].wide)
     var out = PI(unsafe_from_address=err_out)
     out[] = p[].err
     out[unsafe_offset=1] = p[].err_at

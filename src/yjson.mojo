@@ -645,9 +645,10 @@ def table_write4(dst: P8, n: Int, val: UInt32) -> Int:
     return n + 4
 
 # Two- and three-digit (30..64-bit) ints: timestamps, snowflake ids, hashes.
-# Out of line so the container loops that inline int_fast stay small.
+# Only the numeric list loop calls it; the shared loops send them to write_int.
 @inline(.never)
-def int_wide(dst: P8, n: Int, o: Int, tag: Int) -> Int:
+def int_wide(dst: P8, n: Int, o: Int) -> Int:
+    var tag = long_tag(o)
     if tag >= 32:
         return -1
     var digits = long_digits(o)
@@ -670,7 +671,7 @@ def int_fast(dst: P8, n: Int, o: Int) -> Int:
     # returns new length, or -1 if the int is not a compact (<2**30) int
     var tag = long_tag(o)
     if unlikely(tag >= 16):
-        return int_wide(dst, n, o, tag)
+        return -1
     var mag = UInt64(long_digits(o)[])
     var m = n
     if unlikely((tag & 3) == 2):
@@ -1446,6 +1447,14 @@ def ser_special[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, SUBCLASS: 
 
 # ---------------- dispatch: scalars inline, recursion only for containers ----------------
 @always_inline
+def lit2[o_: Origin[mut=True]](bp: Pointer[Buf, o_], a: UInt8, b2: UInt8):
+    ref b = bp[]
+    b.ensure(8)
+    b.p[unsafe_offset=b.len] = a
+    b.p[unsafe_offset=b.len + 1] = b2
+    b.len += 2
+
+@always_inline
 def lit4[o_: Origin[mut=True]](bp: Pointer[Buf, o_], a: UInt8, b2: UInt8, c: UInt8, d: UInt8):
     ref b = bp[]
     b.ensure(5)
@@ -1610,6 +1619,9 @@ def ser_value[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o_: Origin[m
         if unlikely(depth >= 60) and (t == ctx.t_dict or t == ctx.t_list or t == ctx.t_tuple):
             return ser_configured[True, SORT, SOCKET](bp, cp, o, depth)
     if t == ctx.t_dict:
+        if ob_size(o) == 0:
+            lit2(bp, 123, 125)
+            return True
         comptime if NONSTR or SORT:
             if dict_has_general_keys(o):
                 return ser_dict_records[NONSTR, SORT, SOCKET, INDENT](bp, cp, o, depth + 1)
@@ -1618,6 +1630,9 @@ def ser_value[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o_: Origin[m
         else:
             return ser_dict_items[NONSTR, False, SOCKET, False, INDENT](bp, cp, o, depth + 1, 0)
     if t == ctx.t_list or t == ctx.t_tuple:
+        if ob_size(o) == 0:
+            lit2(bp, 91, 93)
+            return True
         return ser_list[NONSTR, SORT, SOCKET, INDENT](bp, cp, o, depth + 1, t == ctx.t_list)
     if t == ctx.t_str:
         return write_str[SOCKET](bp, o)
@@ -2362,11 +2377,27 @@ def ser_list_num[NONSTR: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=True], c
             (p + len)[] = 44
             len += 1
         if t == t_int:
-            var r = int_fast(p, len, v)
-            if r >= 0:
-                len = r
-                i += 1
-                continue
+            # One to three CPython digits (up to 64 bits) inline: this loop is
+            # numbers only, so its size does not matter to the string paths.
+            var tag = long_tag(v)
+            if likely(tag < 32):
+                var digits = long_digits(v)
+                var mag = UInt64(digits[])
+                var fits = True
+                if tag >= 16:
+                    mag |= UInt64(digits[unsafe_offset=1]) << 30
+                    if tag >= 24:
+                        var high = UInt64(digits[unsafe_offset=2])
+                        mag |= high << 60
+                        fits = high < 16 and not ((tag & 3) == 2 and mag > (UInt64(1) << 63))
+                if likely(fits):
+                    var m = len
+                    if (tag & 3) == 2:
+                        (p + len)[] = 45
+                        m = len + 1
+                    len = ia_write8(p, m, UInt32(mag)) if mag < 100000000 else put_u64(p, m, mag)
+                    i += 1
+                    continue
         elif t == t_float:
             len += float_at(p + len, v)
             i += 1
