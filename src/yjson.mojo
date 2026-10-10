@@ -601,8 +601,10 @@ def store8(dst: P8, pos: Int, v: UInt64):
     (dst + pos).unsafe_bitcast[UInt64]()[] = v
 
 # Writes v in decimal at dst+n and returns the new end. May write up to 8 bytes
-# past the end (callers reserve slack).
-@always_inline
+# past the end (callers reserve slack). Out of line: it is inlined into every
+# container loop through int_fast and float_at, and its table writers would
+# grow those loops.
+@inline(.never)
 def put_u64(dst: P8, n: Int, v: UInt64) -> Int:
     # yyjson's split: the high part through the branchy small writer, the low
     # 8 digits through two-digit table stores. Measured 1.4-1.7x faster than
@@ -1598,13 +1600,6 @@ def ser_dataclass_fields[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o
             close_indent(bp, depth - 1)
     put_byte(bp, 125)
     return True
-
-# The list and dict loops write scalars themselves and send everything else
-# here. Out of line so that their loops stay small: growth of the inlined
-# dispatch measurably slowed the string paths of those loops.
-@inline(.never)
-def ser_nested[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o_: Origin[mut=True], c_: Origin](bp: Pointer[Buf, o_], cp: Pointer[Ctx, c_], o: Int, depth: Int) -> Bool:
-    return ser_value[NONSTR, SORT, SOCKET, INDENT](bp, cp, o, depth)
 
 @always_inline
 def ser_value[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o_: Origin[mut=True], c_: Origin](bp: Pointer[Buf, o_], cp: Pointer[Ctx, c_], o: Int, depth: Int) -> Bool:
@@ -2619,7 +2614,7 @@ def ser_list[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o_: Origin[mu
                     continue
                 len = start
         bp[].len = len
-        if not ser_nested[NONSTR, SORT, SOCKET, INDENT](bp, cp, v, depth):
+        if not ser_value[NONSTR, SORT, SOCKET, INDENT](bp, cp, v, depth):
             return False
         if is_list:
             if ob_size(o) != cnt:
@@ -2891,7 +2886,7 @@ def ser_dict_items[NONSTR: Bool, SORT: Bool, SOCKET: Bool, RECORDS: Bool, INDENT
             len += 2
             continue
         bp[].len = len
-        if not ser_nested[NONSTR, SORT, SOCKET, INDENT](bp, cp, v, depth):
+        if not ser_value[NONSTR, SORT, SOCKET, INDENT](bp, cp, v, depth):
             return False
         comptime if not RECORDS:
             # A callback may have mutated the dict: a resize replaces (and frees) the key table.
