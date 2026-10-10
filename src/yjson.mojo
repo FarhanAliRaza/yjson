@@ -1449,14 +1449,6 @@ def ser_special[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, SUBCLASS: 
 
 # ---------------- dispatch: scalars inline, recursion only for containers ----------------
 @always_inline
-def lit2[o_: Origin[mut=True]](bp: Pointer[Buf, o_], a: UInt8, b2: UInt8):
-    ref b = bp[]
-    b.ensure(8)
-    b.p[unsafe_offset=b.len] = a
-    b.p[unsafe_offset=b.len + 1] = b2
-    b.len += 2
-
-@always_inline
 def lit4[o_: Origin[mut=True]](bp: Pointer[Buf, o_], a: UInt8, b2: UInt8, c: UInt8, d: UInt8):
     ref b = bp[]
     b.ensure(5)
@@ -1614,9 +1606,6 @@ def ser_value[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o_: Origin[m
         if unlikely(depth >= 60) and (t == ctx.t_dict or t == ctx.t_list or t == ctx.t_tuple):
             return ser_configured[True, SORT, SOCKET](bp, cp, o, depth)
     if t == ctx.t_dict:
-        if ob_size(o) == 0:
-            lit2(bp, 123, 125)
-            return True
         comptime if NONSTR or SORT:
             if dict_has_general_keys(o):
                 return ser_dict_records[NONSTR, SORT, SOCKET, INDENT](bp, cp, o, depth + 1)
@@ -1625,9 +1614,6 @@ def ser_value[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o_: Origin[m
         else:
             return ser_dict_items[NONSTR, False, SOCKET, False, INDENT](bp, cp, o, depth + 1, 0)
     if t == ctx.t_list or t == ctx.t_tuple:
-        if ob_size(o) == 0:
-            lit2(bp, 91, 93)
-            return True
         return ser_list[NONSTR, SORT, SOCKET, INDENT](bp, cp, o, depth + 1, t == ctx.t_list)
     if t == ctx.t_str:
         return write_str[SOCKET](bp, o)
@@ -2491,6 +2477,14 @@ def ser_list[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o_: Origin[mu
             len += float_at(p + len, v)
             i += 1
             continue
+        elif v == none_addr:
+            (p + len)[] = 110
+            (p + len + 1)[] = 117
+            (p + len + 2)[] = 108
+            (p + len + 3)[] = 108
+            len += 4
+            i += 1
+            continue
         if t == t_str:
             var vsz = 0
             var vsrc = str_src(v, vsz)
@@ -2518,20 +2512,16 @@ def ser_list[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o_: Origin[mu
         # Literals and empty containers without the generic dispatch and a
         # nested call. Type pointers are read here, not hoisted, so the loop
         # above keeps its registers (the buffer has 160 bytes of slack).
-        if v == none_addr or t == cp[].t_bool:
-            # null, true, false without a value-dependent branch: mixed lists
-            # of them mispredicted once per element.
-            var is_none = v == none_addr
-            var is_true = v == cp[].true_addr
-            var word = UInt64(0x6C6C756E) if is_none else (UInt64(0x65757274) if is_true else UInt64(0x65736C6166))
-            store8(p, len, word)
-            len += 5 - Int(is_none or is_true)
-            i += 1
-            continue
         if (t == t_dict or t == t_list) and ob_size(v) == 0:
             (p + len)[] = 123 if t == t_dict else 91
             (p + len + 1)[] = 125 if t == t_dict else 93
             len += 2
+            i += 1
+            continue
+        if t == cp[].t_bool:
+            var is_true = v == cp[].true_addr
+            store8(p, len, UInt64(0x65757274) if is_true else UInt64(0x65736C6166))
+            len += 4 if is_true else 5
             i += 1
             continue
         # Short leaf lists of scalars (coordinate pairs, small vectors, rows):
@@ -2869,17 +2859,22 @@ def ser_dict_items[NONSTR: Bool, SORT: Bool, SOCKET: Bool, RECORDS: Bool, INDENT
         elif t == t_float:
             len += float_at(p + len, v)
             continue
-        elif v == none_addr or t == cp[].t_bool:
-            var is_none = v == none_addr
-            var is_true = v == cp[].true_addr
-            var word = UInt64(0x6C6C756E) if is_none else (UInt64(0x65757274) if is_true else UInt64(0x65736C6166))
-            store8(p, len, word)
-            len += 5 - Int(is_none or is_true)
+        elif v == none_addr:
+            (p + len)[] = 110
+            (p + len + 1)[] = 117
+            (p + len + 2)[] = 108
+            (p + len + 3)[] = 108
+            len += 4
             continue
         elif (t == t_dict or t == t_list) and ob_size(v) == 0:
             (p + len)[] = 123 if t == t_dict else 91
             (p + len + 1)[] = 125 if t == t_dict else 93
             len += 2
+            continue
+        elif t == cp[].t_bool:
+            var is_true = v == cp[].true_addr
+            store8(p, len, UInt64(0x65757274) if is_true else UInt64(0x65736C6166))
+            len += 4 if is_true else 5
             continue
         bp[].len = len
         if not ser_value[NONSTR, SORT, SOCKET, INDENT](bp, cp, v, depth):
