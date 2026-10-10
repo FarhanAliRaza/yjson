@@ -389,8 +389,8 @@ static inline __attribute__((always_inline)) PyObject *dumps_impl(PyObject *caps
         PyErr_SetString(PyExc_TypeError, "dumps() takes at most 3 positional arguments");
         return NULL;
     }
-    ModuleState *state = PyCapsule_GetPointer(capsule, "yjson.state");
-    if (!state) return NULL;
+    ModuleState *state = module_state;
+    if (!state) { state = PyCapsule_GetPointer(capsule, "yjson.state"); if (!state) return NULL; }
     PyObject *default_fn = nargs >= 2 ? args[1] : Py_None;
     PyObject *option_obj = nargs >= 3 ? args[2] : Py_None;
     int default_seen = nargs >= 2, option_seen = nargs >= 3;
@@ -513,6 +513,19 @@ uintptr_t yjson_surrogate_string(uintptr_t object) {
     return (uintptr_t)out;
 }
 
+/* Prototype: one persistent output scratch buffer. Small results are
+   written here and copied once into an exact-size bytes object; a result
+   that outgrows it moves into a bytes object as before. A reentrant call
+   (default() calling dumps) finds it busy and allocates as before. */
+#define YJSON_SCRATCH_CAP 2048
+static char *yjson_scratch_buf;
+static int yjson_scratch_busy;
+uintptr_t yjson_scratch_acquire(void) {
+    if (yjson_scratch_busy) return 0;
+    if (!yjson_scratch_buf) { yjson_scratch_buf = malloc(YJSON_SCRATCH_CAP + 256); if (!yjson_scratch_buf) return 0; }
+    yjson_scratch_busy = 1; return (uintptr_t)yjson_scratch_buf;
+}
+void yjson_scratch_release(void) { yjson_scratch_busy = 0; }
 long yjson_options(uintptr_t request) { return ((Request *)request)->option; }
 
 int yjson_enter_fallback(uintptr_t request_ptr) {
