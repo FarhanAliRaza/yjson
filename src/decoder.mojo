@@ -422,7 +422,7 @@ def utf8_string[o_: Origin[mut=True]](p: Pointer[Parser, o_], src: Int, n: Int) 
                 var l2 = rd(src + i + 2)
                 if (lb - 0xE1) >= 0x0C and (lb - 0xEE) >= 0x02:
                     break
-                if ((l1 & 0xC0) | ((l2 & 0xC0) << 2)) != 0x280:
+                if (l1 & 0xC0) != 0x80 or (l2 & 0xC0) != 0x80:
                     break
                 cp = (UInt16(lb & 0x0F) << 12) | (UInt16(l1 & 0x3F) << 6) | UInt16(l2 & 0x3F)
                 out[unsafe_offset=j] = cp
