@@ -1522,6 +1522,81 @@ def close_indent[o_: Origin[mut=True]](bp: Pointer[Buf, o_], depth: Int):
     bp[].ensure(2 * depth + 40)
     bp[].len = indent_at(bp[].p, bp[].len, depth, False)
 
+# Dataclass instances, from the per-type plan the C shim builds once (see
+# DataclassPlan): the instance dict in its order minus "_" attributes, or the
+# declared fields read straight from their slots. No temporary dict, no
+# Python call per field, and the field names hit the key cache.
+@inline(.never)
+def ser_dataclass[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o_: Origin[mut=True], c_: Origin](bp: Pointer[Buf, o_], cp: Pointer[Ctx, c_], o: Int, plan: Int, depth: Int) -> Bool:
+    if depth > 255:
+        bp[].err = 3
+        return False
+    if rdb(plan, 8) == 1:
+        var d = external_call["PyObject_GenericGetDict", Int](o, 0)
+        if unlikely(d == 0):
+            external_call["PyErr_Clear", NoneType]()
+            return ser_fallback[INDENT, SORT, False, NONSTR, SOCKET](bp, cp, o, depth - 1)
+        var ok = ser_dict_items[NONSTR, SORT, SOCKET, False, INDENT, SKIP_PRIVATE=True](bp, cp, d, depth, 0)
+        external_call["Py_DecRef", NoneType](d)
+        return ok
+    # A callback deeper in the tree may run Python code: pin this instance with
+    # the containers. A getter may drop the last container reference to it: own one.
+    Pointer[Int, MutUntrackedOrigin](unsafe_from_address=cp[].ancestors)[unsafe_offset=depth] = o
+    external_call["Py_IncRef", NoneType](o)
+    var ok = ser_dataclass_fields[NONSTR, SORT, SOCKET, INDENT](bp, cp, o, plan, depth)
+    external_call["Py_DecRef", NoneType](o)
+    return ok
+
+@inline(.always)
+def ser_dataclass_fields[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o_: Origin[mut=True], c_: Origin](bp: Pointer[Buf, o_], cp: Pointer[Ctx, c_], o: Int, plan: Int, depth: Int) -> Bool:
+    var count = rdb(plan, 16)
+    var keys = rdb(plan, 24)
+    var offsets = rdb(plan, 32)
+    put_byte(bp, 123)
+    var i = 0
+    while i < count:
+        var k = rdi(keys, i)
+        var off = rdi(offsets, i)
+        var v: Int
+        if likely(off >= 0):
+            v = rdb(o, off)
+            if unlikely(v == 0):
+                external_call["yjson_unset_attribute", NoneType](o, k)
+                return False
+            external_call["Py_IncRef", NoneType](v)
+        else:
+            v = external_call["PyObject_GetAttr", Int](o, k)
+            if v == 0:
+                return False
+        comptime if INDENT:
+            indent_sep(bp, depth, i > 0)
+        else:
+            if i > 0:
+                put_byte(bp, 44)
+        if not write_cached_key(bp, cp, k):
+            external_call["Py_DecRef", NoneType](v)
+            return False
+        put_byte(bp, 58)
+        comptime if INDENT:
+            put_byte(bp, 32)
+        var ok = ser_value[NONSTR, SORT, SOCKET, INDENT](bp, cp, v, depth)
+        external_call["Py_DecRef", NoneType](v)
+        if not ok:
+            return False
+        i += 1
+    comptime if INDENT:
+        if count > 0:
+            close_indent(bp, depth - 1)
+    put_byte(bp, 125)
+    return True
+
+# The list and dict loops write scalars themselves and send everything else
+# here. Out of line so that their loops stay small: growth of the inlined
+# dispatch measurably slowed the string paths of those loops.
+@inline(.never)
+def ser_nested[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o_: Origin[mut=True], c_: Origin](bp: Pointer[Buf, o_], cp: Pointer[Ctx, c_], o: Int, depth: Int) -> Bool:
+    return ser_value[NONSTR, SORT, SOCKET, INDENT](bp, cp, o, depth)
+
 @always_inline
 def ser_value[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o_: Origin[mut=True], c_: Origin](bp: Pointer[Buf, o_], cp: Pointer[Ctx, c_], o: Int, depth: Int) -> Bool:
     ref ctx = cp[]
@@ -1576,6 +1651,10 @@ def ser_value[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o_: Origin[m
     var special = ser_special[NONSTR, SORT, SOCKET, INDENT, True](bp, cp, o, depth)
     if special != 0:
         return special > 0
+    if (ctx.option & 2048) == 0:
+        var plan = external_call["yjson_dataclass_plan", Int](o)
+        if plan != 0:
+            return ser_dataclass[NONSTR, SORT, SOCKET, INDENT](bp, cp, o, plan, depth + 1)
     if is_numpy_type(t):
         return ser_numpy[NONSTR, SORT, SOCKET, INDENT, False](bp, cp, o, depth)
     return ser_fallback[INDENT, SORT, False, NONSTR, SOCKET](bp, cp, o, depth)
@@ -2390,12 +2469,14 @@ def ser_list[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o_: Origin[mu
             len += float_at(p + len, v)
             i += 1
             continue
-        elif v == none_addr:
-            (p + len)[] = 110
-            (p + len + 1)[] = 117
-            (p + len + 2)[] = 108
-            (p + len + 3)[] = 108
-            len += 4
+        elif v == none_addr or t == cp[].t_bool:
+            # null, true, false without a value-dependent branch: mixed lists
+            # of them mispredicted once per element.
+            var is_none = v == none_addr
+            var is_true = v == cp[].true_addr
+            var word = UInt64(0x6C6C756E) if is_none else (UInt64(0x65757274) if is_true else UInt64(0x65736C6166))
+            store8(p, len, word)
+            len += 5 - Int(is_none or is_true)
             i += 1
             continue
         if t == t_str:
@@ -2429,12 +2510,6 @@ def ser_list[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o_: Origin[mu
             (p + len)[] = 123 if t == t_dict else 91
             (p + len + 1)[] = 125 if t == t_dict else 93
             len += 2
-            i += 1
-            continue
-        if t == cp[].t_bool:
-            var is_true = v == cp[].true_addr
-            store8(p, len, UInt64(0x65757274) if is_true else UInt64(0x65736C6166))
-            len += 4 if is_true else 5
             i += 1
             continue
         # Short leaf lists of scalars (coordinate pairs, small vectors, rows):
@@ -2513,7 +2588,7 @@ def ser_list[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o_: Origin[mu
                     continue
                 len = start
         bp[].len = len
-        if not ser_value[NONSTR, SORT, SOCKET, INDENT](bp, cp, v, depth):
+        if not ser_nested[NONSTR, SORT, SOCKET, INDENT](bp, cp, v, depth):
             return False
         if is_list:
             if ob_size(o) != cnt:
@@ -2772,25 +2847,20 @@ def ser_dict_items[NONSTR: Bool, SORT: Bool, SOCKET: Bool, RECORDS: Bool, INDENT
         elif t == t_float:
             len += float_at(p + len, v)
             continue
-        elif v == none_addr:
-            (p + len)[] = 110
-            (p + len + 1)[] = 117
-            (p + len + 2)[] = 108
-            (p + len + 3)[] = 108
-            len += 4
+        elif v == none_addr or t == cp[].t_bool:
+            var is_none = v == none_addr
+            var is_true = v == cp[].true_addr
+            var word = UInt64(0x6C6C756E) if is_none else (UInt64(0x65757274) if is_true else UInt64(0x65736C6166))
+            store8(p, len, word)
+            len += 5 - Int(is_none or is_true)
             continue
         elif (t == t_dict or t == t_list) and ob_size(v) == 0:
             (p + len)[] = 123 if t == t_dict else 91
             (p + len + 1)[] = 125 if t == t_dict else 93
             len += 2
             continue
-        elif t == cp[].t_bool:
-            var is_true = v == cp[].true_addr
-            store8(p, len, UInt64(0x65757274) if is_true else UInt64(0x65736C6166))
-            len += 4 if is_true else 5
-            continue
         bp[].len = len
-        if not ser_value[NONSTR, SORT, SOCKET, INDENT](bp, cp, v, depth):
+        if not ser_nested[NONSTR, SORT, SOCKET, INDENT](bp, cp, v, depth):
             return False
         comptime if not RECORDS:
             # A callback may have mutated the dict: a resize replaces (and frees) the key table.
@@ -3087,7 +3157,7 @@ def write_cached_key[o_: Origin[mut=True], c_: Origin](bp: Pointer[Buf, o_], cp:
 
 # ---------------- Python entry point: the module's Ctx caches the type pointers ----------------
 @export
-def yjson_encode(context: Int, obj: Int, request: Int) abi("C") -> Int:
+def yjson_encode(context: Int, obj: Int, request: Int, option: Int) abi("C") -> Int:
     var ctx = Pointer[Ctx, MutUntrackedOrigin](unsafe_from_address=context)[]
     ctx.request = request
     var ancestors = unsafe_stack_allocation[257, Int]()
@@ -3096,7 +3166,6 @@ def yjson_encode(context: Int, obj: Int, request: Int) abi("C") -> Int:
     var generation = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=ctx.kc)
     generation[] += 1
     var buffer = Buf(256)
-    var option = external_call["yjson_options", Int](request)
     ctx.option = option
     var ok: Bool
     if (option & (1 | 4 | 32 | 64 | 256 | 65536)) == 0:

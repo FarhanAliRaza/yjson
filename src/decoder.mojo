@@ -41,6 +41,7 @@ comptime INLINE_STACK = 256
 comptime LIST_ITEMS = get_defined_int["YJSON_LIST_ITEMS", 24]()
 comptime STR_LENGTH = get_defined_int["YJSON_STR_LENGTH", 16]()
 comptime STR_ASCII_DATA = get_defined_int["YJSON_STR_ASCII_DATA", 40]()
+comptime STR_COMPACT_DATA = get_defined_int["YJSON_STR_COMPACT_DATA", 72]()
 
 comptime ERR_EOF = 1
 comptime ERR_VALUE = 2
@@ -81,6 +82,7 @@ struct Ctx:
     var pow10: P64
     var hex: P8
     var escapes: P8
+    var utf8_dfa: P8
 
     def __init__(out self, t: Int, f: Int, n: Int):
         self.key_cache = alloc[Int](SLOTS)
@@ -122,6 +124,10 @@ struct Ctx:
         self.escapes[unsafe_offset=114] = 13
         self.escapes[unsafe_offset=116] = 9
         self.escapes[unsafe_offset=117] = 1
+        self.utf8_dfa = P8(unsafe_from_address=Int(alloc[UInt8](364)))
+        var dfa = materialize[UTF8_DFA]()
+        for i in range(364):
+            self.utf8_dfa[unsafe_offset=i] = dfa[i]
 
 
 struct Parser:
@@ -341,10 +347,122 @@ def put_utf8(out0: Int, cp: Int) -> Int:
 
 @always_inline
 def decode_utf8[o_: Origin[mut=True]](p: Pointer[Parser, o_], src: Int, n: Int, quote: Int) -> Int:
-    var s = external_call["PyUnicode_DecodeUTF8", Int](src, n, 0)
+    var s = utf8_string(p[].ctx[].utf8_dfa, src, n)
     if s == 0:
-        external_call["PyErr_Clear", NoneType]()
         return fail(p, ERR_UTF8, quote)
+    return s
+
+
+# Builds a str from UTF-8 the way CPython's decoder would, in two passes: a
+# table-driven automaton (Bjoern Hoehrmann's) validates the bytes (RFC 3629:
+# no overlongs, no surrogates, nothing past U+10FFFF), counts the characters
+# and finds the widest lead byte; a second pass fills a str of exactly that
+# kind. ASCII words are skipped eight bytes at a time in both passes.
+# Returns 0 on invalid input, with no error set.
+comptime UTF8_DFA: Array[UInt8, 364] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 8, 8, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 10, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 3, 3, 11, 6, 6, 6, 5, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 0, 12, 24, 36, 60, 96, 84, 12, 12, 12, 48, 72, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 0, 12, 12, 12, 12, 12, 0, 12, 0, 12, 12, 12, 24, 12, 12, 12, 12, 12, 24, 12, 24, 12, 12, 12, 12, 12, 12, 12, 12, 12, 24, 12, 12, 12, 12, 12, 24, 12, 12, 12, 12, 12, 12, 12, 24, 12, 12, 12, 12, 12, 12, 12, 12, 12, 36, 12, 36, 12, 12, 12, 36, 12, 12, 12, 12, 12, 36, 12, 36, 12, 12, 12, 36, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12]
+
+@no_inline
+def utf8_string(dfa: P8, src: Int, n: Int) -> Int:
+    var i = 0
+    var continuations = 0
+    var maxlead = UInt8(0)
+    var state = 0
+    while i < n:
+        if state == 0 and n - i >= 8:
+            var w = P64(unsafe_from_address=src + i)[]
+            if (w & 0x8080808080808080) == 0:
+                i += 8
+                continue
+            # Run this word through the automaton byte by byte, then look again.
+            var stop = i + 8
+            while i < stop:
+                var b = rd(src + i)
+                state = Int(dfa[unsafe_offset=256 + state + Int(dfa[unsafe_offset=Int(b)])])
+                if state == 12:
+                    return 0
+                var lead = (b & 0xC0) != 0x80
+                continuations += Int(not lead)
+                maxlead = max(maxlead, b if lead else UInt8(0))
+                i += 1
+            continue
+        var b = rd(src + i)
+        state = Int(dfa[unsafe_offset=256 + state + Int(dfa[unsafe_offset=Int(b)])])
+        if state == 12:
+            return 0
+        var lead = (b & 0xC0) != 0x80
+        continuations += Int(not lead)
+        maxlead = max(maxlead, b if lead else UInt8(0))
+        i += 1
+    if state != 0:
+        return 0
+    if maxlead < 0x80:
+        return ascii_string(src, n)
+    var chars = n - continuations
+    if maxlead < 0xC4:
+        var s = external_call["PyUnicode_New", Int](chars, 255)
+        if s == 0:
+            return 0
+        var out = P8(unsafe_from_address=s + STR_COMPACT_DATA)
+        var j = 0
+        i = 0
+        while i < n:
+            if n - i >= 8:
+                var w = P64(unsafe_from_address=src + i)[]
+                if (w & 0x8080808080808080) == 0:
+                    P64(unsafe_from_address=Int(out) + j)[] = w
+                    i += 8
+                    j += 8
+                    continue
+            var b = rd(src + i)
+            if b < 0x80:
+                out[unsafe_offset=j] = b
+                i += 1
+            else:
+                out[unsafe_offset=j] = ((b & 0x1F) << 6) | (rd(src + i + 1) & 0x3F)
+                i += 2
+            j += 1
+        return s
+    if maxlead < 0xF0:
+        var s = external_call["PyUnicode_New", Int](chars, 65535)
+        if s == 0:
+            return 0
+        var out = Pointer[UInt16, MutUntrackedOrigin](unsafe_from_address=s + STR_COMPACT_DATA)
+        var j = 0
+        i = 0
+        while i < n:
+            var b = rd(src + i)
+            if b < 0x80:
+                out[unsafe_offset=j] = UInt16(b)
+                i += 1
+            elif b < 0xE0:
+                out[unsafe_offset=j] = (UInt16(b & 0x1F) << 6) | UInt16(rd(src + i + 1) & 0x3F)
+                i += 2
+            else:
+                out[unsafe_offset=j] = (UInt16(b & 0x0F) << 12) | (UInt16(rd(src + i + 1) & 0x3F) << 6) | UInt16(rd(src + i + 2) & 0x3F)
+                i += 3
+            j += 1
+        return s
+    var s = external_call["PyUnicode_New", Int](chars, 0x10FFFF)
+    if s == 0:
+        return 0
+    var out = Pointer[UInt32, MutUntrackedOrigin](unsafe_from_address=s + STR_COMPACT_DATA)
+    var j = 0
+    i = 0
+    while i < n:
+        var b = rd(src + i)
+        if b < 0x80:
+            out[unsafe_offset=j] = UInt32(b)
+            i += 1
+        elif b < 0xE0:
+            out[unsafe_offset=j] = (UInt32(b & 0x1F) << 6) | UInt32(rd(src + i + 1) & 0x3F)
+            i += 2
+        elif b < 0xF0:
+            out[unsafe_offset=j] = (UInt32(b & 0x0F) << 12) | (UInt32(rd(src + i + 1) & 0x3F) << 6) | UInt32(rd(src + i + 2) & 0x3F)
+            i += 3
+        else:
+            out[unsafe_offset=j] = (UInt32(b & 0x07) << 18) | (UInt32(rd(src + i + 1) & 0x3F) << 12) | (UInt32(rd(src + i + 2) & 0x3F) << 6) | UInt32(rd(src + i + 3) & 0x3F)
+            i += 4
+        j += 1
     return s
 
 
@@ -645,7 +763,9 @@ def float_from_text[o_: Origin[mut=True]](p: Pointer[Parser, o_], start: Int, st
 @always_inline
 def make_int[o_: Origin[mut=True]](negative: Bool, mantissa: UInt64, p: Pointer[Parser, o_], start: Int, c: Int) -> Int:
     if not negative:
-        if mantissa <= UInt64(0x7FFFFFFFFFFFFFFF):
+        # Up to 30 bits: the signed constructor's single-digit fast path. Wider:
+        # the unsigned constructor builds the digits with less work.
+        if mantissa < (UInt64(1) << 30):
             return external_call["PyLong_FromLongLong", Int](Int64(mantissa))
         return external_call["PyLong_FromUnsignedLongLong", Int](mantissa)
     if mantissa < (UInt64(1) << 63):
@@ -1321,6 +1441,7 @@ def yjson_mojo_destroy(address: Int) abi("C"):
     ctx[].pow10.unsafe_free()
     ctx[].hex.unsafe_free()
     ctx[].escapes.unsafe_free()
+    ctx[].utf8_dfa.unsafe_free()
     ctx.unsafe_free()
 
 

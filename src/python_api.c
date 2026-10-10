@@ -86,7 +86,7 @@ _Static_assert(offsetof(Py_buffer, len) == 16 && offsetof(Py_buffer, itemsize) =
     && sizeof(Py_buffer) <= 128, "Py_buffer layout");
 
 /* All Python ownership and keyword parsing lives here, outside the Mojo loops. */
-extern uintptr_t yjson_encode(uintptr_t context, uintptr_t object, uintptr_t request);
+extern uintptr_t yjson_encode(uintptr_t, uintptr_t, uintptr_t, long);
 
 #if PY_VERSION_HEX < 0x030C0000
 static PyObject *PyErr_GetRaisedException(void) {
@@ -244,6 +244,23 @@ typedef struct {
     int kind;
 } TzCacheEntry;
 
+#define DC_CACHE_SIZE 16
+
+/* How instances of one dataclass type are written. The Mojo writer reads this
+   layout directly: kind 1 writes the instance dict (orjson's fast path: its
+   order, attributes not starting with "_"); kind 2 writes `count` fields in
+   declaration order, each read from its slot at `offsets[i]`, or through
+   getattr when the offset is -1. */
+typedef struct DataclassPlan {
+    PyTypeObject *type;   /* strong reference: a freed type's address could be reused */
+    intptr_t kind;
+    intptr_t count;
+    PyObject **keys;      /* strong references, field names */
+    intptr_t *offsets;
+} DataclassPlan;
+
+static void free_dataclass_plan(DataclassPlan *plan);
+
 typedef struct {
     uintptr_t context;
     PyObject *convert, *key_string, *fragment_type, *dataclass_fields_type, *uuid_type;
@@ -251,10 +268,11 @@ typedef struct {
     PyObject *enum_type;
     PyObject *value_name, *slots_name, *utcoffset_name, *normalize_name, *convert_name, *dst_name;
     PyObject *value_private_name, *stock_value_descr;  /* "_value_" and enum.Enum.value, for the direct read */
+    PyObject *default_keyword, *option_keyword;        /* interned "default" and "option": keyword names compare by pointer first */
     Py_ssize_t uuid_int_offset;  /* UUID.int slot, 0 when it is not a plain member slot */
     TzCacheEntry tz_cache[TZ_CACHE_SIZE];
     int tz_cache_next;
-    TzCacheEntry dc_cache[TZ_CACHE_SIZE];  /* dataclass types: DC_DICT or DC_FIELDS */
+    struct DataclassPlan *dc_plans[DC_CACHE_SIZE];  /* dataclass types: how to write them */
     int dc_cache_next;
     /* Per type, under a given set of passthrough options: PLAIN_CALLBACK
        (no built-in conversion: classify/default), PLAIN_ENUM_VALUE (stock
@@ -351,7 +369,9 @@ static void destroy_state(PyObject *capsule) {
     Py_XDECREF(state->value_name); Py_XDECREF(state->slots_name); Py_XDECREF(state->utcoffset_name);
     Py_XDECREF(state->normalize_name); Py_XDECREF(state->convert_name); Py_XDECREF(state->dst_name);
     Py_XDECREF(state->value_private_name); Py_XDECREF(state->stock_value_descr);
-    for (int i = 0; i < TZ_CACHE_SIZE; i++) { Py_XDECREF(state->tz_cache[i].type); Py_XDECREF(state->dc_cache[i].type); }
+    Py_XDECREF(state->default_keyword); Py_XDECREF(state->option_keyword);
+    for (int i = 0; i < TZ_CACHE_SIZE; i++) Py_XDECREF(state->tz_cache[i].type);
+    for (int i = 0; i < DC_CACHE_SIZE; i++) free_dataclass_plan(state->dc_plans[i]);
     for (int i = 0; i < PLAIN_CACHE_SIZE; i++) Py_XDECREF(state->plain_cache[i].type);
     if (module_state == state) module_state = NULL;
     PyMem_Free(state);
@@ -397,9 +417,9 @@ static inline __attribute__((always_inline)) PyObject *dumps_impl(PyObject *caps
     if (kwnames) {
         for (Py_ssize_t i = 0; i < PyTuple_GET_SIZE(kwnames); i++) {
             PyObject *name = PyTuple_GET_ITEM(kwnames, i);
-            if (PyUnicode_CompareWithASCIIString(name, "default") == 0 && !default_seen) {
+            if ((name == state->default_keyword || PyUnicode_CompareWithASCIIString(name, "default") == 0) && !default_seen) {
                 default_fn = args[nargs + i]; default_seen = 1;
-            } else if (PyUnicode_CompareWithASCIIString(name, "option") == 0 && !option_seen) {
+            } else if ((name == state->option_keyword || PyUnicode_CompareWithASCIIString(name, "option") == 0) && !option_seen) {
                 option_obj = args[nargs + i]; option_seen = 1;
             } else {
                 PyErr_Format(PyExc_TypeError, "Unexpected or duplicate keyword: %U", name);
@@ -417,7 +437,7 @@ static inline __attribute__((always_inline)) PyObject *dumps_impl(PyObject *caps
     }
     if (socket) option |= 65536 | 4 | 512 | 2048;
     Request request = {.state = state, .capsule = capsule, .default_fn = default_fn, .option = option, .classify = classify};
-    PyObject *result = (PyObject *)yjson_encode(state->context, (uintptr_t)args[0], (uintptr_t)&request);
+    PyObject *result = (PyObject *)yjson_encode(state->context, (uintptr_t)args[0], (uintptr_t)&request, option);
     Py_XDECREF(request.keepalive);
     if (request.cache) {
         for (int i = 0; i < request.cache->plan_count; i++) {
@@ -807,16 +827,33 @@ static PyObject *uuid_string(PyObject *obj) {
 
 static PyObject *dataclass_fields(ModuleState *state, PyObject *obj, PyObject *schema);
 
-/* How a dataclass type is written, remembered per type (strong reference):
-   DC_DICT when instances have a __dict__ and the class declares no
-   __slots__ (orjson's fast path: the dict's order, attributes not starting
-   with "_"), DC_FIELDS otherwise, 0 when the type is not a dataclass. */
-static int dataclass_kind(ModuleState *state, PyTypeObject *type) {
-    for (int i = 0; i < TZ_CACHE_SIZE; i++)
-        if (state->dc_cache[i].type == type) return state->dc_cache[i].kind;
-    PyObject *schema = _PyType_Lookup(type, state->dataclass_name);
-    if (!schema || !PyDict_Check(schema)) return 0;
-    int kind = DC_FIELDS;
+static void free_dataclass_plan(DataclassPlan *plan) {
+    if (!plan) return;
+    for (intptr_t i = 0; i < plan->count; i++) Py_XDECREF(plan->keys[i]);
+    PyMem_Free(plan->keys);
+    PyMem_Free(plan->offsets);
+    Py_XDECREF(plan->type);
+    PyMem_Free(plan);
+}
+
+/* The slot offset of attribute `name` on `type` (bases included), or -1
+   when the attribute is not a plain object slot: a __dict__ entry, a
+   property, or a slot shadowed by a descriptor. */
+static intptr_t field_slot_offset(PyTypeObject *type, PyObject *name) {
+    PyObject *descr = _PyType_Lookup(type, name);  /* borrowed */
+    if (descr && Py_IS_TYPE(descr, &PyMemberDescr_Type)) {
+        PyMemberDef *member = ((PyMemberDescrObject *)descr)->d_member;
+        if (member && member->type == Py_T_OBJECT_EX && member->offset > 0) return (intptr_t)member->offset;
+    }
+    return -1;
+}
+
+/* Builds the plan for a dataclass type: NULL with an error set on failure. */
+static DataclassPlan *build_dataclass_plan(ModuleState *state, PyTypeObject *type, PyObject *schema) {
+    DataclassPlan *plan = PyMem_Calloc(1, sizeof(DataclassPlan));
+    if (!plan) { PyErr_NoMemory(); return NULL; }
+    plan->type = (PyTypeObject *)Py_NewRef(type);
+    plan->kind = 2;
     if (type->tp_dictoffset != 0) {
 #if PY_VERSION_HEX >= 0x030C0000
         PyObject *type_dict = PyType_GetDict(type);
@@ -826,14 +863,71 @@ static int dataclass_kind(ModuleState *state, PyTypeObject *type) {
         int has_slots = type_dict ? PyDict_Contains(type_dict, state->slots_name) : 1;
         Py_XDECREF(type_dict);
         if (has_slots < 0) { PyErr_Clear(); has_slots = 1; }
-        if (!has_slots) kind = DC_DICT;
+        if (!has_slots) plan->kind = 1;
     }
-    TzCacheEntry *entry = &state->dc_cache[state->dc_cache_next];
-    state->dc_cache_next = (state->dc_cache_next + 1) % TZ_CACHE_SIZE;
-    Py_XDECREF(entry->type);
-    entry->type = (PyTypeObject *)Py_NewRef(type);
-    entry->kind = kind;
-    return kind;
+    if (plan->kind == 1) return plan;
+    Py_ssize_t capacity = PyDict_GET_SIZE(schema);
+    plan->keys = PyMem_Calloc((size_t)(capacity ? capacity : 1), sizeof(PyObject *));
+    plan->offsets = PyMem_Calloc((size_t)(capacity ? capacity : 1), sizeof(intptr_t));
+    if (!plan->keys || !plan->offsets) { PyErr_NoMemory(); free_dataclass_plan(plan); return NULL; }
+    Py_ssize_t position = 0;
+    PyObject *name, *field;
+    while (PyDict_Next(schema, &position, &name, &field)) {
+        if (!PyUnicode_Check(name)) {
+            PyErr_SetString(PyExc_TypeError, "Dataclass field name must be str");
+            free_dataclass_plan(plan);
+            return NULL;
+        }
+        if (PyUnicode_GET_LENGTH(name) && PyUnicode_ReadChar(name, 0) == '_') continue;
+        PyObject *kind = PyObject_GetAttr(field, state->field_kind_name);
+        if (!kind) { free_dataclass_plan(plan); return NULL; }
+        int serialize = kind == state->field_sentinel;
+        Py_DECREF(kind);
+        if (!serialize) continue;
+        plan->keys[plan->count] = Py_NewRef(name);
+        /* A custom __getattribute__ must see every read, as orjson's getattr does. */
+        plan->offsets[plan->count] = type->tp_getattro == PyObject_GenericGetAttr ? field_slot_offset(type, name) : -1;
+        plan->count++;
+    }
+    return plan;
+}
+
+/* The plan for a dataclass type, remembered per type, or NULL for other
+   types (with no error set) and on failure (with an error set). */
+static DataclassPlan *dataclass_plan(ModuleState *state, PyTypeObject *type) {
+    for (int i = 0; i < DC_CACHE_SIZE; i++) {
+        DataclassPlan *plan = state->dc_plans[i];
+        if (plan && plan->type == type) return plan;
+    }
+    PyObject *schema = _PyType_Lookup(type, state->dataclass_name);
+    if (!schema || !PyDict_Check(schema)) return NULL;
+    DataclassPlan *plan = build_dataclass_plan(state, type, schema);
+    if (!plan) return NULL;
+    int slot = state->dc_cache_next;
+    state->dc_cache_next = (slot + 1) % DC_CACHE_SIZE;
+    free_dataclass_plan(state->dc_plans[slot]);
+    state->dc_plans[slot] = plan;
+    return plan;
+}
+
+static int dataclass_kind(ModuleState *state, PyTypeObject *type) {
+    DataclassPlan *plan = dataclass_plan(state, type);
+    if (!plan) { PyErr_Clear(); return 0; }
+    return (int)plan->kind;
+}
+
+/* Called by the Mojo writer for an object no built-in writer took: the
+   dataclass plan to write it with, or 0 (with no error set). */
+uintptr_t yjson_dataclass_plan(uintptr_t object) {
+    PyObject *obj = (PyObject *)object;
+    if (!module_state || PyType_Check(obj)) return 0;
+    DataclassPlan *plan = dataclass_plan(module_state, Py_TYPE(obj));
+    if (!plan) PyErr_Clear();
+    return (uintptr_t)plan;
+}
+
+void yjson_unset_attribute(uintptr_t object, uintptr_t key) {
+    PyErr_Format(PyExc_AttributeError, "'%.100s' object has no attribute '%U'", Py_TYPE((PyObject *)object)->tp_name, (PyObject *)key);
 }
 
 /* The dict to write for a dataclass instance. *is_fragment: 3 = the instance
@@ -1369,7 +1463,7 @@ static PyObject *key_string(Request *request, PyObject *key) {
         }
         if (!isfinite(PyFloat_AS_DOUBLE(key))) return PyUnicode_FromString("null");
         Request scalar = {.state = request->state, .capsule = request->capsule, .default_fn = Py_None};
-        PyObject *bytes = (PyObject *)yjson_encode(request->state->context, (uintptr_t)key, (uintptr_t)&scalar);
+        PyObject *bytes = (PyObject *)yjson_encode(request->state->context, (uintptr_t)key, (uintptr_t)&scalar, 0);
         if (!bytes) return NULL;
         PyObject *text = PyUnicode_DecodeUTF8(PyBytes_AS_STRING(bytes), PyBytes_GET_SIZE(bytes), "strict");
         Py_DECREF(bytes);
@@ -1522,7 +1616,7 @@ static int nonstr_key_record(Request *request, PyObject *key, DictRecord *record
             return 1;
         }
         Request scalar = {.state = request->state, .capsule = request->capsule, .default_fn = Py_None};
-        PyObject *bytes = (PyObject *)yjson_encode(request->state->context, (uintptr_t)key, (uintptr_t)&scalar);
+        PyObject *bytes = (PyObject *)yjson_encode(request->state->context, (uintptr_t)key, (uintptr_t)&scalar, 0);
         if (!bytes) return 0;
         *record = (DictRecord){bytes, NULL, PyBytes_AS_STRING(bytes), PyBytes_GET_SIZE(bytes)};
         return 1;
@@ -1660,6 +1754,8 @@ int yjson_install(uintptr_t module_ptr, uintptr_t context) {
         Py_DECREF(uuid_module);
     }
     state->dataclass_name = PyUnicode_InternFromString("__dataclass_fields__");
+    state->default_keyword = PyUnicode_InternFromString("default");
+    state->option_keyword = PyUnicode_InternFromString("option");
     state->field_kind_name = PyUnicode_InternFromString("_field_type");
     PyObject *dataclasses = PyObject_GetAttrString(support, "dataclasses");
     if (dataclasses) {
@@ -1701,6 +1797,7 @@ int yjson_install(uintptr_t module_ptr, uintptr_t context) {
         Py_XDECREF(state->value_name); Py_XDECREF(state->slots_name); Py_XDECREF(state->utcoffset_name);
         Py_XDECREF(state->normalize_name); Py_XDECREF(state->convert_name); Py_XDECREF(state->dst_name);
         Py_XDECREF(state->value_private_name); Py_XDECREF(state->stock_value_descr);
+    Py_XDECREF(state->default_keyword); Py_XDECREF(state->option_keyword);
         PyMem_Free(state); Py_DECREF(support); return -1;
     }
     if (!state->convert || !state->key_string || !state->fragment_type || !state->dataclass_fields_type || !state->uuid_type

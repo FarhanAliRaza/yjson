@@ -44,6 +44,7 @@ int main(void) {
     printf("YJSON_STR_ASCII_DATA=%zu\n", sizeof(PyASCIIObject));
     printf("YJSON_STR_UTF8_LENGTH=%zu\n", offsetof(PyCompactUnicodeObject, utf8_length));
     printf("YJSON_STR_UTF8=%zu\n", offsetof(PyCompactUnicodeObject, utf8));
+    printf("YJSON_STR_COMPACT_DATA=%zu\n", sizeof(PyCompactUnicodeObject));
     /* datetime objects: a tzinfo flag, packed big-endian fields, the tzinfo pointer */
     printf("YJSON_DT_HASTZ=%zu\n", offsetof(PyDateTime_DateTime, hastzinfo));
     printf("YJSON_DT_DATA=%zu\n", offsetof(PyDateTime_DateTime, data));
