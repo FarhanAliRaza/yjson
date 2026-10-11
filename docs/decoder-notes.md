@@ -246,10 +246,57 @@ twice its length until freed.
 - Keeping benchmark results alive in a list while timing inflates later runs through
   memory pressure.
 
+## Non-ASCII strings
+
+`PyUnicode_DecodeUTF8` built every non-ASCII `str`. It is replaced by one pass that
+validates the bytes (RFC 3629: no overlongs, no surrogates, nothing past U+10FFFF) and
+decodes them into a UCS-2 scratch kept on the parser, widening ASCII words with one
+vector instruction and decoding runs of 3-byte sequences in a loop of their own. The
+result is narrowed into a latin-1 `str` or copied into a UCS-2 one; a 4-byte sequence
+sends the string through a second UCS-4 pass. Two designs lost on the way: a byte loop
+that re-tested an 8-byte ASCII word after every byte, and a table automaton (Höhrmann's)
+with branchless bookkeeping, which ran 57 instructions per byte against CPython's 20. On
+200 Latin strings of 42 bytes: 33.8 µs before, 25.7 µs after (orjson 27.4); on CJK text
+35.0 µs before, 18.7 µs after (orjson 18.1). An 8-bit shift in the run loop's
+continuation check once accepted a corrupted third byte; the corpus mutation check in
+`check_loads.py` caught it.
+
+Integers of 30 bits or more are built with `PyLong_FromUnsignedLongLong`, whose digit
+path is shorter than the signed constructor's for two-digit values: 1,000 epoch
+milliseconds went from 34.7 µs to 28.4 µs (orjson 29.4).
+
+## The encoder: what moved and what only moved the code
+
+- The 256-byte start buffer plus the loops' 160-byte slack grew any output over about
+  96 bytes to 4 KB through glibc and shrank it back: about 120 ns per call. Small results
+  now go into one persistent 2 KB heap scratch and are copied once into an exact-size
+  bytes object; larger ones move into a bytes object as before. A 16 KB scratch in `.bss`
+  measured 25% slower on string lists than the same buffer on the heap, with identical
+  instruction counts.
+- Two- and three-digit CPython longs (timestamps, snowflake ids) fell to the generic long
+  path. The numeric list loop handles them inline; the shared loops keep a one-digit
+  `int_fast` and send the rest through `write_int`.
+- yyjson's integer writer (the high part through the branchy small writer, the low eight
+  digits through two-digit table stores) replaced the SWAR path for nine or more digits:
+  1.4–1.7x faster in isolation. Inlined everywhere through `int_fast` and `float_at` it
+  cost the corpus 6% against orjson; out of line it does not.
+- Dataclass instances are written from a per-type plan (field names and slot offsets, or
+  the instance dict) instead of a temporary dict built through getattr on each `Field`:
+  100 slotted instances went from 85 µs to 17 µs (msgspec 51, orjson 74). A type with a
+  custom `__getattribute__` keeps the getattr path, as orjson does.
+- The container loops are sensitive to their own code size: a call site added to
+  `int_fast`, the dataclass plan call inlined into `ser_value`, and the table integer
+  writer each slowed string-heavy documents by 10–20% with instruction counts within 5%.
+  Keep calls out of the inlined dispatch; measure with callgrind as well as wall time.
+  On the Xeon used for this work, builds with equal instruction counts differed by up to
+  15% on the same loop, consistent with the JCC erratum mitigation; the Mojo compiler
+  has no flag for branch alignment.
+
 ## Still open
 
-- Non-ASCII text goes through `PyUnicode_DecodeUTF8`, 11% of twitter.json; a custom decoder
-  into the right `str` kind could win part of that.
-- Integers in arrays still cost 2–3 ns per element more than orjson's, with no counter that
-  explains it.
+- Lists of short strings encode in the same number of instructions as orjson's but 15–25%
+  slower in wall time on the Xeon; the escape kernel is not the cause (in isolation the
+  32-byte AVX2 copy beats a byte loop at every length).
+- Dict-backed dataclasses tie orjson: their split instance dicts are walked with
+  `PyDict_Next`, as orjson walks them.
 - `loads(type=...)` has no `rename`, `Enum`, `datetime` or union support beyond `Optional`.

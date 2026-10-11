@@ -135,6 +135,8 @@ def tp_name(tp: Int) -> Int:
     return rdb(tp, TP_NAME)
 
 # ---------------- output buffer: writes straight into a PyBytes object (no final copy) ----------------
+comptime SCRATCH_CAP = 2048
+
 struct Buf:
     var obj: Int
     var p: P8
@@ -143,6 +145,14 @@ struct Buf:
     var err: Int
 
     def __init__(out self, cap: Int):
+        var scratch = external_call["yjson_scratch_acquire", Int]()
+        if scratch != 0:
+            self.obj = 0
+            self.p = P8(unsafe_from_address=scratch)
+            self.len = 0
+            self.cap = SCRATCH_CAP
+            self.err = 0
+            return
         self.obj = external_call["PyBytes_FromStringAndSize", Int](0, cap)
         self.p = P8(unsafe_from_address=bytes_data(self.obj))
         self.len = 0
@@ -161,6 +171,17 @@ struct Buf:
         var nc = 4096 - 33 if self.cap < 4096 - 33 else self.cap
         while nc < self.len + n:
             nc *= 2
+        if self.obj == 0:
+            var no = external_call["PyBytes_FromStringAndSize", Int](0, nc)
+            if no == 0:
+                abort("out of memory")
+            var dst = P8(unsafe_from_address=bytes_data(no))
+            _ = external_call["memcpy", Int](Int(dst), Int(self.p), self.len)
+            external_call["yjson_scratch_release", NoneType]()
+            self.obj = no
+            self.p = dst
+            self.cap = nc
+            return
         var o = self.obj
         if external_call["_PyBytes_Resize", Int32](Int(Pointer(to=o)), nc) != 0:
             abort("out of memory")
@@ -580,31 +601,72 @@ def store8(dst: P8, pos: Int, v: UInt64):
     (dst + pos).unsafe_bitcast[UInt64]()[] = v
 
 # Writes v in decimal at dst+n and returns the new end. May write up to 8 bytes
-# past the end (callers reserve slack).
-@always_inline
+# past the end (callers reserve slack). Out of line: it is inlined into every
+# container loop through int_fast and float_at, and its table writers would
+# grow those loops.
+@inline(.never)
 def put_u64(dst: P8, n: Int, v: UInt64) -> Int:
+    # yyjson's split: the high part through the branchy small writer, the low
+    # 8 digits through two-digit table stores. Measured 1.4-1.7x faster than
+    # the SWAR eight_digits path on 9-20 digit values.
     if v < 100000000:
-        # The digit count comes from cheap independent compares, so the next
-        # write position does not wait on the multiply chain that makes digits.
-        var nd = 1 + Int(v >= 10) + Int(v >= 100) + Int(v >= 1000) + Int(v >= 10000) + Int(v >= 100000) + Int(v >= 1000000) + Int(v >= 10000000)
-        store8(dst, n, eight_digits(v) >> UInt64((8 - nd) * 8))
-        return n + nd
+        return ia_write8(dst, n, UInt32(v))
     if v < 10000000000000000:
         var hi = v // 100000000
-        var lo = v - hi * 100000000
-        var nd = ndigits(hi)
-        store8(dst, n, eight_digits(hi) >> UInt64((8 - nd) * 8))
-        store8(dst, n + nd, eight_digits(lo))
-        return n + nd + 8
-    var top = v // 10000000000000000
-    var rest = v - top * 10000000000000000
-    var mid = rest // 100000000
-    var lo = rest - mid * 100000000
-    var nd = ndigits(top)
-    store8(dst, n, eight_digits(top) >> UInt64((8 - nd) * 8))
-    store8(dst, n + nd, eight_digits(mid))
-    store8(dst, n + nd + 8, eight_digits(lo))
-    return n + nd + 16
+        var lo = UInt32(v - hi * 100000000)
+        var m = ia_write8(dst, n, UInt32(hi))
+        return table_write8(dst, m, lo)
+    var tmp = v // 100000000
+    var lo = UInt32(v - tmp * 100000000)
+    var hi = UInt32(tmp // 10000)
+    var mid = UInt32(tmp - UInt64(hi) * 10000)
+    var m = ia_write8(dst, n, hi)
+    m = table_write4(dst, m, mid)
+    return table_write8(dst, m, lo)
+
+@always_inline
+def table_write8(dst: P8, n: Int, val: UInt32) -> Int:
+    var aabb = UInt32((UInt64(val) * 109951163) >> 40)
+    var ccdd = val - aabb * 10000
+    var aa = (aabb * 5243) >> 19
+    var cc = (ccdd * 5243) >> 19
+    var bb = aabb - aa * 100
+    var dd = ccdd - cc * 100
+    put2(dst, n, Int(aa))
+    put2(dst, n + 2, Int(bb))
+    put2(dst, n + 4, Int(cc))
+    put2(dst, n + 6, Int(dd))
+    return n + 8
+
+@always_inline
+def table_write4(dst: P8, n: Int, val: UInt32) -> Int:
+    var aa = (val * 5243) >> 19
+    var bb = val - aa * 100
+    put2(dst, n, Int(aa))
+    put2(dst, n + 2, Int(bb))
+    return n + 4
+
+# Two- and three-digit (30..64-bit) ints: timestamps, snowflake ids, hashes.
+# Only the numeric list loop calls it; the shared loops send them to write_int.
+@inline(.never)
+def int_wide(dst: P8, n: Int, o: Int) -> Int:
+    var tag = long_tag(o)
+    if tag >= 32:
+        return -1
+    var digits = long_digits(o)
+    var mag = UInt64(digits[]) | (UInt64(digits[unsafe_offset=1]) << 30)
+    if tag >= 24:
+        var high = UInt64(digits[unsafe_offset=2])
+        if high >= 16:
+            return -1
+        mag |= high << 60
+        if (tag & 3) == 2 and mag > (UInt64(1) << 63):
+            return -1
+    var m = n
+    if (tag & 3) == 2:
+        (dst + n)[] = 45
+        m = n + 1
+    return put_u64(dst, m, mag)
 
 @always_inline
 def int_fast(dst: P8, n: Int, o: Int) -> Int:
@@ -1463,6 +1525,74 @@ def close_indent[o_: Origin[mut=True]](bp: Pointer[Buf, o_], depth: Int):
     bp[].ensure(2 * depth + 40)
     bp[].len = indent_at(bp[].p, bp[].len, depth, False)
 
+# Dataclass instances, from the per-type plan the C shim builds once (see
+# DataclassPlan): the instance dict in its order minus "_" attributes, or the
+# declared fields read straight from their slots. No temporary dict, no
+# Python call per field, and the field names hit the key cache.
+@inline(.never)
+def ser_dataclass[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o_: Origin[mut=True], c_: Origin](bp: Pointer[Buf, o_], cp: Pointer[Ctx, c_], o: Int, plan: Int, depth: Int) -> Bool:
+    if depth > 255:
+        bp[].err = 3
+        return False
+    if rdb(plan, 8) == 1:
+        var d = external_call["PyObject_GenericGetDict", Int](o, 0)
+        if unlikely(d == 0):
+            external_call["PyErr_Clear", NoneType]()
+            return ser_fallback[INDENT, SORT, False, NONSTR, SOCKET](bp, cp, o, depth - 1)
+        var ok = ser_dict_items[NONSTR, SORT, SOCKET, False, INDENT, SKIP_PRIVATE=True](bp, cp, d, depth, 0)
+        external_call["Py_DecRef", NoneType](d)
+        return ok
+    # A callback deeper in the tree may run Python code: pin this instance with
+    # the containers. A getter may drop the last container reference to it: own one.
+    Pointer[Int, MutUntrackedOrigin](unsafe_from_address=cp[].ancestors)[unsafe_offset=depth] = o
+    external_call["Py_IncRef", NoneType](o)
+    var ok = ser_dataclass_fields[NONSTR, SORT, SOCKET, INDENT](bp, cp, o, plan, depth)
+    external_call["Py_DecRef", NoneType](o)
+    return ok
+
+@inline(.always)
+def ser_dataclass_fields[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o_: Origin[mut=True], c_: Origin](bp: Pointer[Buf, o_], cp: Pointer[Ctx, c_], o: Int, plan: Int, depth: Int) -> Bool:
+    var count = rdb(plan, 16)
+    var keys = rdb(plan, 24)
+    var offsets = rdb(plan, 32)
+    put_byte(bp, 123)
+    var i = 0
+    while i < count:
+        var k = rdi(keys, i)
+        var off = rdi(offsets, i)
+        var v: Int
+        if likely(off >= 0):
+            v = rdb(o, off)
+            if unlikely(v == 0):
+                external_call["yjson_unset_attribute", NoneType](o, k)
+                return False
+            external_call["Py_IncRef", NoneType](v)
+        else:
+            v = external_call["PyObject_GetAttr", Int](o, k)
+            if v == 0:
+                return False
+        comptime if INDENT:
+            indent_sep(bp, depth, i > 0)
+        else:
+            if i > 0:
+                put_byte(bp, 44)
+        if not write_cached_key(bp, cp, k):
+            external_call["Py_DecRef", NoneType](v)
+            return False
+        put_byte(bp, 58)
+        comptime if INDENT:
+            put_byte(bp, 32)
+        var ok = ser_value[NONSTR, SORT, SOCKET, INDENT](bp, cp, v, depth)
+        external_call["Py_DecRef", NoneType](v)
+        if not ok:
+            return False
+        i += 1
+    comptime if INDENT:
+        if count > 0:
+            close_indent(bp, depth - 1)
+    put_byte(bp, 125)
+    return True
+
 @always_inline
 def ser_value[NONSTR: Bool, SORT: Bool, SOCKET: Bool, INDENT: Bool, o_: Origin[mut=True], c_: Origin](bp: Pointer[Buf, o_], cp: Pointer[Ctx, c_], o: Int, depth: Int) -> Bool:
     ref ctx = cp[]
@@ -2224,11 +2354,27 @@ def ser_list_num[NONSTR: Bool, SORT: Bool, SOCKET: Bool, o_: Origin[mut=True], c
             (p + len)[] = 44
             len += 1
         if t == t_int:
-            var r = int_fast(p, len, v)
-            if r >= 0:
-                len = r
-                i += 1
-                continue
+            # One to three CPython digits (up to 64 bits) inline: this loop is
+            # numbers only, so its size does not matter to the string paths.
+            var tag = long_tag(v)
+            if likely(tag < 32):
+                var digits = long_digits(v)
+                var mag = UInt64(digits[])
+                var fits = True
+                if tag >= 16:
+                    mag |= UInt64(digits[unsafe_offset=1]) << 30
+                    if tag >= 24:
+                        var high = UInt64(digits[unsafe_offset=2])
+                        mag |= high << 60
+                        fits = high < 16 and not ((tag & 3) == 2 and mag > (UInt64(1) << 63))
+                if likely(fits):
+                    var m = len
+                    if (tag & 3) == 2:
+                        (p + len)[] = 45
+                        m = len + 1
+                    len = ia_write8(p, m, UInt32(mag)) if mag < 100000000 else put_u64(p, m, mag)
+                    i += 1
+                    continue
         elif t == t_float:
             len += float_at(p + len, v)
             i += 1
@@ -2755,6 +2901,13 @@ def ser_fallback[INDENT: Bool, SORT: Bool, CONFIG: Bool, NONSTR: Bool, SOCKET: B
     if depth > 254:
         bp[].err = 3
         return False
+    # Dataclasses first, from here rather than ser_value: a call site inside
+    # the inlined dispatch would cost every container loop registers.
+    comptime if not CONFIG:
+        if (cp[].option & 2048) == 0:
+            var plan = external_call["yjson_dataclass_plan", Int](o)
+            if plan != 0:
+                return ser_dataclass[NONSTR, SORT, SOCKET, INDENT](bp, cp, o, plan, depth + 1)
     # default may nest 255 deep; the count lives in the C request (it raises the error)
     var conversions = Pointer[Int32, MutUntrackedOrigin](unsafe_from_address=cp[].request + cp[].conv_off)
     if unlikely(conversions[] >= 255):
@@ -3028,7 +3181,7 @@ def write_cached_key[o_: Origin[mut=True], c_: Origin](bp: Pointer[Buf, o_], cp:
 
 # ---------------- Python entry point: the module's Ctx caches the type pointers ----------------
 @export
-def yjson_encode(context: Int, obj: Int, request: Int) abi("C") -> Int:
+def yjson_encode(context: Int, obj: Int, request: Int, option: Int) abi("C") -> Int:
     var ctx = Pointer[Ctx, MutUntrackedOrigin](unsafe_from_address=context)[]
     ctx.request = request
     var ancestors = unsafe_stack_allocation[257, Int]()
@@ -3037,7 +3190,6 @@ def yjson_encode(context: Int, obj: Int, request: Int) abi("C") -> Int:
     var generation = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=ctx.kc)
     generation[] += 1
     var buffer = Buf(256)
-    var option = external_call["yjson_options", Int](request)
     ctx.option = option
     var ok: Bool
     if (option & (1 | 4 | 32 | 64 | 256 | 65536)) == 0:
@@ -3078,11 +3230,18 @@ def yjson_encode(context: Int, obj: Int, request: Int) abi("C") -> Int:
             ok = ser_configured[False, False, False](Pointer(to=buffer), Pointer(to=ctx), obj, 0)
     generation[] += 1
     if not ok:
-        external_call["Py_DecRef", NoneType](buffer.obj)
+        if buffer.obj == 0:
+            external_call["yjson_scratch_release", NoneType]()
+        else:
+            external_call["Py_DecRef", NoneType](buffer.obj)
         external_call["yjson_error", NoneType](Int32(buffer.err))
         return 0
     if (option & 1024) != 0:
         put_byte(Pointer(to=buffer), 10)
+    if buffer.obj == 0:
+        var copied = external_call["PyBytes_FromStringAndSize", Int](Int(buffer.p), buffer.len)
+        external_call["yjson_scratch_release", NoneType]()
+        return copied
     var result = buffer.obj
     if buffer.cap >= 1 << 20:
         # Large results keep their allocation and only get their size set, as orjson does.

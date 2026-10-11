@@ -30,8 +30,10 @@ extern intptr_t yjson_mojo_init(intptr_t, intptr_t, intptr_t);
 extern intptr_t yjson_mojo_loads_typed(intptr_t, intptr_t, intptr_t, intptr_t, intptr_t);
 extern void yjson_mojo_destroy(intptr_t);
 typedef struct { intptr_t context; } DecoderState;
+static DecoderState *decoder_state;   /* the one decoder, set when loads is installed */
 static void destroy_decoder(PyObject *capsule) {
     DecoderState *state = PyCapsule_GetPointer(capsule, "yjson.decoder");
+    if (state == decoder_state) decoder_state = NULL;
     if (state) { yjson_mojo_destroy(state->context); PyMem_Free(state); }
 }
 
@@ -299,9 +301,16 @@ static void raise_decode_error(const char *message, PyObject *source, const unsi
     Py_DECREF(error);
 }
 
+static PyObject *type_keyword;        /* interned "type" */
+static PyObject *last_annotation;     /* strong: the annotation of the last typed call */
+static const Plan *last_plan;
+
 static PyObject *loads(PyObject *self, PyObject *const *args, Py_ssize_t nargs, PyObject *kwnames) {
-    DecoderState *state = PyCapsule_GetPointer(self, "yjson.decoder");
-    if (!state) return NULL;
+    DecoderState *state = decoder_state;
+    if (!state) {
+        state = PyCapsule_GetPointer(self, "yjson.decoder");
+        if (!state) return NULL;
+    }
     if (nargs != 1) {
         if (nargs == 0) PyErr_SetString(PyExc_TypeError, "loads() missing 1 required positional argument: 'obj'");
         else PyErr_Format(PyExc_TypeError, "loads() takes exactly 1 positional argument (%zd given)", nargs);
@@ -310,7 +319,7 @@ static PyObject *loads(PyObject *self, PyObject *const *args, Py_ssize_t nargs, 
     PyObject *obj = args[0], *annotation = NULL;
     for (Py_ssize_t i = 0; kwnames && i < PyTuple_GET_SIZE(kwnames); i++) {
         PyObject *name = PyTuple_GET_ITEM(kwnames, i);
-        if (PyUnicode_CompareWithASCIIString(name, "type") != 0) {
+        if (name != type_keyword && PyUnicode_CompareWithASCIIString(name, "type") != 0) {
             PyErr_Format(PyExc_TypeError, "loads() got an unexpected keyword argument '%U'", name);
             return NULL;
         }
@@ -318,9 +327,15 @@ static PyObject *loads(PyObject *self, PyObject *const *args, Py_ssize_t nargs, 
     }
     const Plan *plan = NULL;
     if (annotation && annotation != Py_None) {
-        plan = plan_for(annotation);
-        if (!plan) return NULL;
-        if (plan->kind == PLAN_ANY) plan = NULL;
+        if (annotation == last_annotation) {
+            plan = last_plan;
+        } else {
+            plan = plan_for(annotation);
+            if (!plan) return NULL;
+            if (plan->kind == PLAN_ANY) plan = NULL;
+            Py_XSETREF(last_annotation, Py_NewRef(annotation));
+            last_plan = plan;
+        }
     }
     const unsigned char *data;
     Py_ssize_t length;
@@ -397,13 +412,15 @@ int yjson_install_loads(PyObject *module, PyObject *support) {
     Py_XSETREF(describe_type, describe);
     if (!plan_cache) plan_cache = PyDict_New();
     if (!post_init_name) post_init_name = PyUnicode_InternFromString("__post_init__");
-    if (!plan_cache || !post_init_name) return -1;
+    if (!type_keyword) type_keyword = PyUnicode_InternFromString("type");
+    if (!plan_cache || !post_init_name || !type_keyword) return -1;
     DecoderState *state = PyMem_Calloc(1, sizeof(*state));
     if (!state) { PyErr_NoMemory(); return -1; }
     state->context = yjson_mojo_init((intptr_t)Py_True, (intptr_t)Py_False, (intptr_t)Py_None);
     if (!state->context) { PyMem_Free(state); PyErr_NoMemory(); return -1; }
     PyObject *capsule = PyCapsule_New(state, "yjson.decoder", destroy_decoder);
     if (!capsule) { yjson_mojo_destroy(state->context); PyMem_Free(state); return -1; }
+    decoder_state = state;
     PyObject *module_name = PyUnicode_FromString("yjson");
     if (!module_name) { Py_DECREF(capsule); return -1; }
     PyObject *func = PyCFunction_NewEx(&loads_method, capsule, module_name);
