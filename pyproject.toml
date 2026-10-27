@@ -42,7 +42,7 @@ test = ["orjson", "numpy"]
 # auditwheel bundles the Mojo runtime library into the wheel and sets the manylinux tag.
 wheel = ["auditwheel>=6.4", "patchelf"]
 # The Mojo compiler. CI installs this group into its own environment (.venv-mojo).
-mojo = ["mojo==1.1.0"]
+mojo = ["mojo==1.2.0"]
 dev = [{ include-group = "test" }, { include-group = "wheel" }]
 
 [tool.setuptools]
